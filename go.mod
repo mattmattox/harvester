@@ -55,7 +55,7 @@ require (
 	github.com/Masterminds/semver/v3 v3.1.1
 	github.com/containernetworking/cni v1.1.2
 	github.com/ehazlett/simplelog v0.0.0-20200226020431-d374894e92a4
-	github.com/emicklei/go-restful v2.15.0+incompatible
+	github.com/emicklei/go-restful v2.16.0+incompatible
 	github.com/gorilla/mux v1.8.0
 	github.com/guonaihong/gout v0.1.3
 	github.com/harvester/harvester-network-controller v0.1.7
