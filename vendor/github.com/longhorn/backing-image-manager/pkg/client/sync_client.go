@@ -1,10 +1,10 @@
 package client
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -41,7 +41,7 @@ func (client *SyncClient) Get(filePath string) (*api.FileInfo, error) {
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
 	}
@@ -76,7 +76,7 @@ func (client *SyncClient) List() (map[string]*api.FileInfo, error) {
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
 	}
@@ -111,9 +111,9 @@ func (client *SyncClient) Delete(filePath string) error {
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
+		return errors.Wrapf(err, "%v, failed to read the response body", util.GetHTTPClientErrorPrefix(resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("%s or http.StatusNotFound(%d), response body content: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), http.StatusNotFound, string(bodyContent))
@@ -140,9 +140,9 @@ func (client *SyncClient) Forget(filePath string) error {
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
+		return errors.Wrapf(err, "%v, failed to read the response body", util.GetHTTPClientErrorPrefix(resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("%s or http.StatusNotFound(%d), response body content: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), http.StatusNotFound, string(bodyContent))
@@ -175,9 +175,9 @@ func (client *SyncClient) Fetch(srcFilePath, dstFilePath, uuid, diskUUID, expect
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
+		return errors.Wrapf(err, "%v, failed to read the response body", util.GetHTTPClientErrorPrefix(resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s, response body content: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), string(bodyContent))
@@ -209,9 +209,92 @@ func (client *SyncClient) DownloadFromURL(downloadURL, filePath, uuid, diskUUID,
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
+		return errors.Wrapf(err, "%v, failed to read the response body", util.GetHTTPClientErrorPrefix(resp.StatusCode))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s, response body content: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), string(bodyContent))
+	}
+
+	return nil
+}
+
+func (client *SyncClient) CloneFromBackingImage(sourceBackingImage, sourceBackingImageUUID, encryption, filePath, uuid, diskUUID, expectedChecksum string, credential map[string]string) error {
+	httpClient := &http.Client{Timeout: 0}
+	encodedCredential, err := json.Marshal(credential)
+	if err != nil {
+		return err
+	}
+
+	requestURL := fmt.Sprintf("http://%s/v1/files", client.Remote)
+	req, err := http.NewRequest("POST", requestURL, bytes.NewReader(encodedCredential))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	q := req.URL.Query()
+	q.Add("action", "cloneFromBackingImage")
+	q.Add("backing-image", sourceBackingImage)
+	q.Add("backing-image-uuid", sourceBackingImageUUID)
+	q.Add("encryption", encryption)
+	q.Add("file-path", filePath)
+	q.Add("uuid", uuid)
+	q.Add("disk-uuid", diskUUID)
+	q.Add("expected-checksum", expectedChecksum)
+
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return errors.Wrapf(err, "clone from backing image failed")
+	}
+	defer resp.Body.Close()
+
+	bodyContent, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return errors.Wrapf(err, "%v, failed to read the response body", util.GetHTTPClientErrorPrefix(resp.StatusCode))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s, response body content: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), string(bodyContent))
+	}
+
+	return nil
+}
+
+func (client *SyncClient) RestoreFromBackupURL(backupURL, concurrentLimit, filePath, uuid, diskUUID, expectedChecksum string, credential map[string]string) error {
+	httpClient := &http.Client{Timeout: 0}
+	encodedCredential, err := json.Marshal(credential)
+	if err != nil {
+		return err
+	}
+
+	requestURL := fmt.Sprintf("http://%s/v1/files", client.Remote)
+	req, err := http.NewRequest("POST", requestURL, bytes.NewReader(encodedCredential))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	q := req.URL.Query()
+	q.Add("action", "restoreFromBackupURL")
+	q.Add("backup-url", backupURL)
+	q.Add("file-path", filePath)
+	q.Add("uuid", uuid)
+	q.Add("disk-uuid", diskUUID)
+	q.Add("expected-checksum", expectedChecksum)
+	q.Add("concurrent-limit", concurrentLimit)
+
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("download from URL failed, err: %s", err)
+	}
+	defer resp.Body.Close()
+
+	bodyContent, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return errors.Wrapf(err, "%v, failed to read the response body", util.GetHTTPClientErrorPrefix(resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s, response body content: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), string(bodyContent))
@@ -269,9 +352,9 @@ func (client *SyncClient) Upload(src, dst, uuid, diskUUID, expectedChecksum stri
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
+		return errors.Wrapf(err, "%v, failed to read the response body", util.GetHTTPClientErrorPrefix(resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s, response body content: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), string(bodyContent))
@@ -305,9 +388,9 @@ func (client *SyncClient) Receive(filePath, uuid, diskUUID, expectedChecksum, fi
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
+		return errors.Wrapf(err, "%v, failed to read the response body", util.GetHTTPClientErrorPrefix(resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s, response body content: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), string(bodyContent))
@@ -335,9 +418,9 @@ func (client *SyncClient) Send(filePath, toAddress string) error {
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
+		return errors.Wrapf(err, "%v, failed to read the response body", util.GetHTTPClientErrorPrefix(resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s, response body content: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), string(bodyContent))
@@ -353,6 +436,9 @@ func (client *SyncClient) DownloadToDst(srcFilePath, dstFilePath string) error {
 		}
 	}
 	dst, err := os.Create(dstFilePath)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create the dst file before download")
+	}
 	defer dst.Close()
 
 	httpClient := &http.Client{Timeout: 0}

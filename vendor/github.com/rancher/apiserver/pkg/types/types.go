@@ -3,7 +3,7 @@ package types
 import (
 	"net/http"
 
-	"github.com/rancher/wrangler/pkg/schemas"
+	"github.com/rancher/wrangler/v3/pkg/schemas"
 )
 
 type Collection struct {
@@ -15,6 +15,8 @@ type Collection struct {
 	Pagination   *Pagination       `json:"pagination,omitempty"`
 	Revision     string            `json:"revision,omitempty"`
 	Continue     string            `json:"continue,omitempty"`
+	Pages        int               `json:"pages,omitempty"`
+	Count        int               `json:"count,omitempty"`
 }
 
 type GenericCollection struct {

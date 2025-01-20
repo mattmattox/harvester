@@ -7,7 +7,7 @@ import (
 	"github.com/rancher/steve/pkg/schema"
 	"github.com/rancher/steve/pkg/server"
 	"github.com/rancher/steve/pkg/stores/proxy"
-	"github.com/rancher/wrangler/pkg/schemas"
+	"github.com/rancher/wrangler/v3/pkg/schemas"
 	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 
@@ -45,9 +45,14 @@ func RegisterSchema(scaled *config.Scaled, server *server.Server, options config
 	settings := scaled.HarvesterFactory.Harvesterhci().V1beta1().Setting()
 	nodes := scaled.CoreFactory.Core().V1().Node()
 	pvcs := scaled.CoreFactory.Core().V1().PersistentVolumeClaim()
+	pvs := scaled.CoreFactory.Core().V1().PersistentVolume()
 	secrets := scaled.CoreFactory.Core().V1().Secret()
 	vmt := scaled.HarvesterFactory.Harvesterhci().V1beta1().VirtualMachineTemplate()
 	vmtv := scaled.HarvesterFactory.Harvesterhci().V1beta1().VirtualMachineTemplateVersion()
+	vmImages := scaled.HarvesterFactory.Harvesterhci().V1beta1().VirtualMachineImage()
+	storageClasses := scaled.StorageFactory.Storage().V1().StorageClass()
+	nads := scaled.CniFactory.K8s().V1().NetworkAttachmentDefinition()
+	resourceQuotas := scaled.Management.HarvesterFactory.Harvesterhci().V1beta1().ResourceQuota()
 
 	copyConfig := rest.CopyConfig(server.RESTConfig)
 	copyConfig.GroupVersion = &kubevirtSubResouceGroupVersion
@@ -75,21 +80,29 @@ func RegisterSchema(scaled *config.Scaled, server *server.Server, options config
 		backupCache:               backups.Cache(),
 		restores:                  restores,
 		settingCache:              settings.Cache(),
+		nadCache:                  nads.Cache(),
 		nodeCache:                 nodes.Cache(),
 		pvcCache:                  pvcs.Cache(),
+		pvCache:                   pvs.Cache(),
 		secretClient:              secrets,
 		secretCache:               secrets.Cache(),
 		virtSubresourceRestClient: virtSubresourceClient,
 		virtRestClient:            virtv1Client.RESTClient(),
+		vmImages:                  vmImages,
+		vmImageCache:              vmImages.Cache(),
+		storageClassCache:         storageClasses.Cache(),
+		resourceQuotaClient:       resourceQuotas,
+		clientSet:                 *scaled.Management.ClientSet,
 	}
 
 	vmformatter := vmformatter{
 		vmiCache:      vmis.Cache(),
 		vmBackupCache: backups.Cache(),
+		clientSet:     *scaled.Management.ClientSet,
 	}
 
 	vmStore := &vmStore{
-		Store:    proxy.NewProxyStore(server.ClientFactory, nil, server.AccessSetLookup),
+		Store:    proxy.NewProxyStore(server.ClientFactory, nil, server.AccessSetLookup, nil),
 		vms:      scaled.VirtFactory.Kubevirt().V1().VirtualMachine(),
 		vmCache:  scaled.VirtFactory.Kubevirt().V1().VirtualMachine().Cache(),
 		pvcs:     scaled.CoreFactory.Core().V1().PersistentVolumeClaim(),
@@ -100,21 +113,26 @@ func RegisterSchema(scaled *config.Scaled, server *server.Server, options config
 		ID: vmSchemaID,
 		Customize: func(apiSchema *types.APISchema) {
 			apiSchema.ActionHandlers = map[string]http.Handler{
-				startVM:        &actionHandler,
-				stopVM:         &actionHandler,
-				restartVM:      &actionHandler,
-				softReboot:     &actionHandler,
-				ejectCdRom:     &actionHandler,
-				pauseVM:        &actionHandler,
-				unpauseVM:      &actionHandler,
-				migrate:        &actionHandler,
-				abortMigration: &actionHandler,
-				backupVM:       &actionHandler,
-				restoreVM:      &actionHandler,
-				createTemplate: &actionHandler,
-				addVolume:      &actionHandler,
-				removeVolume:   &actionHandler,
-				cloneVM:        &actionHandler,
+				startVM:                          &actionHandler,
+				stopVM:                           &actionHandler,
+				restartVM:                        &actionHandler,
+				softReboot:                       &actionHandler,
+				ejectCdRom:                       &actionHandler,
+				pauseVM:                          &actionHandler,
+				unpauseVM:                        &actionHandler,
+				migrate:                          &actionHandler,
+				abortMigration:                   &actionHandler,
+				findMigratableNodes:              &actionHandler,
+				backupVM:                         &actionHandler,
+				restoreVM:                        &actionHandler,
+				createTemplate:                   &actionHandler,
+				addVolume:                        &actionHandler,
+				removeVolume:                     &actionHandler,
+				cloneVM:                          &actionHandler,
+				forceStopVM:                      &actionHandler,
+				dismissInsufficientResourceQuota: &actionHandler,
+				updateResourceQuotaAction:        &actionHandler,
+				deleteResourceQuotaAction:        &actionHandler,
 			}
 			apiSchema.ResourceActions = map[string]schemas.Action{
 				startVM:    {},
@@ -126,7 +144,8 @@ func RegisterSchema(scaled *config.Scaled, server *server.Server, options config
 				migrate: {
 					Input: "migrateInput",
 				},
-				abortMigration: {},
+				abortMigration:      {},
+				findMigratableNodes: {},
 				ejectCdRom: {
 					Input: "ejectCdRomActionInput",
 				},
@@ -148,6 +167,12 @@ func RegisterSchema(scaled *config.Scaled, server *server.Server, options config
 				cloneVM: {
 					Input: "cloneInput",
 				},
+				forceStopVM:                      {},
+				dismissInsufficientResourceQuota: {},
+				updateResourceQuotaAction: {
+					Input: "updateResourceQuotaInput",
+				},
+				deleteResourceQuotaAction: {},
 			}
 		},
 		Formatter: vmformatter.formatter,

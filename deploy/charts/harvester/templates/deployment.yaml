@@ -72,6 +72,11 @@ spec:
             - name: RANCHER_SERVER_URL
               value: {{  .Values.rancherURL }}
 {{- end }}
+{{- if .Values.enableGoCoverDir }}
+            - name: GOCOVERDIR
+              value: /go-cover-dir
+{{- end }}
+{{ include "harvester.supportBundleImageEnv" . | indent 12 }}
             - name: NAMESPACE
               valueFrom:
                 fieldRef:
@@ -105,6 +110,16 @@ spec:
           resources:
 {{ toYaml .Values.containers.apiserver.resources | indent 12 }}
 {{- end }}
+{{- if .Values.enableGoCoverDir }}
+          volumeMounts:
+          - name: go-cover-dir
+            mountPath: /go-cover-dir
+      volumes:
+      - name: go-cover-dir
+        hostPath:
+          path: /usr/local/go-cover-dir/
+          type: DirectoryOrCreate
+{{- end }}
 {{- if .Values.securityContext }}
       securityContext:
 {{ toYaml .Values.securityContext | indent 8 }}
@@ -129,6 +144,10 @@ metadata:
     app.kubernetes.io/name: harvester-webhook
     app.kubernetes.io/component: webhook-server
 spec:
+{{- if .Values.webhook.strategy }}
+  strategy:
+{{ toYaml .Values.webhook.strategy | indent 4 }}
+{{- end }}
   selector:
     matchLabels:
 {{ include "harvester.immutableLabels" . | indent 6 }}
@@ -146,6 +165,13 @@ spec:
       serviceAccountName: harvester
       affinity:
 {{ include "harvester.apiAffinity" (dict "root" . "component" "webhook-server") | indent 8 }}
+      tolerations:
+      - effect: NoExecute
+        key: node.kubernetes.io/unreachable
+        operator: Exists
+      - effect: NoSchedule
+        key: node.kubernetes.io/unreachable
+        operator: Exists
       containers:
       - env:
         - name: HARVESTER_WEBHOOK_SERVER_HTTPS_PORT
@@ -158,6 +184,10 @@ spec:
           value: {{ .Values.webhook.debug | quote }}
         - name: HARVESTER_CONTROLLER_USER_NAME
           value: {{ .Values.webhook.controllerUser | default (print "system:serviceaccount:" .Release.Namespace ":harvester")  | quote }}
+{{- if .Values.enableGoCoverDir }}
+        - name: GOCOVERDIR
+          value: /go-cover-dir
+{{- end }}
         image: {{ .Values.webhook.image.repository }}:{{ .Values.webhook.image.tag }}
         name: harvester-webhook
         args: []
@@ -168,3 +198,13 @@ spec:
         ports:
         - name: https
           containerPort: {{ .Values.webhook.httpsPort }}
+{{- if .Values.enableGoCoverDir }}
+        volumeMounts:
+        - name: go-cover-dir
+          mountPath: /go-cover-dir
+      volumes:
+      - name: go-cover-dir
+        hostPath:
+          path: /usr/local/go-cover-dir/
+          type: DirectoryOrCreate
+{{- end }}

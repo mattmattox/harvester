@@ -4,8 +4,6 @@ import (
 	"fmt"
 )
 
-//go:generate msgp -unexported
-
 type arrayContainer struct {
 	content []uint16
 }
@@ -18,13 +16,35 @@ func (ac *arrayContainer) String() string {
 	return s + "}"
 }
 
-func (ac *arrayContainer) fillLeastSignificant16bits(x []uint32, i int, mask uint32) {
-	for k := 0; k < len(ac.content); k++ {
-		x[k+i] = uint32(ac.content[k]) | mask
+func (ac *arrayContainer) fillLeastSignificant16bits(x []uint32, i int, mask uint32) int {
+	if i < 0 {
+		panic("negative index")
 	}
+	if len(ac.content) == 0 {
+		return i
+	}
+	_ = x[len(ac.content)-1+i]
+	_ = ac.content[len(ac.content)-1]
+	for k := 0; k < len(ac.content); k++ {
+		x[k+i] =
+			uint32(ac.content[k]) | mask
+	}
+	return i + len(ac.content)
 }
 
-func (ac *arrayContainer) getShortIterator() shortIterable {
+func (ac *arrayContainer) iterate(cb func(x uint16) bool) bool {
+	iterator := shortIterator{ac.content, 0}
+
+	for iterator.hasNext() {
+		if !cb(iterator.next()) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (ac *arrayContainer) getShortIterator() shortPeekable {
 	return &shortIterator{ac.content, 0}
 }
 
@@ -33,7 +53,7 @@ func (ac *arrayContainer) getReverseIterator() shortIterable {
 }
 
 func (ac *arrayContainer) getManyIterator() manyIterable {
-	return &manyIterator{ac.content, 0}
+	return &shortIterator{ac.content, 0}
 }
 
 func (ac *arrayContainer) minimum() uint16 {
@@ -347,28 +367,17 @@ func (ac *arrayContainer) iorArray(value2 *arrayContainer) container {
 	len1 := value1.getCardinality()
 	len2 := value2.getCardinality()
 	maxPossibleCardinality := len1 + len2
-	if maxPossibleCardinality > arrayDefaultMaxSize { // it could be a bitmap!
-		bc := newBitmapContainer()
-		for k := 0; k < len(value2.content); k++ {
-			v := value2.content[k]
-			i := uint(v) >> 6
-			mask := uint64(1) << (v % 64)
-			bc.bitmap[i] |= mask
-		}
-		for k := 0; k < len(ac.content); k++ {
-			v := ac.content[k]
-			i := uint(v) >> 6
-			mask := uint64(1) << (v % 64)
-			bc.bitmap[i] |= mask
-		}
-		bc.cardinality = int(popcntSlice(bc.bitmap))
-		if bc.cardinality <= arrayDefaultMaxSize {
-			return bc.toArrayContainer()
-		}
-		return bc
-	}
 	if maxPossibleCardinality > cap(value1.content) {
-		newcontent := make([]uint16, 0, maxPossibleCardinality)
+		// doubling the capacity reduces new slice allocations in the case of
+		// repeated calls to iorArray().
+		newSize := 2 * maxPossibleCardinality
+		// the second check is to handle overly large array containers
+		// and should not occur in normal usage,
+		// as all array containers should be at most arrayDefaultMaxSize
+		if newSize > 2*arrayDefaultMaxSize && maxPossibleCardinality <= 2*arrayDefaultMaxSize {
+			newSize = 2 * arrayDefaultMaxSize
+		}
+		newcontent := make([]uint16, 0, newSize)
 		copy(newcontent[len2:maxPossibleCardinality], ac.content[0:len1])
 		ac.content = newcontent
 	} else {
@@ -376,6 +385,13 @@ func (ac *arrayContainer) iorArray(value2 *arrayContainer) container {
 	}
 	nl := union2by2(value1.content[len2:maxPossibleCardinality], value2.content, ac.content)
 	ac.content = ac.content[:nl] // reslice to match actual used capacity
+
+	if nl > arrayDefaultMaxSize {
+		// Only converting to a bitmap when arrayDefaultMaxSize
+		// is actually exceeded minimizes conversions in the case of repeated
+		// calls to iorArray().
+		return ac.toBitmapContainer()
+	}
 	return ac
 }
 
@@ -388,11 +404,19 @@ func (ac *arrayContainer) iorBitmap(bc2 *bitmapContainer) container {
 }
 
 func (ac *arrayContainer) iorRun16(rc *runContainer16) container {
-	bc1 := ac.toBitmapContainer()
-	bc2 := rc.toBitmapContainer()
-	bc1.iorBitmap(bc2)
-	*ac = *newArrayContainerFromBitmap(bc1)
-	return ac
+	runCardinality := rc.getCardinality()
+	// heuristic for if the container should maybe be an
+	// array container.
+	if runCardinality < ac.getCardinality() &&
+		runCardinality+ac.getCardinality() < arrayDefaultMaxSize {
+		var result container
+		result = ac
+		for _, run := range rc.iv {
+			result = result.iaddRange(int(run.start), int(run.start)+int(run.length)+1)
+		}
+		return result
+	}
+	return rc.orArray(ac)
 }
 
 func (ac *arrayContainer) lazyIOR(a container) container {
@@ -477,7 +501,7 @@ func (ac *arrayContainer) orArrayCardinality(value2 *arrayContainer) int {
 func (ac *arrayContainer) lazyorArray(value2 *arrayContainer) container {
 	value1 := ac
 	maxPossibleCardinality := value1.getCardinality() + value2.getCardinality()
-	if maxPossibleCardinality > arrayLazyLowerBound { // it could be a bitmap!^M
+	if maxPossibleCardinality > arrayLazyLowerBound { // it could be a bitmap!
 		bc := newBitmapContainer()
 		for k := 0; k < len(value2.content); k++ {
 			v := value2.content[k]
@@ -640,10 +664,54 @@ func (ac *arrayContainer) iandNot(a container) container {
 }
 
 func (ac *arrayContainer) iandNotRun16(rc *runContainer16) container {
-	rcb := rc.toBitmapContainer()
-	acb := ac.toBitmapContainer()
-	acb.iandNotBitmapSurely(rcb)
-	*ac = *(acb.toArrayContainer())
+	// Fast path: if either the array container or the run container is empty, the result is the array.
+	if ac.isEmpty() || rc.isEmpty() {
+		// Empty
+		return ac
+	}
+	// Fast path: if the run container is full, the result is empty.
+	if rc.isFull() {
+		ac.content = ac.content[:0]
+		return ac
+	}
+	current_run := 0
+	// All values in [start_run, end_end] are part of the run
+	start_run := rc.iv[current_run].start
+	end_end := start_run + rc.iv[current_run].length
+	// We are going to read values in the array at index i, and we are
+	// going to write them at index pos. So we do in-place processing.
+	// We always have that pos <= i by construction. So we can either
+	// overwrite a value just read, or a value that was previous read.
+	pos := 0
+	i := 0
+	for ; i < len(ac.content); i++ {
+		if ac.content[i] < start_run {
+			// the value in the array appears before the run [start_run, end_end]
+			ac.content[pos] = ac.content[i]
+			pos++
+		} else if ac.content[i] <= end_end {
+			// nothing to do, the value is in the array but also in the run.
+		} else {
+			// We have the value in the array after the run. We cannot tell
+			// whether we need to keep it or not. So let us move to another run.
+			if current_run+1 < len(rc.iv) {
+				current_run++
+				start_run = rc.iv[current_run].start
+				end_end = start_run + rc.iv[current_run].length
+				i-- // retry with the same i
+			} else {
+				// We have exhausted the number of runs. We can keep the rest of the values
+				// from i to len(ac.content) - 1 inclusively.
+				break // We are done, the rest of the array will be kept
+			}
+		}
+	}
+	for ; i < len(ac.content); i++ {
+		ac.content[pos] = ac.content[i]
+		pos++
+	}
+	// We 'shink' the slice.
+	ac.content = ac.content[:pos]
 	return ac
 }
 
@@ -837,6 +905,10 @@ func (ac *arrayContainer) getCardinality() int {
 	return len(ac.content)
 }
 
+func (ac *arrayContainer) isEmpty() bool {
+	return len(ac.content) == 0
+}
+
 func (ac *arrayContainer) rank(x uint16) int {
 	answer := binarySearch(ac.content, x)
 	if answer >= 0 {
@@ -864,6 +936,41 @@ func (ac *arrayContainer) loadData(bitmapContainer *bitmapContainer) {
 	ac.content = make([]uint16, bitmapContainer.cardinality, bitmapContainer.cardinality)
 	bitmapContainer.fillArray(ac.content)
 }
+
+func (ac *arrayContainer) resetTo(a container) {
+	switch x := a.(type) {
+	case *arrayContainer:
+		ac.realloc(len(x.content))
+		copy(ac.content, x.content)
+
+	case *bitmapContainer:
+		ac.realloc(x.cardinality)
+		x.fillArray(ac.content)
+
+	case *runContainer16:
+		card := int(x.getCardinality())
+		ac.realloc(card)
+		cur := 0
+		for _, r := range x.iv {
+			for val := r.start; val <= r.last(); val++ {
+				ac.content[cur] = val
+				cur++
+			}
+		}
+
+	default:
+		panic("unsupported container type")
+	}
+}
+
+func (ac *arrayContainer) realloc(size int) {
+	if cap(ac.content) < size {
+		ac.content = make([]uint16, size)
+	} else {
+		ac.content = ac.content[:size]
+	}
+}
+
 func newArrayContainer() *arrayContainer {
 	p := new(arrayContainer)
 	return p
@@ -915,10 +1022,10 @@ func (ac *arrayContainer) numberOfRuns() (nr int) {
 				runlen++
 			} else {
 				if cur < prev {
-					panic("then fundamental arrayContainer assumption of sorted ac.content was broken")
+					panic("the fundamental arrayContainer assumption of sorted ac.content was broken")
 				}
 				if cur == prev {
-					panic("then fundamental arrayContainer assumption of deduplicated content was broken")
+					panic("the fundamental arrayContainer assumption of deduplicated content was broken")
 				} else {
 					nr++
 					runlen = 0
@@ -953,16 +1060,42 @@ func (ac *arrayContainer) containerType() contype {
 	return arrayContype
 }
 
-func (ac *arrayContainer) addOffset(x uint16) []container {
-	low := &arrayContainer{}
-	high := &arrayContainer{}
+func (ac *arrayContainer) addOffset(x uint16) (container, container) {
+	var low, high *arrayContainer
+
+	if len(ac.content) == 0 {
+		return nil, nil
+	}
+
+	if y := uint32(ac.content[0]) + uint32(x); highbits(y) == 0 {
+		// Some elements will fall into low part, allocate a container.
+		// Checking the first one is enough because they are ordered.
+		low = &arrayContainer{}
+	}
+	if y := uint32(ac.content[len(ac.content)-1]) + uint32(x); highbits(y) > 0 {
+		// Some elements will fall into high part, allocate a container.
+		// Checking the last one is enough because they are ordered.
+		high = &arrayContainer{}
+	}
+
 	for _, val := range ac.content {
 		y := uint32(val) + uint32(x)
 		if highbits(y) > 0 {
+			// OK, if high == nil then highbits(y) == 0 for all y.
 			high.content = append(high.content, lowbits(y))
 		} else {
+			// OK, if low == nil then highbits(y) > 0 for all y.
 			low.content = append(low.content, lowbits(y))
 		}
 	}
-	return []container{low, high}
+
+	// Ensure proper nil interface.
+	if low == nil {
+		return nil, high
+	}
+	if high == nil {
+		return low, nil
+	}
+
+	return low, high
 }

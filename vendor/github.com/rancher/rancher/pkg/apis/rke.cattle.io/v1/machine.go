@@ -1,10 +1,10 @@
 package v1
 
 import (
-	"github.com/rancher/wrangler/pkg/genericcondition"
+	"github.com/rancher/wrangler/v3/pkg/genericcondition"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	capi "sigs.k8s.io/cluster-api/api/v1alpha4"
+	capi "sigs.k8s.io/cluster-api/api/v1beta1"
 )
 
 type RKECommonNodeConfig struct {
@@ -15,7 +15,6 @@ type RKECommonNodeConfig struct {
 
 type RKEMachineStatus struct {
 	Conditions                []genericcondition.GenericCondition `json:"conditions,omitempty"`
-	JobComplete               bool                                `json:"jobComplete,omitempty"`
 	JobName                   string                              `json:"jobName,omitempty"`
 	Ready                     bool                                `json:"ready,omitempty"`
 	DriverHash                string                              `json:"driverHash,omitempty"`
@@ -27,6 +26,7 @@ type RKEMachineStatus struct {
 }
 
 // +genclient
+// +kubebuilder:skipversion
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 type CustomMachine struct {
@@ -42,6 +42,7 @@ type CustomMachineSpec struct {
 }
 
 type CustomMachineStatus struct {
-	Ready     bool                  `json:"ready,omitempty"`
-	Addresses []capi.MachineAddress `json:"addresses,omitempty"`
+	Conditions []genericcondition.GenericCondition `json:"conditions,omitempty"`
+	Ready      bool                                `json:"ready,omitempty"`
+	Addresses  []capi.MachineAddress               `json:"addresses,omitempty"`
 }

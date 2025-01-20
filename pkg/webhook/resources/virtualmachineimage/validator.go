@@ -3,11 +3,14 @@ package virtualmachineimage
 import (
 	"fmt"
 	"reflect"
+	"strings"
 
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
+	ctlstoragev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/storage/v1"
 	admissionregv1 "k8s.io/api/admissionregistration/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,6 +20,7 @@ import (
 	ctlharvesterv1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	"github.com/harvester/harvester/pkg/util"
 	werror "github.com/harvester/harvester/pkg/webhook/error"
+	"github.com/harvester/harvester/pkg/webhook/indexeres"
 	"github.com/harvester/harvester/pkg/webhook/types"
 )
 
@@ -24,20 +28,35 @@ const (
 	fieldDisplayName = "spec.displayName"
 )
 
-func NewValidator(vmimages ctlharvesterv1.VirtualMachineImageCache, pvcCache ctlcorev1.PersistentVolumeClaimCache, ssar authorizationv1client.SelfSubjectAccessReviewInterface) types.Validator {
+func NewValidator(
+	vmimages ctlharvesterv1.VirtualMachineImageCache,
+	pvcCache ctlcorev1.PersistentVolumeClaimCache,
+	ssar authorizationv1client.SelfSubjectAccessReviewInterface,
+	vmTemplateVersionCache ctlharvesterv1.VirtualMachineTemplateVersionCache,
+	secretCache ctlcorev1.SecretCache,
+	storageClassCache ctlstoragev1.StorageClassCache,
+	vmBackupCache ctlharvesterv1.VirtualMachineBackupCache) types.Validator {
 	return &virtualMachineImageValidator{
-		vmimages: vmimages,
-		pvcCache: pvcCache,
-		ssar:     ssar,
+		vmimages:               vmimages,
+		pvcCache:               pvcCache,
+		ssar:                   ssar,
+		vmTemplateVersionCache: vmTemplateVersionCache,
+		secretCache:            secretCache,
+		storageClassCache:      storageClassCache,
+		vmBackupCache:          vmBackupCache,
 	}
 }
 
 type virtualMachineImageValidator struct {
 	types.DefaultValidator
 
-	vmimages ctlharvesterv1.VirtualMachineImageCache
-	pvcCache ctlcorev1.PersistentVolumeClaimCache
-	ssar     authorizationv1client.SelfSubjectAccessReviewInterface
+	vmimages               ctlharvesterv1.VirtualMachineImageCache
+	pvcCache               ctlcorev1.PersistentVolumeClaimCache
+	ssar                   authorizationv1client.SelfSubjectAccessReviewInterface
+	vmTemplateVersionCache ctlharvesterv1.VirtualMachineTemplateVersionCache
+	secretCache            ctlcorev1.SecretCache
+	storageClassCache      ctlstoragev1.StorageClassCache
+	vmBackupCache          ctlharvesterv1.VirtualMachineBackupCache
 }
 
 func (v *virtualMachineImageValidator) Resource() types.Resource {
@@ -58,6 +77,10 @@ func (v *virtualMachineImageValidator) Resource() types.Resource {
 func (v *virtualMachineImageValidator) Create(request *types.Request, newObj runtime.Object) error {
 	newImage := newObj.(*v1beta1.VirtualMachineImage)
 	if err := v.CheckImageDisplayNameAndURL(newImage); err != nil {
+		return err
+	}
+
+	if err := v.checkImageSecurityParameters(newImage); err != nil {
 		return err
 	}
 
@@ -82,12 +105,89 @@ func (v *virtualMachineImageValidator) CheckImageDisplayNameAndURL(newImage *v1b
 		return werror.NewConflict("A resource with the same name exists")
 	}
 
-	if newImage.Spec.SourceType == v1beta1.VirtualMachineImageSourceTypeDownload && newImage.Spec.URL == "" {
-		return werror.NewInvalidError(`url is required when image source type is "download"`, "spec.url")
+	shouldHaveURL := false
+	if newImage.Spec.SourceType == v1beta1.VirtualMachineImageSourceTypeDownload || newImage.Spec.SourceType == v1beta1.VirtualMachineImageSourceTypeRestore {
+		shouldHaveURL = true
 	}
 
-	if newImage.Spec.SourceType != v1beta1.VirtualMachineImageSourceTypeDownload && newImage.Spec.URL != "" {
-		return werror.NewInvalidError(`url should be empty when image source type is not "download"`, "spec.url")
+	if shouldHaveURL && newImage.Spec.URL == "" {
+		return werror.NewInvalidError(fmt.Sprintf(`url is required when image source type is "%s"`, newImage.Spec.SourceType), "spec.url")
+	} else if !shouldHaveURL && newImage.Spec.URL != "" {
+		return werror.NewInvalidError(fmt.Sprintf(`url should be empty when image source type is "%s"`, newImage.Spec.SourceType), "spec.url")
+	}
+
+	return nil
+}
+
+func (v *virtualMachineImageValidator) checkImageSecurityParameters(newImage *v1beta1.VirtualMachineImage) error {
+	if newImage.Spec.SourceType != v1beta1.VirtualMachineImageSourceTypeClone {
+		return nil
+	}
+
+	sp := newImage.Spec.SecurityParameters
+	if sp == nil {
+		return werror.NewInvalidError(`sourceParameters is required when image source type is "clone"`, "spec.sourceParameters")
+	}
+
+	if sp.CryptoOperation == "" {
+		return werror.NewInvalidError(`encryption is required when image source type is "clone"`, "spec.cryptoOperation")
+	}
+
+	if sp.SourceImageName == "" {
+		return werror.NewInvalidError(`SourceImageName is required when image source type is "clone"`, "spec.security.sourceImageName")
+	}
+
+	if sp.SourceImageNamespace == "" {
+		return werror.NewInvalidError(`SourceImageNamespace is required when image source type is "clone"`, "spec.security.sourceImageName")
+	}
+
+	// Check if the source image exists
+	sourceImage, err := v.vmimages.Get(sp.SourceImageNamespace, sp.SourceImageName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return werror.NewInvalidError(fmt.Sprintf("source image %s/%s not found", sp.SourceImageNamespace, sp.SourceImageName), "spec.securityParameters.sourceImageName")
+		}
+		return werror.NewInternalError(fmt.Sprintf("failed to get source image %s/%s: %v", sp.SourceImageNamespace, sp.SourceImageName, err))
+	}
+
+	sourceSp := sourceImage.Spec.SecurityParameters
+	if (sourceSp != nil && sourceSp.CryptoOperation == v1beta1.VirtualMachineImageCryptoOperationTypeEncrypt) &&
+		sp.CryptoOperation == v1beta1.VirtualMachineImageCryptoOperationTypeEncrypt {
+		return werror.NewInvalidError(fmt.Sprintf("can not re-encrypt, source image %s/%s (%s) is already encrypted", sourceImage.Namespace, sourceImage.Name, sourceImage.Spec.DisplayName), "")
+	}
+
+	if (sourceSp == nil || sourceSp.CryptoOperation == v1beta1.VirtualMachineImageCryptoOperationTypeDecrypt) &&
+		sp.CryptoOperation == v1beta1.VirtualMachineImageCryptoOperationTypeDecrypt {
+		return werror.NewInvalidError(fmt.Sprintf("can not re-decrypt, source image %s/%s (%s) is not encrypted", sourceImage.Namespace, sourceImage.Name, sourceImage.Spec.DisplayName), "")
+	}
+
+	if !v1beta1.ImageImported.IsTrue(sourceImage) {
+		return werror.NewInvalidError(fmt.Sprintf("source image %s/%s (%s) is not ready", sourceImage.Namespace, sourceImage.Name, sourceImage.Spec.DisplayName), "")
+	}
+
+	// For decryption, we don't need to check the storage class.
+	// We could use sourceImage to track back to get the storage class.
+	if sp.CryptoOperation == v1beta1.VirtualMachineImageCryptoOperationTypeDecrypt {
+		return nil
+	}
+
+	// Check if storage class exits
+	scName, ok := newImage.Annotations[util.AnnotationStorageClassName]
+	if !ok {
+		return werror.NewInvalidError("storageClassName is required when using security params", fmt.Sprintf("metadata.annotations[%s]", util.AnnotationStorageClassName))
+	}
+
+	sc, err := v.storageClassCache.Get(scName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return werror.NewInvalidError(fmt.Sprintf("storage class %s not found", scName), fmt.Sprintf("metadata.annotations[%s]", util.AnnotationStorageClassName))
+		}
+		return werror.NewInternalError(fmt.Sprintf("failed to get storage class %s: %v", scName, err))
+	}
+
+	value := sc.Parameters[util.LonghornOptionEncrypted]
+	if value != "true" {
+		return werror.NewInvalidError(fmt.Sprintf("storage class %s is not for encryption or decryption", scName), fmt.Sprintf("spec.parameters[%s] must be true", util.LonghornOptionEncrypted))
 	}
 
 	return nil
@@ -136,7 +236,7 @@ func (v *virtualMachineImageValidator) CheckImagePVC(request *types.Request, new
 	return nil
 }
 
-func (v *virtualMachineImageValidator) Update(request *types.Request, oldObj runtime.Object, newObj runtime.Object) error {
+func (v *virtualMachineImageValidator) Update(_ *types.Request, oldObj runtime.Object, newObj runtime.Object) error {
 	newImage := newObj.(*v1beta1.VirtualMachineImage)
 	oldImage := oldObj.(*v1beta1.VirtualMachineImage)
 
@@ -161,15 +261,38 @@ func (v *virtualMachineImageValidator) Update(request *types.Request, oldObj run
 		}
 	}
 
+	if oldImage.Spec.URL != newImage.Spec.URL {
+		return werror.NewInvalidError("url cannot be modified", "spec.url")
+	}
+
+	if !reflect.DeepEqual(oldImage.Spec.SecurityParameters, newImage.Spec.SecurityParameters) {
+		return werror.NewInvalidError("securityParameters cannot be modified", "spec.securityParameters")
+	}
+
 	return v.CheckImageDisplayNameAndURL(newImage)
 }
 
-func (v *virtualMachineImageValidator) Delete(request *types.Request, oldObj runtime.Object) error {
+func (v *virtualMachineImageValidator) Delete(_ *types.Request, oldObj runtime.Object) error {
 	image := oldObj.(*v1beta1.VirtualMachineImage)
 
 	if image.Status.StorageClassName == "" {
 		return nil
 	}
+
+	for _, ownerRef := range image.GetOwnerReferences() {
+		if ownerRef.Kind == "VirtualMachineTemplateVersion" {
+			_, err := v.vmTemplateVersionCache.Get(image.Namespace, ownerRef.Name)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					continue
+				}
+				return werror.NewInternalError(err.Error())
+			}
+			message := fmt.Sprintf("Cannot delete image %s/%s: being used by VMTemplateVersion %s", image.Namespace, image.Spec.DisplayName, ownerRef.Name)
+			return werror.NewInvalidError(message, "")
+		}
+	}
+
 	pvcs, err := v.pvcCache.List(corev1.NamespaceAll, labels.Everything())
 	if err != nil {
 		return err
@@ -182,5 +305,18 @@ func (v *virtualMachineImageValidator) Delete(request *types.Request, oldObj run
 		}
 	}
 
+	vmBackups, err := v.vmBackupCache.GetByIndex(indexeres.VMBackupByStorageClassNameIndex, image.Status.StorageClassName)
+	if err != nil {
+		message := fmt.Sprintf("Failed to get VMBackups by storageClassName %s: %v", image.Status.StorageClassName, err)
+		return werror.NewInternalError(message)
+	}
+
+	if len(vmBackups) > 0 {
+		vmBackupNamespaceAndNames := []string{}
+		for _, vmBackup := range vmBackups {
+			vmBackupNamespaceAndNames = append(vmBackupNamespaceAndNames, fmt.Sprintf("%s/%s", vmBackup.Namespace, vmBackup.Name))
+		}
+		return werror.NewInvalidError(fmt.Sprintf("Cannot delete image %s/%s: being used by VMBackups %s", image.Namespace, image.Spec.DisplayName, strings.Join(vmBackupNamespaceAndNames, ",")), "")
+	}
 	return nil
 }

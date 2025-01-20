@@ -2,6 +2,7 @@ package engineapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -12,6 +13,12 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/utils/clock"
+
+	lhbackup "github.com/longhorn/go-common-libs/backup"
+
+	"github.com/longhorn/longhorn-manager/datastore"
+	"github.com/longhorn/longhorn-manager/types"
+	"github.com/longhorn/longhorn-manager/util"
 
 	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 )
@@ -42,13 +49,10 @@ type BackupMonitor struct {
 
 	ctx  context.Context
 	quit context.CancelFunc
-
-	retryCount int
 }
 
-func NewBackupMonitor(logger logrus.FieldLogger,
-	backup *longhorn.Backup, volume *longhorn.Volume, backupTargetClient *BackupTargetClient,
-	biChecksum string, engine *longhorn.Engine, engineClientProxy EngineClientProxy,
+func NewBackupMonitor(logger logrus.FieldLogger, ds *datastore.DataStore, backup *longhorn.Backup, volume *longhorn.Volume, backupTargetClient *BackupTargetClient,
+	biChecksum string, compressionMethod longhorn.BackupCompressionMethod, concurrentLimit int, storageClassName string, engine *longhorn.Engine, engineClientProxy EngineClientProxy,
 	syncCallback func(key string)) (*BackupMonitor, error) {
 	ctx, quit := context.WithCancel(context.Background())
 	m := &BackupMonitor{
@@ -70,11 +74,22 @@ func NewBackupMonitor(logger logrus.FieldLogger,
 	}
 
 	// Call engine API snapshot backup
-	if backup.Status.State == longhorn.BackupStateNew {
-		_, replicaAddress, err := engineClientProxy.SnapshotBackup(engine,
-			backup.Spec.SnapshotName, backup.Name, backupTargetClient.URL,
-			volume.Spec.BackingImage, biChecksum,
-			backup.Spec.Labels, backupTargetClient.Credential)
+	if backup.Status.State == longhorn.BackupStateNew || backup.Status.State == longhorn.BackupStatePending {
+
+		backupParameters := getBackupParameters(backup)
+
+		// volumeRecurringJobInfo could be "".
+		volumeRecurringJobInfo, err := m.getVolumeRecurringJobInfos(ds, volume)
+		if err != nil {
+			return nil, err
+		}
+		// put volume recurring jobs/groups information into backup labels and it would be stored in the file `volume.cfg`
+		if volumeRecurringJobInfo != "" {
+			backup.Spec.Labels[types.VolumeRecurringJobInfoLabel] = volumeRecurringJobInfo
+		}
+		_, replicaAddress, err := engineClientProxy.SnapshotBackup(engine, backup.Spec.SnapshotName, backup.Name,
+			backupTargetClient.URL, volume.Spec.BackingImage, biChecksum, string(compressionMethod), concurrentLimit, storageClassName,
+			backup.Spec.Labels, backupTargetClient.Credential, backupParameters)
 		if err != nil {
 			if !strings.Contains(err.Error(), "DeadlineExceeded") {
 				m.logger.WithError(err).Warn("Cannot take snapshot backup")
@@ -109,6 +124,68 @@ func NewBackupMonitor(logger logrus.FieldLogger,
 	return m, nil
 }
 
+// getVolumeRecurringJobInfos get recurring jobs in the volume labels and recurring jobs of groups in the volume labels
+func (m *BackupMonitor) getVolumeRecurringJobInfos(ds *datastore.DataStore, volume *longhorn.Volume) (string, error) {
+	allRecurringJobs, err := ds.ListRecurringJobsRO()
+	if err != nil {
+		m.logger.WithError(err).Warn("Failed to list all recurring jobs")
+		return "", err
+	}
+
+	volumeRecurringJobInfos := make(map[string]longhorn.VolumeRecurringJobInfo)
+	// distinguish volume labels between job and group.
+	volumeSelectedRecurringJobs := datastore.MarshalLabelToVolumeRecurringJob(volume.Labels)
+	for recurringJobName, recurringJob := range allRecurringJobs {
+		for jobName, job := range volumeSelectedRecurringJobs {
+			if job.IsGroup {
+				// add the recurring job from group or update its groups informtaion
+				if volumeRecurringJobInfos, err = addVolumeRecurringJobInfosFromGroup(recurringJobName, jobName, &recurringJob.Spec, volumeRecurringJobInfos); err != nil {
+					m.logger.WithError(err).WithFields(logrus.Fields{"recurringjob": recurringJobName, "group": jobName}).Warn("Failed to add the recurring job")
+					return "", err
+				}
+			} else if recurringJobName == jobName {
+				// save a recurring job information if it is not a group.
+				if recordJob, exist := volumeRecurringJobInfos[recurringJobName]; !exist {
+					volumeRecurringJobInfos[recurringJobName] = longhorn.VolumeRecurringJobInfo{JobSpec: recurringJob.Spec, FromJob: true, FromGroup: []string{}}
+				} else {
+					// recurring job has been saved by groups and update it from job as well.
+					recordJob.FromJob = true
+					volumeRecurringJobInfos[recurringJobName] = recordJob
+				}
+			}
+		}
+	}
+	volumeRecurringJobInfosBytes, err := json.Marshal(volumeRecurringJobInfos)
+	if err != nil {
+		m.logger.WithError(err).Warnf("Marshal volumeRecurringJobInfoMap: %v", volumeRecurringJobInfos)
+		return "", err
+	}
+
+	return string(volumeRecurringJobInfosBytes), nil
+}
+
+// addVolumeRecurringJobInfosFromGroup add recurring jobs in the group and add the group name into the recurring job information
+func addVolumeRecurringJobInfosFromGroup(jobName, groupName string, jobSpec *longhorn.RecurringJobSpec, volumeRecurringJobInfo map[string]longhorn.VolumeRecurringJobInfo) (map[string]longhorn.VolumeRecurringJobInfo, error) {
+	if !util.Contains(jobSpec.Groups, groupName) {
+		// this job is not in this group then do nothing
+		return volumeRecurringJobInfo, nil
+	}
+	if _, exist := volumeRecurringJobInfo[jobName]; !exist {
+		// store new recurring job information in this group
+		volumeRecurringJobInfo[jobName] = longhorn.VolumeRecurringJobInfo{JobSpec: *jobSpec, FromGroup: []string{groupName}}
+		return volumeRecurringJobInfo, nil
+	}
+
+	if !util.Contains(volumeRecurringJobInfo[jobName].FromGroup, groupName) {
+		// this recurring job saved but it is in multiple groups, update its groups information.
+		recordJob := volumeRecurringJobInfo[jobName]
+		recordJob.FromGroup = append(recordJob.FromGroup, groupName)
+		volumeRecurringJobInfo[jobName] = recordJob
+	}
+
+	return volumeRecurringJobInfo, nil
+}
+
 func (m *BackupMonitor) monitorBackups() {
 	// If backup.status.state = Pending, use exponential backoff timer to monitor engine/replica backup status
 	// Otherwise, use liner timer to monitor engine/replica backup status
@@ -123,7 +200,7 @@ func (m *BackupMonitor) monitorBackups() {
 
 // linerTimer runs a periodically liner timer to sync backup status from engine/replica
 func (m *BackupMonitor) linerTimer() {
-	wait.PollUntil(BackupMonitorSyncPeriod, func() (done bool, err error) {
+	if err := wait.PollUntilContextCancel(m.ctx, BackupMonitorSyncPeriod, false, func(context.Context) (done bool, err error) {
 		currentBackupStatus, err := m.syncBackupStatusFromEngineReplica()
 		if err != nil {
 			currentBackupStatus.State = longhorn.BackupStateError
@@ -131,7 +208,9 @@ func (m *BackupMonitor) linerTimer() {
 		}
 		m.syncCallBack(currentBackupStatus)
 		return false, nil
-	}, m.ctx.Done())
+	}); err != nil {
+		m.logger.WithError(err).Error("Failed to sync backup status")
+	}
 }
 
 // exponentialBackOffTimer runs a exponential backoff timer to sync backup status from engine/replica
@@ -146,7 +225,7 @@ func (m *BackupMonitor) exponentialBackOffTimer() bool {
 		retryCount    = 0
 	)
 	// The exponential backoff timer 2s/4s/8s/16s/.../10mins
-	backoffMgr := wait.NewExponentialBackoffManager(initBackoff, maxBackoff, resetDuration, backoffFactor, jitter, clock)
+	backoffMgr := wait.NewExponentialBackoffManager(initBackoff, maxBackoff, resetDuration, backoffFactor, jitter, clock) // nolint: staticcheck
 	defer backoffMgr.Backoff().Stop()
 
 	ctx, cancel := context.WithTimeout(context.Background(), BackupMonitorMaxRetryPeriod)
@@ -168,7 +247,7 @@ func (m *BackupMonitor) exponentialBackOffTimer() bool {
 			// Keep in exponential backoff timer
 		case <-ctx.Done():
 			// Give it the last try to prevent if the snapshot backup succeed between
-			// the last trigged backoff time and the max retry period
+			// the last triggered backoff time and the max retry period
 			currentBackupStatus, err := m.syncBackupStatusFromEngineReplica()
 			if err == nil {
 				m.logger.Info("Change to liner timer to monitor it")
@@ -177,7 +256,7 @@ func (m *BackupMonitor) exponentialBackOffTimer() bool {
 			}
 
 			// Set to Error state
-			err = fmt.Errorf("Max retry period %s reached in exponential backoff timer", BackupMonitorMaxRetryPeriod)
+			err = fmt.Errorf("max retry period %s reached in exponential backoff timer", BackupMonitorMaxRetryPeriod)
 			m.logger.Error(err)
 
 			currentBackupStatus.State = longhorn.BackupStateError
@@ -201,14 +280,26 @@ func (m *BackupMonitor) syncCallBack(currentBackupStatus longhorn.BackupStatus) 
 	}
 }
 
-func (m *BackupMonitor) syncBackupStatusFromEngineReplica() (longhorn.BackupStatus, error) {
-	currentBackupStatus := longhorn.BackupStatus{}
+func (m *BackupMonitor) syncBackupStatusFromEngineReplica() (currentBackupStatus longhorn.BackupStatus, err error) {
+	currentBackupStatus = longhorn.BackupStatus{}
+	var engineBackupStatus *longhorn.EngineBackupStatus
+
+	defer func() {
+		if err == nil && engineBackupStatus != nil {
+			currentBackupStatus.Progress = engineBackupStatus.Progress
+			currentBackupStatus.URL = engineBackupStatus.BackupURL
+			currentBackupStatus.Error = engineBackupStatus.Error
+			currentBackupStatus.SnapshotName = engineBackupStatus.SnapshotName
+			currentBackupStatus.State = ConvertEngineBackupState(engineBackupStatus.State)
+			currentBackupStatus.ReplicaAddress = engineBackupStatus.ReplicaAddress
+		}
+	}()
 
 	m.backupStatusLock.RLock()
 	m.backupStatus.DeepCopyInto(&currentBackupStatus)
 	m.backupStatusLock.RUnlock()
 
-	engineBackupStatus, err := m.engineClientProxy.SnapshotBackupStatus(m.engine, m.backupName, m.replicaAddress)
+	engineBackupStatus, err = m.engineClientProxy.SnapshotBackupStatus(m.engine, m.backupName, m.replicaAddress, "")
 	if err != nil {
 		return currentBackupStatus, err
 	}
@@ -221,12 +312,6 @@ func (m *BackupMonitor) syncBackupStatusFromEngineReplica() (longhorn.BackupStat
 		return currentBackupStatus, err
 	}
 
-	currentBackupStatus.Progress = engineBackupStatus.Progress
-	currentBackupStatus.URL = engineBackupStatus.BackupURL
-	currentBackupStatus.Error = engineBackupStatus.Error
-	currentBackupStatus.SnapshotName = engineBackupStatus.SnapshotName
-	currentBackupStatus.State = ConvertEngineBackupState(engineBackupStatus.State)
-	currentBackupStatus.ReplicaAddress = engineBackupStatus.ReplicaAddress
 	return currentBackupStatus, nil
 }
 
@@ -239,4 +324,10 @@ func (m *BackupMonitor) GetBackupStatus() longhorn.BackupStatus {
 func (m *BackupMonitor) Close() {
 	m.engineClientProxy.Close()
 	m.quit()
+}
+
+func getBackupParameters(backup *longhorn.Backup) map[string]string {
+	parameters := map[string]string{}
+	parameters[lhbackup.LonghornBackupParameterBackupMode] = string(backup.Spec.BackupMode)
+	return parameters
 }

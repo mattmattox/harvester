@@ -2,6 +2,7 @@ package types
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -19,16 +20,21 @@ const (
 	DefaultSyncServerPort           = 8001
 	DefaultVolumeExportReceiverPort = 8002
 
-	GRPCServiceTimeout = 1 * time.Minute
-	HTTPTimeout        = 4 * time.Second
-	MonitorInterval    = 3 * time.Second
-	FileSyncTimeout    = 120
+	GRPCServiceTimeout      = 1 * time.Minute
+	HTTPTimeout             = 4 * time.Second
+	MonitorInterval         = 3 * time.Second
+	CommandExecutionTimeout = 10 * time.Second
+
+	FileSyncHTTPClientTimeout = 5 // TODO: use 5 seconds as default, need to refactor it
 
 	SendingLimit = 3
 
 	BackingImageFileName    = "backing"
 	TmpFileSuffix           = ".tmp"
 	BackingImageTmpFileName = BackingImageFileName + TmpFileSuffix
+
+	MapperFilePathPrefix = "/dev/mapper"
+	EncryptionMetaSize   = 16 * 1024 * 1024 // 16MB
 )
 
 type State string
@@ -38,6 +44,7 @@ const (
 	StateStarting         = State("starting")
 	StateInProgress       = State("in-progress")
 	StateFailed           = State("failed")
+	StateFailedAndCleanUp = State("failed-and-cleanup")
 	StateUnknown          = State("unknown")
 	StateReady            = State("ready")
 	StateReadyForTransfer = State("ready-for-transfer")
@@ -49,15 +56,24 @@ const (
 	DataSourceTypeDownload         = DataSourceType("download")
 	DataSourceTypeUpload           = DataSourceType("upload")
 	DataSourceTypeExportFromVolume = DataSourceType("export-from-volume")
+	DataSourceTypeRestore          = DataSourceType("restore")
+	DataSourceTypeClone            = DataSourceType("clone")
 )
 
 const (
-	DataSourceTypeDownloadParameterURL = "url"
-	DataSourceTypeFileType             = "file-type"
+	DataSourceTypeCloneParameterBackingImage     = "backing-image"
+	DataSourceTypeCloneParameterBackingImageUUID = "backing-image-uuid"
+	DataSourceTypeCloneParameterEncryption       = "encryption"
 
-	DataSourceTypeExportFromVolumeParameterVolumeSize    = "volume-size"
-	DataSourceTypeExportFromVolumeParameterSnapshotName  = "snapshot-name"
-	DataSourceTypeExportFromVolumeParameterSenderAddress = "sender-address"
+	DataSourceTypeDownloadParameterURL            = "url"
+	DataSourceTypeRestoreParameterBackupURL       = "backup-url"
+	DataSourceTypeRestoreParameterConcurrentLimit = "concurrent-limit"
+	DataSourceTypeFileType                        = "file-type"
+
+	DataSourceTypeExportFromVolumeParameterVolumeSize                = "volume-size"
+	DataSourceTypeExportFromVolumeParameterSnapshotName              = "snapshot-name"
+	DataSourceTypeExportFromVolumeParameterSenderAddress             = "sender-address"
+	DataSourceTypeExportFromVolumeParameterFileSyncHTTPClientTimeout = "file-sync-http-client-timeout"
 
 	DataSourceTypeExportFromVolumeParameterExportTypeRAW   = "raw"
 	DataSourceTypeExportFromVolumeParameterExportTypeQCOW2 = "qcow2"
@@ -65,6 +81,14 @@ const (
 	SyncingFileTypeEmpty = ""
 	SyncingFileTypeRaw   = "raw"
 	SyncingFileTypeQcow2 = "qcow2"
+)
+
+type EncryptionType string
+
+const (
+	EncryptionTypeEncrypt = EncryptionType("encrypt")
+	EncryptionTypeDecrypt = EncryptionType("decrypt")
+	EncryptionTypeIgnore  = EncryptionType("ignore")
 )
 
 func GetDataSourceFileName(biName, biUUID string) string {
@@ -90,4 +114,12 @@ func GetBackingImageFilePath(diskPath, biName, biUUID string) string {
 func GetBackingImageNameFromFilePath(biFilePath, biUUID string) string {
 	biDirName := filepath.Join(filepath.Base(filepath.Dir(biFilePath)))
 	return strings.TrimSuffix(biDirName, "-"+biUUID)
+}
+
+func BackingImageMapper(uuid string) string {
+	return path.Join(MapperFilePathPrefix, GetLuksBackingImageName(uuid))
+}
+
+func GetLuksBackingImageName(uuid string) string {
+	return fmt.Sprintf("%v-%v", BackingImageFileName, uuid)
 }

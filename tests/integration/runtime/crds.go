@@ -5,10 +5,11 @@ import (
 
 	helmv1 "github.com/k3s-io/helm-controller/pkg/apis/helm.cattle.io/v1"
 	cniv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+	lhv1beta2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 	catalogv1 "github.com/rancher/rancher/pkg/apis/catalog.cattle.io/v1"
 	mgmtv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	upgradev1 "github.com/rancher/system-upgrade-controller/pkg/apis/upgrade.cattle.io/v1"
-	wcrd "github.com/rancher/wrangler/pkg/crd"
+	wcrd "github.com/rancher/wrangler/v3/pkg/crd"
 	"k8s.io/client-go/rest"
 
 	"github.com/harvester/harvester/pkg/util/crd"
@@ -28,6 +29,10 @@ func createCRDs(ctx context.Context, restConfig *rest.Config) error {
 			createAppCRD(),
 			createPlanCRD(),
 			createHelmChartCRD(),
+			createLonghornNodeCRD(),
+			createLonghornVolumeCRD(),
+			createLonghornReplicaCRD(),
+			createClusterRepoCRD(),
 		).
 		BatchWait()
 }
@@ -77,4 +82,23 @@ func createHelmChartCRD() wcrd.CRD {
 		WithColumn("Repo", ".spec.repo").
 		WithColumn("HelmVersion", ".spec.helmVersion").
 		WithColumn("Bootstrap", ".spec.bootstrap")
+}
+
+func createLonghornNodeCRD() wcrd.CRD {
+	return crd.FromGV(lhv1beta2.SchemeGroupVersion, "Node", lhv1beta2.Node{})
+}
+
+func createLonghornVolumeCRD() wcrd.CRD {
+	return crd.FromGV(lhv1beta2.SchemeGroupVersion, "Volume", lhv1beta2.Volume{})
+}
+
+func createLonghornReplicaCRD() wcrd.CRD {
+	return crd.FromGV(lhv1beta2.SchemeGroupVersion, "Replica", lhv1beta2.Replica{})
+}
+
+func createClusterRepoCRD() wcrd.CRD {
+	clusterrepo := crd.FromGV(catalogv1.SchemeGroupVersion, "ClusterRepo", catalogv1.ClusterRepo{})
+	clusterrepo.PluralName = "clusterrepos"
+	clusterrepo.SingularName = "clusterrepo"
+	return clusterrepo
 }

@@ -50,6 +50,14 @@ type BackupListerExpansion interface{}
 // BackupNamespaceLister.
 type BackupNamespaceListerExpansion interface{}
 
+// BackupBackingImageListerExpansion allows custom methods to be added to
+// BackupBackingImageLister.
+type BackupBackingImageListerExpansion interface{}
+
+// BackupBackingImageNamespaceListerExpansion allows custom methods to be added to
+// BackupBackingImageNamespaceLister.
+type BackupBackingImageNamespaceListerExpansion interface{}
+
 // BackupTargetListerExpansion allows custom methods to be added to
 // BackupTargetLister.
 type BackupTargetListerExpansion interface{}
@@ -146,6 +154,30 @@ type SnapshotListerExpansion interface{}
 // SnapshotNamespaceLister.
 type SnapshotNamespaceListerExpansion interface{}
 
+// SupportBundleListerExpansion allows custom methods to be added to
+// SupportBundleLister.
+type SupportBundleListerExpansion interface{}
+
+// SupportBundleNamespaceListerExpansion allows custom methods to be added to
+// SupportBundleNamespaceLister.
+type SupportBundleNamespaceListerExpansion interface{}
+
+// SystemBackupListerExpansion allows custom methods to be added to
+// SystemBackupLister.
+type SystemBackupListerExpansion interface{}
+
+// SystemBackupNamespaceListerExpansion allows custom methods to be added to
+// SystemBackupNamespaceLister.
+type SystemBackupNamespaceListerExpansion interface{}
+
+// SystemRestoreListerExpansion allows custom methods to be added to
+// SystemRestoreLister.
+type SystemRestoreListerExpansion interface{}
+
+// SystemRestoreNamespaceListerExpansion allows custom methods to be added to
+// SystemRestoreNamespaceLister.
+type SystemRestoreNamespaceListerExpansion interface{}
+
 // VolumeListerExpansion allows custom methods to be added to
 // VolumeLister.
 type VolumeListerExpansion interface{}
@@ -153,3 +185,11 @@ type VolumeListerExpansion interface{}
 // VolumeNamespaceListerExpansion allows custom methods to be added to
 // VolumeNamespaceLister.
 type VolumeNamespaceListerExpansion interface{}
+
+// VolumeAttachmentListerExpansion allows custom methods to be added to
+// VolumeAttachmentLister.
+type VolumeAttachmentListerExpansion interface{}
+
+// VolumeAttachmentNamespaceListerExpansion allows custom methods to be added to
+// VolumeAttachmentNamespaceLister.
+type VolumeAttachmentNamespaceListerExpansion interface{}

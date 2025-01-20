@@ -11,8 +11,8 @@ import (
 
 	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
-	ctlrbacv1 "github.com/rancher/wrangler/pkg/generated/controllers/rbac/v1"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
+	ctlrbacv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/rbac/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,37 +33,42 @@ const (
 )
 
 type GenerateHandler struct {
-	context           context.Context
-	saClient          ctlcorev1.ServiceAccountClient
-	saCache           ctlcorev1.ServiceAccountCache
-	clusterRoleCache  ctlrbacv1.ClusterRoleCache
-	roleBindingClient ctlrbacv1.RoleBindingClient
-	roleBindingCache  ctlrbacv1.RoleBindingCache
-	secretCache       ctlcorev1.SecretCache
-	secretClient      ctlcorev1.SecretClient
-	configMapCache    ctlcorev1.ConfigMapCache
-	namespace         string
+	context                  context.Context
+	saClient                 ctlcorev1.ServiceAccountClient
+	saCache                  ctlcorev1.ServiceAccountCache
+	clusterRoleCache         ctlrbacv1.ClusterRoleCache
+	clusterRoleBindingClient ctlrbacv1.ClusterRoleBindingClient
+	clusterRoleBindingCache  ctlrbacv1.ClusterRoleBindingCache
+	roleBindingClient        ctlrbacv1.RoleBindingClient
+	roleBindingCache         ctlrbacv1.RoleBindingCache
+	secretCache              ctlcorev1.SecretCache
+	secretClient             ctlcorev1.SecretClient
+	configMapCache           ctlcorev1.ConfigMapCache
+	namespace                string
 }
 
 func NewGenerateHandler(scaled *config.Scaled, option config.Options) *GenerateHandler {
 	return &GenerateHandler{
-		context:           scaled.Ctx,
-		saClient:          scaled.CoreFactory.Core().V1().ServiceAccount(),
-		saCache:           scaled.CoreFactory.Core().V1().ServiceAccount().Cache(),
-		clusterRoleCache:  scaled.RbacFactory.Rbac().V1().ClusterRole().Cache(),
-		roleBindingClient: scaled.RbacFactory.Rbac().V1().RoleBinding(),
-		roleBindingCache:  scaled.RbacFactory.Rbac().V1().RoleBinding().Cache(),
-		secretCache:       scaled.CoreFactory.Core().V1().Secret().Cache(),
-		secretClient:      scaled.CoreFactory.Core().V1().Secret(),
-		configMapCache:    scaled.CoreFactory.Core().V1().ConfigMap().Cache(),
-		namespace:         option.Namespace,
+		context:                  scaled.Ctx,
+		saClient:                 scaled.CoreFactory.Core().V1().ServiceAccount(),
+		saCache:                  scaled.CoreFactory.Core().V1().ServiceAccount().Cache(),
+		clusterRoleCache:         scaled.RbacFactory.Rbac().V1().ClusterRole().Cache(),
+		clusterRoleBindingClient: scaled.RbacFactory.Rbac().V1().ClusterRoleBinding(),
+		clusterRoleBindingCache:  scaled.RbacFactory.Rbac().V1().ClusterRoleBinding().Cache(),
+		roleBindingClient:        scaled.RbacFactory.Rbac().V1().RoleBinding(),
+		roleBindingCache:         scaled.RbacFactory.Rbac().V1().RoleBinding().Cache(),
+		secretCache:              scaled.CoreFactory.Core().V1().Secret().Cache(),
+		secretClient:             scaled.CoreFactory.Core().V1().Secret(),
+		configMapCache:           scaled.CoreFactory.Core().V1().ConfigMap().Cache(),
+		namespace:                option.Namespace,
 	}
 }
 
 type req struct {
-	ClusterRoleName string `json:"clusterRoleName"`
-	Namespace       string `json:"namespace"`
-	SaName          string `json:"serviceAccountName"`
+	CSIClusterRoleName string `json:"csiclusterRoleName"`
+	ClusterRoleName    string `json:"clusterRoleName"`
+	Namespace          string `json:"namespace"`
+	SaName             string `json:"serviceAccountName"`
 }
 
 func decodeRequest(r *http.Request) (*req, error) {
@@ -102,18 +107,23 @@ func (h *GenerateHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.createRoleBindingIfNotExit(req.ClusterRoleName, sa); err != nil {
+	if _, err := h.createRoleBindingIfNotExists(sa); err != nil {
 		util.ResponseError(rw, http.StatusInternalServerError, errors.Wrap(err, "fail to create roleBinding"))
 		return
 	}
 
-	serverUrl, err := h.getServerUrl()
+	if _, err := h.createClusterRoleBindingIfNotExists(sa); err != nil {
+		util.ResponseError(rw, http.StatusInternalServerError, errors.Wrap(err, "fail to create clusterRoleBinding"))
+		return
+	}
+
+	serverURL, err := h.getServerURL()
 	if err != nil {
 		util.ResponseError(rw, http.StatusInternalServerError, errors.Wrap(err, "failed to get server url"))
 		return
 	}
 
-	kubeConfig, err := h.generateKubeConfig(secret, serverUrl)
+	kubeConfig, err := h.generateKubeConfig(secret, serverURL)
 	if err != nil {
 		util.ResponseError(rw, http.StatusInternalServerError, errors.Wrap(err, "fail to generate kubeconfig"))
 		return
@@ -122,7 +132,7 @@ func (h *GenerateHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	util.ResponseOKWithBody(rw, kubeConfig)
 }
 
-func (h *GenerateHandler) getServerUrl() (string, error) {
+func (h *GenerateHandler) getServerURL() (string, error) {
 	vipCm, err := h.configMapCache.Get(h.namespace, rancher.VipConfigmapName)
 	if err != nil {
 		return "", err
@@ -141,7 +151,7 @@ func (h *GenerateHandler) getServerUrl() (string, error) {
 	return "https://" + vip + ":" + port, nil
 }
 
-func (h *GenerateHandler) createRoleBindingIfNotExit(clusterRoleName string, sa *corev1.ServiceAccount) (*rbacv1.RoleBinding, error) {
+func (h *GenerateHandler) createRoleBindingIfNotExists(sa *corev1.ServiceAccount) (*rbacv1.RoleBinding, error) {
 	namespace := sa.Namespace
 	name := sa.Namespace + "-" + sa.Name
 	roleBinding, err := h.roleBindingCache.Get(namespace, name)
@@ -175,7 +185,45 @@ func (h *GenerateHandler) createRoleBindingIfNotExit(clusterRoleName string, sa 
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: rbacv1.GroupName,
 			Kind:     "ClusterRole",
-			Name:     clusterRoleName,
+			Name:     "harvesterhci.io:cloudprovider",
+		},
+	})
+}
+
+func (h *GenerateHandler) createClusterRoleBindingIfNotExists(sa *corev1.ServiceAccount) (*rbacv1.ClusterRoleBinding, error) {
+	namespace := sa.Namespace
+	name := sa.Namespace + "-" + sa.Name
+	clusterRoleBinding, err := h.clusterRoleBindingCache.Get(name)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return nil, err
+	}
+	if err == nil {
+		return clusterRoleBinding, nil
+	}
+
+	return h.clusterRoleBindingClient.Create(&rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "v1",
+					Kind:       rbacv1.ServiceAccountKind,
+					Name:       sa.Name,
+					UID:        sa.UID,
+				},
+			},
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      rbacv1.ServiceAccountKind,
+				Namespace: namespace,
+				Name:      sa.Name,
+			},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "ClusterRole",
+			Name:     "harvesterhci.io:csi-driver",
 		},
 	})
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2023 Rancher Labs, Inc.
+Copyright 2025 Rancher Labs, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,9 +31,12 @@ type HarvesterhciV1beta1Interface interface {
 	AddonsGetter
 	KeyPairsGetter
 	PreferencesGetter
+	ResourceQuotasGetter
+	ScheduleVMBackupsGetter
 	SettingsGetter
 	SupportBundlesGetter
 	UpgradesGetter
+	UpgradeLogsGetter
 	VersionsGetter
 	VirtualMachineBackupsGetter
 	VirtualMachineImagesGetter
@@ -59,6 +62,14 @@ func (c *HarvesterhciV1beta1Client) Preferences(namespace string) PreferenceInte
 	return newPreferences(c, namespace)
 }
 
+func (c *HarvesterhciV1beta1Client) ResourceQuotas(namespace string) ResourceQuotaInterface {
+	return newResourceQuotas(c, namespace)
+}
+
+func (c *HarvesterhciV1beta1Client) ScheduleVMBackups(namespace string) ScheduleVMBackupInterface {
+	return newScheduleVMBackups(c, namespace)
+}
+
 func (c *HarvesterhciV1beta1Client) Settings() SettingInterface {
 	return newSettings(c)
 }
@@ -69,6 +80,10 @@ func (c *HarvesterhciV1beta1Client) SupportBundles(namespace string) SupportBund
 
 func (c *HarvesterhciV1beta1Client) Upgrades(namespace string) UpgradeInterface {
 	return newUpgrades(c, namespace)
+}
+
+func (c *HarvesterhciV1beta1Client) UpgradeLogs(namespace string) UpgradeLogInterface {
+	return newUpgradeLogs(c, namespace)
 }
 
 func (c *HarvesterhciV1beta1Client) Versions(namespace string) VersionInterface {

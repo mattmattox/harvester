@@ -10,11 +10,15 @@ import (
 
 	"github.com/pkg/errors"
 
+	etypes "github.com/longhorn/longhorn-engine/pkg/types"
+
+	lhexec "github.com/longhorn/go-common-libs/exec"
+	lhtypes "github.com/longhorn/go-common-libs/types"
 	imutil "github.com/longhorn/longhorn-instance-manager/pkg/util"
 
-	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 	"github.com/longhorn/longhorn-manager/types"
-	"github.com/longhorn/longhorn-manager/util"
+
+	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 )
 
 // Should be the same values as in https://github.com/longhorn/longhorn-engine/blob/master/pkg/types/types.go
@@ -29,11 +33,12 @@ const (
 type EngineCollection struct{}
 
 type EngineBinary struct {
-	name  string
-	image string
-	ip    string
-	port  int
-	cURL  string
+	volumeName   string
+	image        string
+	ip           string
+	port         int
+	cURL         string
+	instanceName string
 }
 
 func (c *EngineCollection) NewEngineClient(request *EngineClientRequest) (*EngineBinary, error) {
@@ -46,16 +51,17 @@ func (c *EngineCollection) NewEngineClient(request *EngineClientRequest) (*Engin
 	}
 
 	return &EngineBinary{
-		name:  request.VolumeName,
-		image: request.EngineImage,
-		ip:    request.IP,
-		port:  request.Port,
-		cURL:  imutil.GetURL(request.IP, request.Port),
+		volumeName:   request.VolumeName,
+		image:        request.EngineImage,
+		ip:           request.IP,
+		port:         request.Port,
+		cURL:         imutil.GetURL(request.IP, request.Port),
+		instanceName: request.InstanceName,
 	}, nil
 }
 
 func (e *EngineBinary) Name() string {
-	return e.name
+	return e.volumeName
 }
 
 func (e *EngineBinary) LonghornEngineBinary() string {
@@ -63,18 +69,27 @@ func (e *EngineBinary) LonghornEngineBinary() string {
 }
 
 func (e *EngineBinary) ExecuteEngineBinary(args ...string) (string, error) {
-	args = append([]string{"--url", e.cURL}, args...)
-	return util.Execute([]string{}, e.LonghornEngineBinary(), args...)
+	args, err := e.addFlags(args)
+	if err != nil {
+		return "", err
+	}
+	return lhexec.NewExecutor().Execute([]string{}, e.LonghornEngineBinary(), args, lhtypes.ExecuteDefaultTimeout)
 }
 
 func (e *EngineBinary) ExecuteEngineBinaryWithTimeout(timeout time.Duration, args ...string) (string, error) {
-	args = append([]string{"--url", e.cURL}, args...)
-	return util.ExecuteWithTimeout(timeout, []string{}, e.LonghornEngineBinary(), args...)
+	args, err := e.addFlags(args)
+	if err != nil {
+		return "", err
+	}
+	return lhexec.NewExecutor().Execute([]string{}, e.LonghornEngineBinary(), args, timeout)
 }
 
 func (e *EngineBinary) ExecuteEngineBinaryWithoutTimeout(envs []string, args ...string) (string, error) {
-	args = append([]string{"--url", e.cURL}, args...)
-	return util.ExecuteWithoutTimeout(envs, e.LonghornEngineBinary(), args...)
+	args, err := e.addFlags(args)
+	if err != nil {
+		return "", err
+	}
+	return lhexec.NewExecutor().Execute(envs, e.LonghornEngineBinary(), args, lhtypes.ExecuteNoTimeout)
 }
 
 func parseReplica(s string) (*Replica, error) {
@@ -98,7 +113,7 @@ func parseReplica(s string) (*Replica, error) {
 func (e *EngineBinary) ReplicaList(*longhorn.Engine) (map[string]*Replica, error) {
 	output, err := e.ExecuteEngineBinary("ls")
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to list replicas from controller '%s'", e.name)
+		return nil, errors.Wrapf(err, "failed to list replicas from controller '%s'", e.volumeName)
 	}
 	replicas := make(map[string]*Replica)
 	lines := strings.Split(output, "\n")
@@ -120,7 +135,9 @@ func (e *EngineBinary) ReplicaList(*longhorn.Engine) (map[string]*Replica, error
 
 // ReplicaAdd calls engine binary
 // TODO: Deprecated, replaced by gRPC proxy
-func (e *EngineBinary) ReplicaAdd(engine *longhorn.Engine, url string, isRestoreVolume bool) error {
+func (e *EngineBinary) ReplicaAdd(engine *longhorn.Engine, replicaName, url string, isRestoreVolume, fastSync bool, localSync *etypes.FileLocalSync, replicaFileSyncHTTPClientTimeout, grpcTimeoutSeconds int64) error {
+	// Ignore grpcTimeoutSeconds because we expect that longhorn manager should use proxy gRPC to communicate with
+	// engine/replica who understands this field
 	if err := ValidateReplicaURL(url); err != nil {
 		return err
 	}
@@ -128,8 +145,32 @@ func (e *EngineBinary) ReplicaAdd(engine *longhorn.Engine, url string, isRestore
 	if isRestoreVolume {
 		cmd = append(cmd, "--restore")
 	}
+
+	version, err := e.VersionGet(engine, true)
+	if err != nil {
+		return err
+	}
+
+	if version.ClientVersion.CLIAPIVersion >= 6 {
+		cmd = append(cmd,
+			"--size", strconv.FormatInt(engine.Spec.VolumeSize, 10),
+			"--current-size", strconv.FormatInt(engine.Status.CurrentSize, 10))
+	}
+
+	if version.ClientVersion.CLIAPIVersion >= 7 {
+		cmd = append(cmd, "--file-sync-http-client-timeout", strconv.FormatInt(replicaFileSyncHTTPClientTimeout, 10))
+
+		if fastSync {
+			cmd = append(cmd, "--fast-sync")
+		}
+	}
+
+	if version.ClientVersion.CLIAPIVersion >= 9 {
+		cmd = append(cmd, "--replica-instance-name", replicaName)
+	}
+
 	if _, err := e.ExecuteEngineBinaryWithoutTimeout([]string{}, cmd...); err != nil {
-		return errors.Wrapf(err, "failed to add replica address='%s' to controller '%s'", url, e.name)
+		return errors.Wrapf(err, "failed to add replica address='%s' to controller '%s'", url, e.volumeName)
 	}
 	return nil
 }
@@ -141,7 +182,7 @@ func (e *EngineBinary) ReplicaRemove(engine *longhorn.Engine, url string) error 
 		return err
 	}
 	if _, err := e.ExecuteEngineBinary("rm", url); err != nil {
-		return errors.Wrapf(err, "failed to rm replica address='%s' from controller '%s'", url, e.name)
+		return errors.Wrapf(err, "failed to rm replica address='%s' from controller '%s'", url, e.volumeName)
 	}
 	return nil
 }
@@ -170,7 +211,7 @@ func (e *EngineBinary) VersionGet(engine *longhorn.Engine, clientOnly bool) (*En
 	} else {
 		cmdline = append([]string{"--url", e.cURL}, cmdline...)
 	}
-	output, err := util.Execute([]string{}, e.LonghornEngineBinary(), cmdline...)
+	output, err := lhexec.NewExecutor().Execute([]string{}, e.LonghornEngineBinary(), cmdline, lhtypes.ExecuteDefaultTimeout)
 	if err != nil {
 		return nil, errors.Wrapf(err, "cannot get volume version")
 	}
@@ -212,7 +253,7 @@ func (e *EngineBinary) ReplicaRebuildStatus(*longhorn.Engine) (map[string]*longh
 // VolumeFrontendStart calls engine binary
 // TODO: Deprecated, replaced by gRPC proxy
 func (e *EngineBinary) VolumeFrontendStart(engine *longhorn.Engine) error {
-	frontendName, err := GetEngineProcessFrontend(engine.Spec.Frontend)
+	frontendName, err := GetEngineInstanceFrontend(engine.Spec.DataEngine, engine.Spec.Frontend)
 	if err != nil {
 		return err
 	}
@@ -221,7 +262,7 @@ func (e *EngineBinary) VolumeFrontendStart(engine *longhorn.Engine) error {
 	}
 
 	if _, err := e.ExecuteEngineBinary("frontend", "start", frontendName); err != nil {
-		return errors.Wrapf(err, "error starting frontend %v", frontendName)
+		return errors.Wrapf(err, "failed to start frontend %v", frontendName)
 	}
 
 	return nil
@@ -237,13 +278,59 @@ func (e *EngineBinary) VolumeFrontendShutdown(*longhorn.Engine) error {
 	return nil
 }
 
+// VolumeUnmapMarkSnapChainRemovedSet calls engine binary
+// TODO: Deprecated, replaced by gRPC proxy
+func (e *EngineBinary) VolumeUnmapMarkSnapChainRemovedSet(engine *longhorn.Engine) error {
+	cmdline := []string{"unmap-mark-snap-chain-removed"}
+	if engine.Spec.UnmapMarkSnapChainRemovedEnabled {
+		cmdline = append(cmdline, "--enable")
+	} else {
+		cmdline = append(cmdline, "--disable")
+	}
+	if _, err := e.ExecuteEngineBinary(cmdline...); err != nil {
+		return errors.Wrapf(err, "error setting volume flag UnmapMarkSnapChainRemoved to %v", engine.Spec.UnmapMarkSnapChainRemovedEnabled)
+	}
+
+	return nil
+}
+
+// VolumeSnapshotMaxCountSet calls engine binary
+// TODO: Deprecated, replaced by gRPC proxy
+func (e *EngineBinary) VolumeSnapshotMaxCountSet(engine *longhorn.Engine) error {
+	cmdline := []string{"snapshot-max-count", strconv.Itoa(engine.Spec.SnapshotMaxCount)}
+	if _, err := e.ExecuteEngineBinary(cmdline...); err != nil {
+		return errors.Wrapf(err, "error setting volume flag SnapshotMaxCount to %d", engine.Spec.SnapshotMaxCount)
+	}
+	return nil
+}
+
+// VolumeSnapshotMaxSizeSet calls engine binary
+// TODO: Deprecated, replaced by gRPC proxy
+func (e *EngineBinary) VolumeSnapshotMaxSizeSet(engine *longhorn.Engine) error {
+	cmdline := []string{"snapshot-max-size", strconv.FormatInt(engine.Spec.SnapshotMaxSize, 10)}
+	if _, err := e.ExecuteEngineBinary(cmdline...); err != nil {
+		return errors.Wrapf(err, "error setting volume flag SnapshotMaxSize to %d", engine.Spec.SnapshotMaxSize)
+	}
+	return nil
+}
+
 // ReplicaRebuildVerify calls engine binary
 // TODO: Deprecated, replaced by gRPC proxy
-func (e *EngineBinary) ReplicaRebuildVerify(engine *longhorn.Engine, url string) error {
+func (e *EngineBinary) ReplicaRebuildVerify(engine *longhorn.Engine, replicaName, url string) error {
 	if err := ValidateReplicaURL(url); err != nil {
 		return err
 	}
+
+	version, err := e.VersionGet(engine, true)
+	if err != nil {
+		return err
+	}
+
 	cmd := []string{"verify-rebuild-replica", url}
+	if version.ClientVersion.CLIAPIVersion >= 9 {
+		cmd = append(cmd, "--replica-instance-name", replicaName)
+	}
+
 	if _, err := e.ExecuteEngineBinaryWithoutTimeout([]string{}, cmd...); err != nil {
 		return errors.Wrapf(err, "failed to verify rebuilding for the replica from address %s", url)
 	}
@@ -253,4 +340,37 @@ func (e *EngineBinary) ReplicaRebuildVerify(engine *longhorn.Engine, url string)
 // Close engine proxy client connection.
 // Do not panic this method because this is could be called by the fallback client.
 func (e *EngineBinary) Close() {
+}
+
+// ReplicaModeUpdate calls engine binary
+// TODO: Deprecated, replaced by gRPC proxy
+func (e *EngineBinary) ReplicaModeUpdate(engine *longhorn.Engine, url, mode string) error {
+	_, err := e.ExecuteEngineBinary("update", "--mode", mode, url)
+	if err != nil {
+		return errors.Wrapf(err, "failed to update replica %v mode to %v", url, mode)
+	}
+	return nil
+}
+
+func (e *EngineBinary) MetricsGet(*longhorn.Engine) (*Metrics, error) {
+	return nil, fmt.Errorf(ErrNotImplement)
+}
+
+func (e *EngineBinary) RemountReadOnlyVolume(*longhorn.Engine) error {
+	return fmt.Errorf(ErrNotImplement)
+}
+
+// addFlags always adds required flags to args. In addition, if the engine version is high enough, it adds additional
+// engine identity validation flags.
+func (e *EngineBinary) addFlags(args []string) ([]string, error) {
+	version, err := e.VersionGet(nil, true)
+	if err != nil {
+		return args, errors.Wrap(err, "failed to get engine CLI version while adding identity flags")
+	}
+
+	argsToAdd := []string{"--url", e.cURL}
+	if version.ClientVersion.CLIAPIVersion >= 9 {
+		argsToAdd = append(argsToAdd, "--volume-name", e.volumeName, "--engine-instance-name", e.instanceName)
+	}
+	return append(argsToAdd, args...), nil
 }

@@ -9,8 +9,8 @@ import (
 	"github.com/rancher/apiserver/pkg/apierror"
 	"github.com/rancher/apiserver/pkg/parse"
 	"github.com/rancher/apiserver/pkg/types"
-	"github.com/rancher/wrangler/pkg/schemas"
-	"github.com/rancher/wrangler/pkg/schemas/validation"
+	"github.com/rancher/wrangler/v3/pkg/schemas"
+	"github.com/rancher/wrangler/v3/pkg/schemas/validation"
 )
 
 const (
@@ -47,7 +47,8 @@ func CheckCSRF(apiOp *types.APIRequest) error {
 
 	cookie, err := apiOp.Request.Cookie(csrfCookie)
 	if err == http.ErrNoCookie {
-		bytes := make([]byte, 5)
+		// 16 bytes = 32 Hex Char = 128 bit entropy
+		bytes := make([]byte, 16)
 		_, err := rand.Read(bytes)
 		if err != nil {
 			return apierror.WrapAPIError(err, validation.ServerError, "Failed in CSRF processing")

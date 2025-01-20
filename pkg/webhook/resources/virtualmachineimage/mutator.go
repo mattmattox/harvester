@@ -6,8 +6,8 @@ import (
 	"fmt"
 
 	longhorntypes "github.com/longhorn/longhorn-manager/types"
-	ctlstoragev1 "github.com/rancher/wrangler/pkg/generated/controllers/storage/v1"
-	"github.com/rancher/wrangler/pkg/slice"
+	ctlstoragev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/storage/v1"
+	"github.com/rancher/wrangler/v3/pkg/slice"
 	admissionregv1 "k8s.io/api/admissionregistration/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -42,7 +42,7 @@ func (m *virtualMachineImageMutator) Resource() types.Resource {
 	}
 }
 
-func (m *virtualMachineImageMutator) Create(request *types.Request, newObj runtime.Object) (types.PatchOps, error) {
+func (m *virtualMachineImageMutator) Create(_ *types.Request, newObj runtime.Object) (types.PatchOps, error) {
 	newImage := newObj.(*harvesterv1.VirtualMachineImage)
 
 	return m.patchImageStorageClassParams(newImage)
@@ -105,14 +105,21 @@ func (m *virtualMachineImageMutator) getStorageClass(storageClassName string) (*
 func mergeStorageClassParams(image *harvesterv1.VirtualMachineImage, storageClass *storagev1.StorageClass) map[string]string {
 	params := util.GetImageDefaultStorageClassParameters()
 	var mergeParams map[string]string
-	if image.Spec.StorageClassParameters != nil {
-		mergeParams = image.Spec.StorageClassParameters
-	} else if storageClass != nil {
+	if storageClass != nil {
 		mergeParams = storageClass.Parameters
+	} else if image.Spec.StorageClassParameters != nil {
+		mergeParams = image.Spec.StorageClassParameters
 	}
 	var allowPatchParams = []string{
 		longhorntypes.OptionNodeSelector, longhorntypes.OptionDiskSelector,
-		longhorntypes.OptionNumberOfReplicas, longhorntypes.OptionStaleReplicaTimeout}
+		longhorntypes.OptionNumberOfReplicas, longhorntypes.OptionStaleReplicaTimeout,
+		util.LonghornDataLocality,
+		util.LonghornOptionEncrypted,
+		util.CSIProvisionerSecretNameKey, util.CSIProvisionerSecretNamespaceKey,
+		util.CSINodeStageSecretNameKey, util.CSINodeStageSecretNamespaceKey,
+		util.CSINodePublishSecretNameKey, util.CSINodePublishSecretNamespaceKey,
+	}
+
 	for k, v := range mergeParams {
 		if slice.ContainsString(allowPatchParams, k) {
 			params[k] = v

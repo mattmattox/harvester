@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	longhornv1 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta1"
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	lhv1beta2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -19,7 +19,7 @@ import (
 	"github.com/harvester/harvester/pkg/config"
 	ctlharvesterv1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	ctlkubevirtv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
-	ctllonghornv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta1"
+	ctllonghornv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta2"
 	"github.com/harvester/harvester/pkg/settings"
 	"github.com/harvester/harvester/pkg/util"
 )
@@ -29,19 +29,13 @@ const (
 
 	longhornBackupTargetSettingName       = "backup-target"
 	longhornBackupTargetSecretSettingName = "backup-target-credential-secret"
-
-	AWSAccessKey       = "AWS_ACCESS_KEY_ID"
-	AWSSecretKey       = "AWS_SECRET_ACCESS_KEY"
-	AWSEndpoints       = "AWS_ENDPOINTS"
-	AWSCERT            = "AWS_CERT"
-	VirtualHostedStyle = "VIRTUAL_HOSTED_STYLE"
 )
 
 // RegisterBackupTarget register the setting controller and reconsile longhorn setting when backup target changed
-func RegisterBackupTarget(ctx context.Context, management *config.Management, opts config.Options) error {
+func RegisterBackupTarget(ctx context.Context, management *config.Management, _ config.Options) error {
 	settings := management.HarvesterFactory.Harvesterhci().V1beta1().Setting()
 	secrets := management.CoreFactory.Core().V1().Secret()
-	longhornSettings := management.LonghornFactory.Longhorn().V1beta1().Setting()
+	longhornSettings := management.LonghornFactory.Longhorn().V1beta2().Setting()
 	vms := management.VirtFactory.Kubevirt().V1().VirtualMachine()
 
 	backupTargetController := &TargetHandler{
@@ -69,7 +63,7 @@ type TargetHandler struct {
 }
 
 // OnBackupTargetChange handles backupTarget setting object on change
-func (h *TargetHandler) OnBackupTargetChange(key string, setting *harvesterv1.Setting) (*harvesterv1.Setting, error) {
+func (h *TargetHandler) OnBackupTargetChange(_ string, setting *harvesterv1.Setting) (*harvesterv1.Setting, error) {
 	if setting == nil || setting.DeletionTimestamp != nil ||
 		setting.Name != settings.BackupTargetSettingName {
 		return setting, nil
@@ -106,8 +100,8 @@ func (h *TargetHandler) OnBackupTargetChange(key string, setting *harvesterv1.Se
 			return h.setConfiguredCondition(setting, "", err)
 		}
 
-		// delete the may existing previous secret of S3
-		if err = h.deleteBackupTargetSecret(target); err != nil {
+		// reset previous secret of S3
+		if err = h.resetBackupTargetSecret(); err != nil {
 			return h.setConfiguredCondition(setting, "", err)
 		}
 
@@ -118,8 +112,8 @@ func (h *TargetHandler) OnBackupTargetChange(key string, setting *harvesterv1.Se
 				return h.setConfiguredCondition(setting, "", err)
 			}
 
-			// delete the may existing previous secret of S3
-			if err = h.deleteBackupTargetSecret(target); err != nil {
+			// reset previous secret of S3
+			if err = h.resetBackupTargetSecret(); err != nil {
 				return h.setConfiguredCondition(setting, "", err)
 			}
 
@@ -166,12 +160,12 @@ func (h *TargetHandler) updateLonghornTarget(backupTarget *settings.BackupTarget
 			return err
 		}
 
-		if _, err := h.longhornSettings.Create(&longhornv1.Setting{
+		if _, err := h.longhornSettings.Create(&lhv1beta2.Setting{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      longhornBackupTargetSettingName,
 				Namespace: util.LonghornSystemNamespaceName,
 			},
-			Value: ConstructEndpoint(backupTarget),
+			Value: util.ConstructEndpoint(backupTarget),
 		}); err != nil {
 			return err
 		}
@@ -179,7 +173,7 @@ func (h *TargetHandler) updateLonghornTarget(backupTarget *settings.BackupTarget
 	}
 
 	targetCpy := target.DeepCopy()
-	targetCpy.Value = ConstructEndpoint(backupTarget)
+	targetCpy.Value = util.ConstructEndpoint(backupTarget)
 
 	if !reflect.DeepEqual(target, targetCpy) {
 		_, err := h.longhornSettings.Update(targetCpy)
@@ -190,14 +184,14 @@ func (h *TargetHandler) updateLonghornTarget(backupTarget *settings.BackupTarget
 
 func getBackupSecretData(target *settings.BackupTarget) (map[string]string, error) {
 	data := map[string]string{
-		AWSAccessKey:       target.AccessKeyID,
-		AWSSecretKey:       target.SecretAccessKey,
-		AWSEndpoints:       target.Endpoint,
-		AWSCERT:            target.Cert,
-		VirtualHostedStyle: strconv.FormatBool(target.VirtualHostedStyle),
+		util.AWSAccessKey:       target.AccessKeyID,
+		util.AWSSecretKey:       target.SecretAccessKey,
+		util.AWSEndpoints:       target.Endpoint,
+		util.AWSCERT:            target.Cert,
+		util.VirtualHostedStyle: strconv.FormatBool(target.VirtualHostedStyle),
 	}
 	if settings.AdditionalCA.Get() != "" {
-		data[AWSCERT] = settings.AdditionalCA.Get()
+		data[util.AWSCERT] = settings.AdditionalCA.Get()
 	}
 
 	var httpProxyConfig util.HTTPProxyConfig
@@ -207,6 +201,11 @@ func getBackupSecretData(target *settings.BackupTarget) (map[string]string, erro
 	data[util.HTTPProxyEnv] = httpProxyConfig.HTTPProxy
 	data[util.HTTPSProxyEnv] = httpProxyConfig.HTTPSProxy
 	data[util.NoProxyEnv] = util.AddBuiltInNoProxy(httpProxyConfig.NoProxy)
+
+	// trim spaces for all values in order to pass the Longhorn webhook, refer to https://github.com/longhorn/longhorn-manager/pull/970
+	for k, v := range data {
+		data[k] = strings.TrimSpace(v)
+	}
 
 	return data, nil
 }
@@ -242,29 +241,45 @@ func (h *TargetHandler) updateBackupTargetSecret(target *settings.BackupTarget) 
 		}
 	}
 
-	return h.updateLonghornBackupTargetSecretSetting(target)
+	return h.updateLonghornBackupTargetSecretSetting()
 }
 
-func (h *TargetHandler) deleteBackupTargetSecret(target *settings.BackupTarget) error {
-	if err := h.secrets.Delete(util.LonghornSystemNamespaceName, util.BackupTargetSecretName, nil); err != nil && !apierrors.IsNotFound(err) {
+func (h *TargetHandler) resetBackupTargetSecret() error {
+	secret, err := h.secretCache.Get(util.LonghornSystemNamespaceName, util.BackupTargetSecretName)
+	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
+	if secret != nil && len(secret.Data) != 0 {
+		secretCpy := secret.DeepCopy()
+		secretCpy.Data = map[string][]byte{}
+		if _, err = h.secrets.Update(secretCpy); err != nil {
+			return err
+		}
+	}
 
-	if err := h.longhornSettings.Delete(util.LonghornSystemNamespaceName, longhornBackupTargetSecretSettingName, nil); err != nil && !apierrors.IsNotFound(err) {
+	setting, err := h.longhornSettingCache.Get(util.LonghornSystemNamespaceName, longhornBackupTargetSecretSettingName)
+	if err != nil && !apierrors.IsNotFound(err) {
 		return err
+	}
+	if setting != nil && setting.Value != "" {
+		settingCpy := setting.DeepCopy()
+		settingCpy.Value = ""
+		if _, err := h.longhornSettings.Update(settingCpy); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func (h *TargetHandler) updateLonghornBackupTargetSecretSetting(target *settings.BackupTarget) error {
+func (h *TargetHandler) updateLonghornBackupTargetSecretSetting() error {
 	targetSecret, err := h.longhornSettingCache.Get(util.LonghornSystemNamespaceName, longhornBackupTargetSecretSettingName)
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			return err
 		}
 
-		if _, err := h.longhornSettings.Create(&longhornv1.Setting{
+		if _, err := h.longhornSettings.Create(&lhv1beta2.Setting{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      longhornBackupTargetSecretSettingName,
 				Namespace: util.LonghornSystemNamespaceName,
@@ -293,16 +308,4 @@ func (h *TargetHandler) setConfiguredCondition(setting *harvesterv1.Setting, rea
 	// SetError with nil error will cleanup message in condition and set the status to true
 	harvesterv1.SettingConfigured.SetError(settingCpy, reason, err)
 	return h.settings.Update(settingCpy)
-}
-
-func ConstructEndpoint(target *settings.BackupTarget) string {
-	switch target.Type {
-	case settings.S3BackupType:
-		return fmt.Sprintf("s3://%s@%s/", target.BucketName, target.BucketRegion)
-	case settings.NFSBackupType:
-		// we allow users to input nfs:// prefix as optional
-		return fmt.Sprintf("nfs://%s", strings.TrimPrefix(target.Endpoint, "nfs://"))
-	default:
-		return target.Endpoint
-	}
 }

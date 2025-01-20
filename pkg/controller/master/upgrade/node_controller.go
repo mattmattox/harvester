@@ -6,12 +6,12 @@ import (
 	"reflect"
 	"time"
 
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	capiv1alpha4 "sigs.k8s.io/cluster-api/api/v1alpha4"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 
 	ctlharvesterv1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
 )
@@ -29,7 +29,7 @@ type nodeHandler struct {
 	secretClient  ctlcorev1.SecretClient
 }
 
-func (h *nodeHandler) OnChanged(key string, node *corev1.Node) (*corev1.Node, error) {
+func (h *nodeHandler) OnChanged(_ string, node *corev1.Node) (*corev1.Node, error) {
 	if node == nil || node.DeletionTimestamp != nil || node.Annotations == nil {
 		return node, nil
 	}
@@ -59,7 +59,7 @@ func (h *nodeHandler) OnChanged(key string, node *corev1.Node) (*corev1.Node, er
 		return node, nil
 	}
 
-	machineName, ok := node.Annotations[capiv1alpha4.MachineAnnotation]
+	machineName, ok := node.Annotations[clusterv1.MachineAnnotation]
 	if !ok {
 		return node, nil
 	}

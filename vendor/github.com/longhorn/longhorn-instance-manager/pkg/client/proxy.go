@@ -1,22 +1,22 @@
 package client
 
 import (
+	"crypto/tls"
 	"fmt"
 	"time"
 
+	emeta "github.com/longhorn/longhorn-engine/pkg/meta"
+	eclient "github.com/longhorn/longhorn-engine/pkg/replica/client"
+	rpc "github.com/longhorn/types/pkg/generated/imrpc"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/keepalive"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
-	rpc "github.com/longhorn/longhorn-instance-manager/pkg/imrpc"
 	"github.com/longhorn/longhorn-instance-manager/pkg/meta"
 	"github.com/longhorn/longhorn-instance-manager/pkg/util"
-
-	emeta "github.com/longhorn/longhorn-engine/pkg/meta"
-	eclient "github.com/longhorn/longhorn-engine/pkg/replica/client"
 )
 
 var (
@@ -39,6 +39,7 @@ type ServiceContext struct {
 	quit context.CancelFunc
 
 	service rpc.ProxyEngineServiceClient
+	health  healthpb.HealthClient
 }
 
 func (s ServiceContext) GetConnectionState() connectivity.State {
@@ -60,16 +61,9 @@ type ProxyClient struct {
 	Version int
 }
 
-func NewProxyClient(ctx context.Context, ctxCancel context.CancelFunc, address string, port int) (*ProxyClient, error) {
+func NewProxyClient(ctx context.Context, ctxCancel context.CancelFunc, address string, port int, tlsConfig *tls.Config) (*ProxyClient, error) {
 	getServiceCtx := func(serviceUrl string) (ServiceContext, error) {
-		dialOptions := []grpc.DialOption{
-			grpc.WithInsecure(),
-			grpc.WithKeepaliveParams(keepalive.ClientParameters{
-				Time:                time.Second * 10,
-				PermitWithoutStream: true,
-			}),
-		}
-		connection, err := grpc.Dial(serviceUrl, dialOptions...)
+		connection, err := util.Connect(serviceUrl, tlsConfig)
 		if err != nil {
 			return ServiceContext{}, errors.Wrapf(err, "cannot connect to ProxyService %v", serviceUrl)
 		}
@@ -78,6 +72,7 @@ func NewProxyClient(ctx context.Context, ctxCancel context.CancelFunc, address s
 			ctx:     ctx,
 			quit:    ctxCancel,
 			service: rpc.NewProxyEngineServiceClient(connection),
+			health:  healthpb.NewHealthClient(connection),
 		}, nil
 	}
 
@@ -95,7 +90,17 @@ func NewProxyClient(ctx context.Context, ctxCancel context.CancelFunc, address s
 	}, nil
 }
 
+func NewProxyClientWithTLS(ctx context.Context, ctxCancel context.CancelFunc, address string, port int, caFile, certFile, keyFile, peerName string) (*ProxyClient, error) {
+	tlsConfig, err := util.LoadClientTLS(caFile, certFile, keyFile, peerName)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to load tls key pair from file")
+	}
+
+	return NewProxyClient(ctx, ctxCancel, address, port, tlsConfig)
+}
+
 const (
+	// We want to have a slightly bigger timeout on the proxy client-side compared to the actual timeout in the engine/replica because the proxy server adds some delay to the flow
 	GRPCServiceTimeout     = eclient.GRPCServiceCommonTimeout * 2
 	GRPCServiceLongTimeout = eclient.GRPCServiceLongTimeout + GRPCServiceTimeout
 )
@@ -105,8 +110,15 @@ func getContextWithGRPCTimeout(parent context.Context) context.Context {
 	return ctx
 }
 
-func getContextWithGRPCLongTimeout(parent context.Context) context.Context {
-	ctx, _ := context.WithTimeout(parent, GRPCServiceLongTimeout)
+// getContextWithGRPCLongTimeout returns a context with given grpcTimeoutSeconds + GRPCServiceTimeout timeout.
+// If grpcTimeoutSeconds is 0, use the default GRPCServiceLongTimeout instead.
+func getContextWithGRPCLongTimeout(parent context.Context, grpcTimeoutSeconds int64) context.Context {
+	grpcTimeout := GRPCServiceLongTimeout
+	if grpcTimeoutSeconds > 0 {
+		// We want to have a slightly bigger timeout on the proxy client-side compared to the actual timeout in the engine/replica because the proxy server adds some delay to the flow
+		grpcTimeout = (time.Second * time.Duration(grpcTimeoutSeconds)) + GRPCServiceTimeout
+	}
+	ctx, _ := context.WithTimeout(parent, grpcTimeout)
 	return ctx
 }
 
@@ -150,6 +162,12 @@ func (c *ProxyClient) ServerVersionGet(serviceAddress string) (version *emeta.Ve
 }
 
 func (c *ProxyClient) ClientVersionGet() (version emeta.VersionOutput) {
-	logrus.Debug("Getting client version")
+	logrus.Trace("Getting client version")
 	return emeta.GetVersion()
+}
+
+func (c *ProxyClient) CheckConnection() error {
+	req := &healthpb.HealthCheckRequest{}
+	_, err := c.health.Check(getContextWithGRPCTimeout(c.ctx), req)
+	return err
 }

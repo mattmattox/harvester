@@ -23,6 +23,10 @@ import (
 const (
 	networkGroup      = "network.harvesterhci.io"
 	keyClusterNetwork = networkGroup + "/clusternetwork"
+
+	memory10M  = 10485760
+	memory100M = 104857600
+	memory256M = 268435456
 )
 
 func NewMutator(
@@ -55,7 +59,7 @@ func (m *vmMutator) Resource() types.Resource {
 	}
 }
 
-func (m *vmMutator) Create(request *types.Request, newObj runtime.Object) (types.PatchOps, error) {
+func (m *vmMutator) Create(_ *types.Request, newObj runtime.Object) (types.PatchOps, error) {
 	vm := newObj.(*kubevirtv1.VirtualMachine)
 
 	logrus.Debugf("create VM %s/%s", vm.Namespace, vm.Name)
@@ -65,7 +69,12 @@ func (m *vmMutator) Create(request *types.Request, newObj runtime.Object) (types
 		return patchOps, err
 	}
 
-	patchOps, err = m.patchAffinity(nil, vm, patchOps)
+	patchOps, err = m.patchAffinity(vm, patchOps)
+	if err != nil {
+		return nil, err
+	}
+
+	patchOps, err = m.patchTerminationGracePeriodSeconds(vm, patchOps)
 	if err != nil {
 		return nil, err
 	}
@@ -73,53 +82,56 @@ func (m *vmMutator) Create(request *types.Request, newObj runtime.Object) (types
 	return patchOps, nil
 }
 
-func (m *vmMutator) Update(request *types.Request, oldObj runtime.Object, newObj runtime.Object) (types.PatchOps, error) {
-	newVm := newObj.(*kubevirtv1.VirtualMachine)
-	oldVm := oldObj.(*kubevirtv1.VirtualMachine)
+func (m *vmMutator) Update(_ *types.Request, oldObj runtime.Object, newObj runtime.Object) (types.PatchOps, error) {
+	newVM := newObj.(*kubevirtv1.VirtualMachine)
+	oldVM := oldObj.(*kubevirtv1.VirtualMachine)
 
-	logrus.Debugf("update VM %s/%s", newVm.Namespace, newVm.Name)
+	logrus.Debugf("update VM %s/%s", newVM.Namespace, newVM.Name)
 
 	var patchOps types.PatchOps
 	var err error
 
-	if needUpdateResourceOvercommit(oldVm, newVm) {
-		patchOps, err = m.patchResourceOvercommit(newVm)
+	if needUpdateResourceOvercommit(oldVM, newVM) {
+		patchOps, err = m.patchResourceOvercommit(newVM)
 	}
 	if err != nil {
 		return patchOps, err
 	}
 
-	needUpdateRunStrategy, err := needUpdateRunStrategy(oldVm, newVm)
+	needUpdateRunStrategy, err := needUpdateRunStrategy(oldVM, newVM)
 	if err != nil {
 		return patchOps, err
 	}
 
 	if needUpdateRunStrategy {
-		patchOps = patchRunStrategy(newVm, patchOps)
+		patchOps = patchRunStrategy(newVM, patchOps)
 	}
 
-	if needUpdateAffinity(oldVm, newVm) {
-		patchOps, err = m.patchAffinity(oldVm, newVm, patchOps)
-		if err != nil {
-			return nil, err
-		}
+	patchOps, err = m.patchAffinity(newVM, patchOps)
+	if err != nil {
+		return nil, err
+	}
+
+	patchOps, err = m.patchTerminationGracePeriodSeconds(newVM, patchOps)
+	if err != nil {
+		return nil, err
 	}
 
 	return patchOps, nil
 }
 
-func needUpdateRunStrategy(oldVm, newVm *kubevirtv1.VirtualMachine) (bool, error) {
+func needUpdateRunStrategy(oldVM, newVM *kubevirtv1.VirtualMachine) (bool, error) {
 	// no need to patch the run strategy if user uses the spec.running filed.
-	if newVm.Spec.Running != nil {
+	if newVM.Spec.Running != nil {
 		return false, nil
 	}
 
-	newRunStrategy, err := newVm.RunStrategy()
+	newRunStrategy, err := newVM.RunStrategy()
 	if err != nil {
 		return false, err
 	}
 
-	oldRunStrategy, err := oldVm.RunStrategy()
+	oldRunStrategy, err := oldVM.RunStrategy()
 	if err != nil {
 		return false, err
 	}
@@ -131,8 +143,8 @@ func needUpdateRunStrategy(oldVm, newVm *kubevirtv1.VirtualMachine) (bool, error
 }
 
 // add workaround for the issue https://github.com/kubevirt/kubevirt/issues/7295
-func patchRunStrategy(newVm *kubevirtv1.VirtualMachine, patchOps types.PatchOps) types.PatchOps {
-	runStrategy := newVm.Annotations[util.AnnotationRunStrategy]
+func patchRunStrategy(newVM *kubevirtv1.VirtualMachine, patchOps types.PatchOps) types.PatchOps {
+	runStrategy := newVM.Annotations[util.AnnotationRunStrategy]
 	if string(runStrategy) == "" {
 		runStrategy = string(kubevirtv1.RunStrategyRerunOnFailure)
 	}
@@ -140,23 +152,23 @@ func patchRunStrategy(newVm *kubevirtv1.VirtualMachine, patchOps types.PatchOps)
 	return patchOps
 }
 
-func needUpdateResourceOvercommit(oldVm, newVm *kubevirtv1.VirtualMachine) bool {
+func needUpdateResourceOvercommit(oldVM, newVM *kubevirtv1.VirtualMachine) bool {
 	var newReservedMemory, oldReservedMemory string
-	newLimits := newVm.Spec.Template.Spec.Domain.Resources.Limits
-	newCpu := newLimits.Cpu()
+	newLimits := newVM.Spec.Template.Spec.Domain.Resources.Limits
+	newCPU := newLimits.Cpu()
 	newMem := newLimits.Memory()
-	if newVm.Annotations != nil {
-		newReservedMemory = newVm.Annotations[util.AnnotationReservedMemory]
+	if newVM.Annotations != nil {
+		newReservedMemory = newVM.Annotations[util.AnnotationReservedMemory]
 	}
 
-	oldLimits := oldVm.Spec.Template.Spec.Domain.Resources.Limits
-	oldCpu := oldLimits.Cpu()
+	oldLimits := oldVM.Spec.Template.Spec.Domain.Resources.Limits
+	oldCPU := oldLimits.Cpu()
 	oldMem := oldLimits.Memory()
-	if oldVm.Annotations != nil {
-		oldReservedMemory = oldVm.Annotations[util.AnnotationReservedMemory]
+	if oldVM.Annotations != nil {
+		oldReservedMemory = oldVM.Annotations[util.AnnotationReservedMemory]
 	}
 
-	if !newCpu.IsZero() && (oldCpu.IsZero() || !newCpu.Equal(*oldCpu)) {
+	if !newCPU.IsZero() && (oldCPU.IsZero() || !newCPU.Equal(*oldCPU)) {
 		return true
 	}
 	if !newMem.IsZero() && (oldMem.IsZero() || !newMem.Equal(*oldMem)) {
@@ -165,7 +177,11 @@ func needUpdateResourceOvercommit(oldVm, newVm *kubevirtv1.VirtualMachine) bool 
 	if newReservedMemory != oldReservedMemory {
 		return true
 	}
-	return false
+	if isDedicatedCPU(oldVM) != isDedicatedCPU(newVM) {
+		return true
+	}
+
+	return hostDevicesOvercommitNeeded(oldVM, newVM)
 }
 
 func (m *vmMutator) patchResourceOvercommit(vm *kubevirtv1.VirtualMachine) ([]string, error) {
@@ -179,9 +195,25 @@ func (m *vmMutator) patchResourceOvercommit(vm *kubevirtv1.VirtualMachine) ([]st
 	if err != nil || overcommit == nil {
 		return patchOps, err
 	}
+	agmorc, err := m.getAdditionalGuestMemoryOverheadRatioConfig()
+	if err != nil {
+		logrus.WithFields(logrus.Fields{
+			"namespace": vm.Namespace,
+			"name":      vm.Name,
+		}).Warnf("fail to get setting %v, fallback to legacy reserved memory strategy, error: %v", settings.AdditionalGuestMemoryOverheadRatioName, err.Error())
+		agmorc = nil
+		err = nil
+	}
 
 	if !cpu.IsZero() {
-		newRequest := cpu.MilliValue() * int64(100) / int64(overcommit.Cpu)
+		var newRequest int64
+		if isDedicatedCPU(vm) {
+			// do not apply overcommitted resource since dedicated CPU requires guaranteed QoS
+			// more info, please check https://github.com/kubevirt/kubevirt/blob/8fe1d71accd7d6f5837de514d6b9ddc782c5dd41/pkg/virt-api/webhooks/validating-webhook/admitters/vmi-create-admitter.go#L619
+			newRequest = cpu.MilliValue()
+		} else {
+			newRequest = cpu.MilliValue() * int64(100) / int64(overcommit.CPU)
+		}
 		quantity := resource.NewMilliQuantity(newRequest, cpu.Format)
 		if requestsMissing {
 			requestsToMutate[v1.ResourceCPU] = *quantity
@@ -190,31 +222,11 @@ func (m *vmMutator) patchResourceOvercommit(vm *kubevirtv1.VirtualMachine) ([]st
 		}
 	}
 	if !mem.IsZero() {
-		// Truncate to MiB
-		newRequest := mem.Value() * int64(100) / int64(overcommit.Memory) / 1048576 * 1048576
-		quantity := resource.NewQuantity(newRequest, mem.Format)
-		if requestsMissing {
-			requestsToMutate[v1.ResourceMemory] = *quantity
-		} else {
-			patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/domain/resources/requests/memory", "value": "%s"}`, quantity))
+		memPatch, err := generateMemoryPatch(vm, mem, overcommit, agmorc, requestsMissing, requestsToMutate)
+		if err != nil {
+			return patchOps, err
 		}
-		// Reserve 100MiB (104857600 Bytes) for QEMU on guest memory
-		// Ref: https://github.com/harvester/harvester/issues/1234
-		// TODO: handle hugepage memory
-		reservedMemory := *resource.NewQuantity(104857600, resource.BinarySI)
-		if vm.Annotations != nil && vm.Annotations[util.AnnotationReservedMemory] != "" {
-			reservedMemory, err = resource.ParseQuantity(vm.Annotations[util.AnnotationReservedMemory])
-			if err != nil {
-				return patchOps, err
-			}
-		}
-		guestMemory := *mem
-		guestMemory.Sub(reservedMemory)
-		if vm.Spec.Template.Spec.Domain.Memory == nil {
-			patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/domain/memory", "value": {"guest":"%s"}}`, &guestMemory))
-		} else {
-			patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/domain/memory/guest", "value": "%s"}`, &guestMemory))
-		}
+		patchOps = append(patchOps, memPatch...)
 	}
 	if len(requestsToMutate) > 0 {
 		bytes, err := json.Marshal(requestsToMutate)
@@ -226,8 +238,83 @@ func (m *vmMutator) patchResourceOvercommit(vm *kubevirtv1.VirtualMachine) ([]st
 	return patchOps, nil
 }
 
+func generateMemoryPatch(vm *kubevirtv1.VirtualMachine, mem *resource.Quantity, overcommit *settings.Overcommit, agmorc *settings.AdditionalGuestMemoryOverheadRatioConfig, requestsMissing bool, requestsToMutate v1.ResourceList) (types.PatchOps, error) {
+	// Truncate to MiB
+	var patchOps types.PatchOps
+	var err error
+	newRequest := mem.Value() * int64(100) / int64(overcommit.Memory) / 1048576 * 1048576
+	quantity := resource.NewQuantity(newRequest, mem.Format)
+
+	// Reserve 100MiB (104857600 Bytes) for QEMU on guest memory
+	// Ref: https://github.com/harvester/harvester/issues/1234
+	// TODO: handle hugepage memory
+	reservedMemory := *resource.NewQuantity(memory100M, resource.BinarySI)
+	useReservedMemory := true
+
+	// user has set AnnotationReservedMemory, then use it anyway
+	if vm.Annotations != nil && vm.Annotations[util.AnnotationReservedMemory] != "" {
+		reservedMemory, err = resource.ParseQuantity(vm.Annotations[util.AnnotationReservedMemory])
+		if err != nil {
+			return patchOps, fmt.Errorf("annotation %v can't be converted to memory unit", vm.Annotations[util.AnnotationReservedMemory])
+		}
+		// already checked on validator: reservedMemory < mem
+		if reservedMemory.Value() >= mem.Value() {
+			return patchOps, fmt.Errorf("reservedMemory can't be equal or greater than limits.memory  %v %v", reservedMemory.Value(), mem.Value())
+		}
+	} else {
+		// if user has set a valid AdditionalGuestMemoryOverheadRatio value
+		if agmorc != nil && !agmorc.IsEmpty() {
+			useReservedMemory = false
+		}
+	}
+
+	// when AnnotationReservedMemory is set, or AdditionalGuestMemoryOverheadRatioConfig is not set
+	// if AdditionalGuestMemoryOverheadRatioConfig and AdditionalGuestMemoryOverheadRatioConfig are both set
+	// then the VM will benefit from both
+	guestMemory := *mem
+	if useReservedMemory {
+		guestMemory.Sub(reservedMemory)
+	}
+	if guestMemory.Value() < memory256M {
+		// some test cases use a small value to test, but for production such VM makes no sense, add a warning here
+		logrus.WithFields(logrus.Fields{
+			"namespace": vm.Namespace,
+			"name":      vm.Name,
+		}).Warnf("guest memory is under the suggested minimum requirement (256 Mi), original: %v, final: %v", mem.Value(), guestMemory.Value())
+	}
+	if guestMemory.Value() < memory10M {
+		// should not be < 10 Mi
+		return patchOps, fmt.Errorf("guest memory is under the minimum requirement (10 Mi), original: %v, final: %v", mem.Value(), guestMemory.Value())
+	}
+
+	if isDedicatedCPU(vm) {
+		// do not apply overcommitted resource since dedicated CPU requires guaranteed QoS
+		// more info, please check https://github.com/kubevirt/kubevirt/blob/8fe1d71accd7d6f5837de514d6b9ddc782c5dd41/pkg/virt-api/webhooks/validating-webhook/admitters/vmi-create-admitter.go#L619
+		quantity = mem
+	} else if hostDevicesPresent(vm) {
+		// Needed to avoid issue due to overcommit when GPU or HostDevices are passed to a VM.
+		// Addresses issue: `https://github.com/kubevirt/kubevirt/issues/10379`
+		// This condition can be removed once a fix is available upstream
+		guestMemory.DeepCopyInto(quantity)
+	}
+
+	if requestsMissing {
+		requestsToMutate[v1.ResourceMemory] = *quantity
+	} else {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/domain/resources/requests/memory", "value": "%s"}`, quantity))
+	}
+
+	if vm.Spec.Template.Spec.Domain.Memory == nil {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/domain/memory", "value": {"guest":"%s"}}`, &guestMemory))
+	} else {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/domain/memory/guest", "value": "%s"}`, &guestMemory))
+	}
+
+	return patchOps, nil
+}
+
 func (m *vmMutator) getOvercommit() (*settings.Overcommit, error) {
-	s, err := m.setting.Get("overcommit-config")
+	s, err := m.setting.Get(settings.OvercommitConfigSettingName)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil
@@ -248,64 +335,51 @@ func (m *vmMutator) getOvercommit() (*settings.Overcommit, error) {
 	return overcommit, nil
 }
 
-func needUpdateAffinity(oldVm, newVm *kubevirtv1.VirtualMachine) bool {
-	if oldVm.Spec.Template == nil || newVm.Spec.Template == nil {
-		return false
+func (m *vmMutator) getAdditionalGuestMemoryOverheadRatioConfig() (*settings.AdditionalGuestMemoryOverheadRatioConfig, error) {
+	s, err := m.setting.Get(settings.AdditionalGuestMemoryOverheadRatioName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
-
-	if isContainMultusNetwork(newVm.Spec.Template.Spec.Networks) {
-		return true
+	value := s.Value
+	if value == "" {
+		value = s.Default
 	}
-	// if there are networks removed, update the affinity
-	reducedNetworks := getMultusNetworkIncrement(newVm.Spec.Template.Spec.Networks, oldVm.Spec.Template.Spec.Networks)
-	if len(reducedNetworks) != 0 {
-		return true
-	}
-
-	oldVmAffinity, newVmAffinity := oldVm.Spec.Template.Spec.Affinity, newVm.Spec.Template.Spec.Affinity
-	// the affinity.String() method already checks the nil
-	if oldVmAffinity.String() != newVmAffinity.String() {
-		return true
-	}
-
-	return false
+	return settings.NewAdditionalGuestMemoryOverheadRatioConfig(value)
 }
 
-func (m *vmMutator) patchAffinity(oldVm, newVm *kubevirtv1.VirtualMachine, patchOps types.PatchOps) (types.PatchOps, error) {
-	if newVm == nil || newVm.Spec.Template == nil {
+func (m *vmMutator) patchAffinity(vm *kubevirtv1.VirtualMachine, patchOps types.PatchOps) (types.PatchOps, error) {
+	if vm == nil || vm.Spec.Template == nil {
 		return patchOps, nil
 	}
 
-	affinity := makeAffinityFromVMTemplate(newVm.Spec.Template)
-	nodeSelector := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	affinity := makeAffinityFromVMTemplate(vm.Spec.Template)
+	requiredNodeSelector := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	preferredNodeSelector := affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
 
-	var oldVmNetworks []kubevirtv1.Network
-	if oldVm != nil && oldVm.Spec.Template != nil {
-		oldVmNetworks = oldVm.Spec.Template.Spec.Networks
-	}
-	newVmNetworks := newVm.Spec.Template.Spec.Networks
-	logrus.Debugf("newNetworks: %+v", newVmNetworks)
-	reducedNetworks := getMultusNetworkIncrement(newVmNetworks, oldVmNetworks)
-	logrus.Debugf("reducedNetworks: %+v", reducedNetworks)
+	newVMNetworks := vm.Spec.Template.Spec.Networks
+	logrus.Debugf("newNetworks: %+v", newVMNetworks)
 
-	isAdded, err := m.addNodeSelectorRequirements(newVm.Namespace, nodeSelector, newVmNetworks)
-	if err != nil {
-		return patchOps, err
-	}
-	isReduced, err := m.deleteNodeNetworkRequirements(newVm.Namespace, nodeSelector, reducedNetworks)
-	if err != nil {
+	if err := m.addNodeSelectorTerms(vm.Namespace, requiredNodeSelector, newVMNetworks); err != nil {
 		return patchOps, err
 	}
 
-	if !(isAdded || isReduced) {
-		return patchOps, nil
+	// The .spec.affinity could not be like `{nodeAffinity:requireDuringSchedulingIgnoreDuringExecution:[]}` if there is not any rules.
+	if len(requiredNodeSelector.NodeSelectorTerms) == 0 {
+		if len(preferredNodeSelector) == 0 {
+			affinity.NodeAffinity = nil
+		} else {
+			affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = nil
+		}
 	}
 
 	bytes, err := json.Marshal(affinity)
 	if err != nil {
 		return patchOps, err
 	}
-	return append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/affinity", "value": %s}`, string(bytes))), nil
+	return append(patchOps, fmt.Sprintf(`{"op":"replace","path":"/spec/template/spec/affinity","value":%s}`, string(bytes))), nil
 }
 
 func (m *vmMutator) getNodeSelectorRequirementFromNetwork(defaultNamespace string, network kubevirtv1.Network) (*v1.NodeSelectorRequirement, error) {
@@ -362,41 +436,30 @@ func makeAffinityFromVMTemplate(template *kubevirtv1.VirtualMachineInstanceTempl
 		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &v1.NodeSelector{}
 	}
 
+	// clear node selector terms whose key contains the prefix "network.harvesterhci.io"
+	nodeSelectorTerms := make([]v1.NodeSelectorTerm, 0, len(affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms))
+	for _, term := range affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		expressions := make([]v1.NodeSelectorRequirement, 0, len(term.MatchExpressions))
+		for _, expression := range term.MatchExpressions {
+			if !strings.HasPrefix(expression.Key, networkGroup) {
+				expressions = append(expressions, expression)
+			}
+		}
+		if len(expressions) != 0 {
+			term.MatchExpressions = expressions
+			nodeSelectorTerms = append(nodeSelectorTerms, term)
+		}
+	}
+	affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms = nodeSelectorTerms
+
 	return affinity
 }
 
-func getMultusNetworkIncrement(before, after []kubevirtv1.Network) []kubevirtv1.Network {
-	increment := make([]kubevirtv1.Network, 0, len(after))
-
-	for _, a := range after {
-		if a.Multus == nil {
-			continue
-		}
-
-		isExisting := false
-
-		for _, b := range before {
-			if b.Multus != nil && a.Multus.NetworkName == b.Multus.NetworkName {
-				isExisting = true
-				break
-			}
-		}
-
-		if !isExisting {
-			increment = append(increment, a)
-		}
-	}
-
-	return increment
-}
-
-func (m *vmMutator) addNodeSelectorRequirements(defaultNamespace string, nodeSelector *v1.NodeSelector, incrementalNetworks []kubevirtv1.Network) (bool, error) {
-	isChanged := false
-
+func (m *vmMutator) addNodeSelectorTerms(defaultNamespace string, nodeSelector *v1.NodeSelector, incrementalNetworks []kubevirtv1.Network) error {
 	for _, network := range incrementalNetworks {
 		nodeSelectorRequirement, err := m.getNodeSelectorRequirementFromNetwork(defaultNamespace, network)
 		if err != nil {
-			return false, err
+			return err
 		}
 		if nodeSelectorRequirement == nil {
 			continue
@@ -407,7 +470,6 @@ func (m *vmMutator) addNodeSelectorRequirements(defaultNamespace string, nodeSel
 			if _, ok := isContainTargetNodeSelectorRequirement(term, *nodeSelectorRequirement); !ok {
 				term.MatchExpressions = append(term.MatchExpressions, *nodeSelectorRequirement)
 				nodeSelector.NodeSelectorTerms[i] = term
-				isChanged = true
 			}
 		}
 		// If there is no term, initialize one with the cluster network requirement to prove that the cluster network
@@ -416,42 +478,65 @@ func (m *vmMutator) addNodeSelectorRequirements(defaultNamespace string, nodeSel
 			nodeSelector.NodeSelectorTerms = []v1.NodeSelectorTerm{{
 				MatchExpressions: []v1.NodeSelectorRequirement{*nodeSelectorRequirement},
 			}}
-			isChanged = true
 		}
 	}
 
-	return isChanged, nil
+	return nil
 }
 
-func (m *vmMutator) deleteNodeNetworkRequirements(defaultNamespace string, nodeSelector *v1.NodeSelector, reducedNetworks []kubevirtv1.Network) (bool, error) {
-	isChanged := false
-
-	for _, network := range reducedNetworks {
-		nodeSelectorRequirement, err := m.getNodeSelectorRequirementFromNetwork(defaultNamespace, network)
-		if err != nil {
-			return false, err
-		}
-		if nodeSelectorRequirement == nil {
-			continue
-		}
-		for i, term := range nodeSelector.NodeSelectorTerms {
-			if index, ok := isContainTargetNodeSelectorRequirement(term, *nodeSelectorRequirement); ok {
-				term.MatchExpressions = append(term.MatchExpressions[:index], term.MatchExpressions[index+1:]...)
-				nodeSelector.NodeSelectorTerms[i] = term
-				isChanged = true
-			}
-		}
+func (m *vmMutator) patchTerminationGracePeriodSeconds(vm *kubevirtv1.VirtualMachine, patchOps types.PatchOps) (types.PatchOps, error) {
+	if vm == nil || vm.Spec.Template == nil {
+		return patchOps, nil
 	}
 
-	return isChanged, nil
+	if vm.Spec.Template.Spec.TerminationGracePeriodSeconds != nil {
+		return patchOps, nil
+	}
+
+	s, err := m.setting.Get(settings.DefaultVMTerminationGracePeriodSecondsSettingName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return patchOps, nil
+		}
+		return patchOps, err
+	}
+	value := s.Default
+	if s.Value != "" {
+		value = s.Value
+	}
+
+	patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/template/spec/terminationGracePeriodSeconds", "value": %s}`, value))
+	return patchOps, nil
 }
 
-func isContainMultusNetwork(networks []kubevirtv1.Network) bool {
-	for _, network := range networks {
-		if network.Multus != nil && network.Multus.NetworkName != "" {
-			return true
-		}
+func hostDevicesPresent(vm *kubevirtv1.VirtualMachine) bool {
+	if len(vm.Spec.Template.Spec.Domain.Devices.HostDevices) > 0 {
+		return true
+	}
+
+	if len(vm.Spec.Template.Spec.Domain.Devices.GPUs) > 0 {
+		return true
 	}
 
 	return false
+}
+
+func hostDevicesOvercommitNeeded(oldVM, newVM *kubevirtv1.VirtualMachine) bool {
+	// if host devices or GPUs are added or removed then resource update is needed
+	if len(newVM.Spec.Template.Spec.Domain.Devices.HostDevices) != len(oldVM.Spec.Template.Spec.Domain.Devices.HostDevices) || len(newVM.Spec.Template.Spec.Domain.Devices.GPUs) != len(oldVM.Spec.Template.Spec.Domain.Devices.GPUs) {
+		return true
+	}
+
+	// during upgrade path VMs with host devices are turned off. Post upgrade the memory needs to be patched
+	// to ensure devices with hostDevices/GPUs can be booted
+	if len(newVM.Spec.Template.Spec.Domain.Devices.HostDevices) > 0 || len(newVM.Spec.Template.Spec.Domain.Devices.GPUs) > 0 {
+		if newVM.Spec.Template.Spec.Domain.Memory != nil && (newVM.Spec.Template.Spec.Domain.Memory.Guest.Value() != newVM.Spec.Template.Spec.Domain.Resources.Requests.Memory().Value()) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDedicatedCPU(vm *kubevirtv1.VirtualMachine) bool {
+	return vm.Spec.Template.Spec.Domain.CPU != nil && vm.Spec.Template.Spec.Domain.CPU.DedicatedCPUPlacement
 }

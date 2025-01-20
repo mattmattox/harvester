@@ -4,8 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
-	. "github.com/onsi/ginkgo/v2"
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -18,8 +17,7 @@ import (
 	"github.com/harvester/harvester/pkg/config"
 	ctlharvesterv1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	ctlkubevirtv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
-	ctllonghornv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta1"
-	. "github.com/harvester/harvester/tests/framework/dsl"
+	ctllhv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta2"
 	"github.com/harvester/harvester/tests/framework/env"
 	"github.com/harvester/harvester/tests/framework/fuzz"
 	"github.com/harvester/harvester/tests/framework/helper"
@@ -33,7 +31,7 @@ var _ = Describe("verify vm backup & restore APIs", func() {
 			restoreController ctlharvesterv1.VirtualMachineRestoreController
 			vmController      ctlkubevirtv1.VirtualMachineController
 			vmiController     ctlkubevirtv1.VirtualMachineInstanceController
-			settingController ctllonghornv1.SettingController
+			settingController ctllhv1.SettingController
 			podController     ctlcorev1.PodController
 			svcController     ctlcorev1.ServiceController
 			backupNamespace   string
@@ -46,7 +44,7 @@ var _ = Describe("verify vm backup & restore APIs", func() {
 			restoreController = scaled.HarvesterFactory.Harvesterhci().V1beta1().VirtualMachineRestore()
 			vmController = scaled.VirtFactory.Kubevirt().V1().VirtualMachine()
 			vmiController = scaled.VirtFactory.Kubevirt().V1().VirtualMachineInstance()
-			settingController = scaled.LonghornFactory.Longhorn().V1beta1().Setting()
+			settingController = scaled.LonghornFactory.Longhorn().V1beta2().Setting()
 			podController = scaled.CoreFactory.Core().V1().Pod()
 			svcController = scaled.CoreFactory.Core().V1().Service()
 			backupNamespace = testVMNamespace

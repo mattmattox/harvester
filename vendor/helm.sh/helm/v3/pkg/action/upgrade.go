@@ -32,6 +32,7 @@ import (
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/kube"
 	"helm.sh/helm/v3/pkg/postrender"
+	"helm.sh/helm/v3/pkg/registry"
 	"helm.sh/helm/v3/pkg/release"
 	"helm.sh/helm/v3/pkg/releaseutil"
 	"helm.sh/helm/v3/pkg/storage/driver"
@@ -45,7 +46,6 @@ type Upgrade struct {
 
 	ChartPathOptions
 
-	Adopt bool
 	// Install is a purely informative flag that indicates whether this upgrade was done in "install" mode.
 	//
 	// Applications may use this to determine whether this Upgrade operation was done as part of a
@@ -71,8 +71,12 @@ type Upgrade struct {
 	// DisableHooks disables hook processing if set to true.
 	DisableHooks bool
 	// DryRun controls whether the operation is prepared, but not executed.
-	// If `true`, the upgrade is prepared but not performed.
 	DryRun bool
+	// DryRunOption controls whether the operation is prepared, but not executed with options on whether or not to interact with the remote cluster.
+	DryRunOption string
+	// HideSecret can be set to true when DryRun is enabled in order to hide
+	// Kubernetes Secrets in the output. It cannot be used outside of DryRun.
+	HideSecret bool
 	// Force will, if set to `true`, ignore certain warnings and perform the upgrade anyway.
 	//
 	// This should be used with caution.
@@ -81,6 +85,8 @@ type Upgrade struct {
 	ResetValues bool
 	// ReuseValues will re-use the user's last supplied values.
 	ReuseValues bool
+	// ResetThenReuseValues will reset the values to the chart's built-ins then merge with user's last supplied values.
+	ResetThenReuseValues bool
 	// Recreate will (if true) recreate pods after a rollback.
 	Recreate bool
 	// MaxHistory limits the maximum number of revisions saved per release
@@ -93,6 +99,7 @@ type Upgrade struct {
 	SubNotes bool
 	// Description is the description of this operation
 	Description string
+	Labels      map[string]string
 	// PostRender is an optional post-renderer
 	//
 	// If this is non-nil, then after templates are rendered, they will be sent to the
@@ -104,6 +111,10 @@ type Upgrade struct {
 	DependencyUpdate bool
 	// Lock to control raceconditions when the process receives a SIGTERM
 	Lock sync.Mutex
+	// Enable DNS lookups when rendering templates
+	EnableDNS bool
+	// TakeOwnership will ignore the check for helm annotations and take ownership of the resources.
+	TakeOwnership bool
 }
 
 type resultMessage struct {
@@ -119,6 +130,11 @@ func NewUpgrade(cfg *Configuration) *Upgrade {
 	up.ChartPathOptions.registryClient = cfg.RegistryClient
 
 	return up
+}
+
+// SetRegistryClient sets the registry client to use when fetching charts.
+func (u *Upgrade) SetRegistryClient(client *registry.Client) {
+	u.ChartPathOptions.registryClient = client
 }
 
 // Run executes the upgrade on the given release.
@@ -140,6 +156,7 @@ func (u *Upgrade) RunWithContext(ctx context.Context, name string, chart *chart.
 	if err := chartutil.ValidateReleaseName(name); err != nil {
 		return nil, errors.Errorf("release name is invalid: %s", name)
 	}
+
 	u.cfg.Log("preparing upgrade for %s", name)
 	currentRelease, upgradedRelease, err := u.prepareUpgrade(name, chart, vals)
 	if err != nil {
@@ -154,7 +171,8 @@ func (u *Upgrade) RunWithContext(ctx context.Context, name string, chart *chart.
 		return res, err
 	}
 
-	if !u.DryRun {
+	// Do not update for dry runs
+	if !u.isDryRun() {
 		u.cfg.Log("updating status for upgraded release for %s", name)
 		if err := u.cfg.Releases.Update(upgradedRelease); err != nil {
 			return res, err
@@ -164,10 +182,23 @@ func (u *Upgrade) RunWithContext(ctx context.Context, name string, chart *chart.
 	return res, nil
 }
 
+// isDryRun returns true if Upgrade is set to run as a DryRun
+func (u *Upgrade) isDryRun() bool {
+	if u.DryRun || u.DryRunOption == "client" || u.DryRunOption == "server" || u.DryRunOption == "true" {
+		return true
+	}
+	return false
+}
+
 // prepareUpgrade builds an upgraded release for an upgrade operation.
 func (u *Upgrade) prepareUpgrade(name string, chart *chart.Chart, vals map[string]interface{}) (*release.Release, *release.Release, error) {
 	if chart == nil {
 		return nil, nil, errMissingChart
+	}
+
+	// HideSecret must be used with dry run. Otherwise, return an error.
+	if !u.isDryRun() && u.HideSecret {
+		return nil, nil, errors.New("Hiding Kubernetes secrets requires a dry-run mode")
 	}
 
 	// finds the last non-deleted release with the given name
@@ -208,7 +239,7 @@ func (u *Upgrade) prepareUpgrade(name string, chart *chart.Chart, vals map[strin
 		return nil, nil, err
 	}
 
-	if err := chartutil.ProcessDependencies(chart, vals); err != nil {
+	if err := chartutil.ProcessDependenciesWithMerge(chart, vals); err != nil {
 		return nil, nil, err
 	}
 
@@ -232,9 +263,19 @@ func (u *Upgrade) prepareUpgrade(name string, chart *chart.Chart, vals map[strin
 		return nil, nil, err
 	}
 
-	hooks, manifestDoc, notesTxt, err := u.cfg.renderResources(chart, valuesToRender, "", "", u.SubNotes, false, false, u.PostRenderer, u.DryRun)
+	// Determine whether or not to interact with remote
+	var interactWithRemote bool
+	if !u.isDryRun() || u.DryRunOption == "server" || u.DryRunOption == "none" || u.DryRunOption == "false" {
+		interactWithRemote = true
+	}
+
+	hooks, manifestDoc, notesTxt, err := u.cfg.renderResources(chart, valuesToRender, "", "", u.SubNotes, false, false, u.PostRenderer, interactWithRemote, u.EnableDNS, u.HideSecret)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if driver.ContainsSystemLabels(u.Labels) {
+		return nil, nil, fmt.Errorf("user suplied labels contains system reserved label name. System labels: %+v", driver.GetSystemLabels())
 	}
 
 	// Store an upgraded release.
@@ -252,6 +293,7 @@ func (u *Upgrade) prepareUpgrade(name string, chart *chart.Chart, vals map[strin
 		Version:  revision,
 		Manifest: manifestDoc.String(),
 		Hooks:    hooks,
+		Labels:   mergeCustomLabels(lastRelease.Labels, u.Labels),
 	}
 
 	if len(notesTxt) > 0 {
@@ -297,9 +339,9 @@ func (u *Upgrade) performUpgrade(ctx context.Context, originalRelease, upgradedR
 		}
 	}
 
-	toBeUpdated, err := existingResourceConflict(toBeCreated, upgradedRelease.Name, upgradedRelease.Namespace, u.Adopt)
+	toBeUpdated, err := existingResourceConflict(toBeCreated, upgradedRelease.Name, upgradedRelease.Namespace, u.TakeOwnership)
 	if err != nil {
-		return nil, errors.Wrap(err, "rendered manifests contain a resource that already exists. Unable to continue with update")
+		return nil, errors.Wrap(err, "Unable to continue with update")
 	}
 
 	toBeUpdated.Visit(func(r *resource.Info, err error) error {
@@ -310,7 +352,8 @@ func (u *Upgrade) performUpgrade(ctx context.Context, originalRelease, upgradedR
 		return nil
 	})
 
-	if u.DryRun {
+	// Run if it is a dry run
+	if u.isDryRun() {
 		u.cfg.Log("dry run for %s", upgradedRelease.Name)
 		if len(u.Description) > 0 {
 			upgradedRelease.Info.Description = u.Description
@@ -327,11 +370,11 @@ func (u *Upgrade) performUpgrade(ctx context.Context, originalRelease, upgradedR
 	rChan := make(chan resultMessage)
 	ctxChan := make(chan resultMessage)
 	doneChan := make(chan interface{})
+	defer close(doneChan)
 	go u.releasingUpgrade(rChan, upgradedRelease, current, target, originalRelease)
 	go u.handleContext(ctx, doneChan, ctxChan, upgradedRelease)
 	select {
 	case result := <-rChan:
-		doneChan <- true
 		return result.r, result.e
 	case result := <-ctxChan:
 		return result.r, result.e
@@ -352,17 +395,15 @@ func (u *Upgrade) reportToPerformUpgrade(c chan<- resultMessage, rel *release.Re
 
 // Setup listener for SIGINT and SIGTERM
 func (u *Upgrade) handleContext(ctx context.Context, done chan interface{}, c chan<- resultMessage, upgradedRelease *release.Release) {
-	go func() {
-		select {
-		case <-ctx.Done():
-			err := ctx.Err()
+	select {
+	case <-ctx.Done():
+		err := ctx.Err()
 
-			// when the atomic flag is set the ongoing release finish first and doesn't give time for the rollback happens.
-			u.reportToPerformUpgrade(c, upgradedRelease, kube.ResourceList{}, err)
-		case <-done:
-			return
-		}
-	}()
+		// when the atomic flag is set the ongoing release finish first and doesn't give time for the rollback happens.
+		u.reportToPerformUpgrade(c, upgradedRelease, kube.ResourceList{}, err)
+	case <-done:
+		return
+	}
 }
 func (u *Upgrade) releasingUpgrade(c chan<- resultMessage, upgradedRelease *release.Release, current kube.ResourceList, target kube.ResourceList, originalRelease *release.Release) {
 	// pre-upgrade hooks
@@ -394,6 +435,9 @@ func (u *Upgrade) releasingUpgrade(c chan<- resultMessage, upgradedRelease *rele
 	}
 
 	if u.Wait {
+		u.cfg.Log(
+			"waiting for release %s resources (created: %d updated: %d  deleted: %d)",
+			upgradedRelease.Name, len(results.Created), len(results.Updated), len(results.Deleted))
 		if u.WaitForJobs {
 			if err := u.cfg.KubeClient.WaitWithJobs(target, u.Timeout); err != nil {
 				u.cfg.recordRelease(originalRelease)
@@ -520,6 +564,15 @@ func (u *Upgrade) reuseValues(chart *chart.Chart, current *release.Release, newV
 		return newVals, nil
 	}
 
+	// If the ResetThenReuseValues flag is set, we use the new chart's values, but we copy the old config's values over the new config's values.
+	if u.ResetThenReuseValues {
+		u.cfg.Log("merging values from old release to new values")
+
+		newVals = chartutil.CoalesceTables(newVals, current.Config)
+
+		return newVals, nil
+	}
+
 	if len(newVals) == 0 && len(current.Config) > 0 {
 		u.cfg.Log("copying values from %s (v%d) to new release.", current.Name, current.Version)
 		newVals = current.Config
@@ -571,4 +624,14 @@ func recreate(cfg *Configuration, resources kube.ResourceList) error {
 func objectKey(r *resource.Info) string {
 	gvk := r.Object.GetObjectKind().GroupVersionKind()
 	return fmt.Sprintf("%s/%s/%s/%s", gvk.GroupVersion().String(), gvk.Kind, r.Namespace, r.Name)
+}
+
+func mergeCustomLabels(current, desired map[string]string) map[string]string {
+	labels := mergeStrStrMaps(current, desired)
+	for k, v := range labels {
+		if v == "null" {
+			delete(labels, k)
+		}
+	}
+	return labels
 }

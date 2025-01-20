@@ -3,13 +3,13 @@ package upgrade
 import (
 	"fmt"
 
-	jobV1 "github.com/rancher/wrangler/pkg/generated/controllers/batch/v1"
+	jobV1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/batch/v1"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
-	clusterv1ctl "github.com/harvester/harvester/pkg/generated/controllers/cluster.x-k8s.io/v1alpha4"
+	ctlclusterv1 "github.com/harvester/harvester/pkg/generated/controllers/cluster.x-k8s.io/v1beta1"
 	ctlharvesterv1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
 )
 
@@ -27,10 +27,10 @@ type secretHandler struct {
 	upgradeCache  ctlharvesterv1.UpgradeCache
 	jobClient     jobV1.JobClient
 	jobCache      jobV1.JobCache
-	machineCache  clusterv1ctl.MachineCache
+	machineCache  ctlclusterv1.MachineCache
 }
 
-func (h *secretHandler) OnChanged(key string, secret *v1.Secret) (*v1.Secret, error) {
+func (h *secretHandler) OnChanged(_ string, secret *v1.Secret) (*v1.Secret, error) {
 	if secret == nil || secret.DeletionTimestamp != nil || secret.Namespace != rancherPlanSecretNamespace || secret.Annotations == nil || secret.Type != rancherPlanSecretType {
 		return secret, nil
 	}
@@ -150,9 +150,8 @@ func checkEligibleToDrain(upgrade *harvesterv1.Upgrade, nodeName string) error {
 		}
 		if status.State == StateSucceeded || status.State == nodeStateImagesPreloaded {
 			continue
-		} else {
-			return fmt.Errorf("%s is in \"%s\" state so %s is not allowed to run any kind of job", name, status, nodeName)
 		}
+		return fmt.Errorf("%s is in \"%s\" state so %s is not allowed to run any kind of job", name, status, nodeName)
 	}
 	return nil
 }

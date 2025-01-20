@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 	"github.com/rancher/dynamiclistener"
 	"github.com/sirupsen/logrus"
 	restclient "k8s.io/client-go/rest"
@@ -16,7 +16,7 @@ import (
 	"github.com/harvester/harvester/pkg/config"
 	"github.com/harvester/harvester/pkg/server"
 	"github.com/harvester/harvester/tests/framework/cluster"
-	. "github.com/harvester/harvester/tests/framework/dsl"
+	"github.com/harvester/harvester/tests/framework/dsl"
 	"github.com/harvester/harvester/tests/framework/helper"
 	"github.com/harvester/harvester/tests/integration/runtime"
 )
@@ -44,6 +44,54 @@ const (
 	harvesterStartTimeOut = 20
 )
 
+// Declarations for Ginkgo DSL
+var Fail = ginkgo.Fail
+var Describe = ginkgo.Describe
+var It = ginkgo.It
+var By = ginkgo.By
+var BeforeEach = ginkgo.BeforeEach
+var AfterEach = ginkgo.AfterEach
+var BeforeSuite = ginkgo.BeforeSuite
+var AfterSuite = ginkgo.AfterSuite
+var RunSpecs = ginkgo.RunSpecs
+var GinkgoWriter = ginkgo.GinkgoWriter
+var GinkgoRecover = ginkgo.GinkgoRecover
+var GinkgoT = ginkgo.GinkgoT
+var Context = ginkgo.Context
+var Specify = ginkgo.Specify
+
+// Declarations for Gomega Matchers
+var RegisterFailHandler = gomega.RegisterFailHandler
+var Equal = gomega.Equal
+var Expect = gomega.Expect
+var BeNil = gomega.BeNil
+var HaveOccurred = gomega.HaveOccurred
+var BeEmpty = gomega.BeEmpty
+var Eventually = gomega.Eventually
+var BeEquivalentTo = gomega.BeEquivalentTo
+var BeElementOf = gomega.BeElementOf
+var Consistently = gomega.Consistently
+var BeTrue = gomega.BeTrue
+
+// Declarations for DSL
+var MustNotError = dsl.MustNotError
+var MustFinallyBeTrue = dsl.MustFinallyBeTrue
+var MustRespCodeIs = dsl.MustRespCodeIs
+var MustRespCodeIn = dsl.MustRespCodeIn
+var MustEqual = dsl.MustEqual
+var MustNotEqual = dsl.MustNotEqual
+var Cleanup = dsl.Cleanup
+var CheckRespCodeIs = dsl.CheckRespCodeIs
+var HasNoneVMI = dsl.HasNoneVMI
+var AfterVMRunning = dsl.AfterVMRunning
+var AfterVMIRunning = dsl.AfterVMIRunning
+var AfterVMIRestarted = dsl.AfterVMIRestarted
+var MustVMPaused = dsl.MustVMPaused
+var MustVMRunning = dsl.MustVMRunning
+var MustVMDeleted = dsl.MustVMDeleted
+var MustVMIRunning = dsl.MustVMIRunning
+var MustPVCDeleted = dsl.MustPVCDeleted
+
 func TestAPI(t *testing.T) {
 	defer GinkgoRecover()
 
@@ -68,7 +116,7 @@ var _ = BeforeSuite(func() {
 	MustNotError(err)
 
 	By("set harvester config")
-	options, err = runtime.SetConfig(kubeConfig, testCluster)
+	options, err = runtime.SetConfig()
 	MustNotError(err)
 
 	By("new harvester server")
@@ -92,7 +140,7 @@ var _ = BeforeSuite(func() {
 	select {
 	case <-time.After(harvesterStartTimeOut * time.Second):
 		MustFinallyBeTrue(func() bool {
-			return validateApiIsReady()
+			return validateAPIIsReady()
 		})
 	case err := <-testSuiteStartErrChan:
 		MustNotError(err)
@@ -100,12 +148,8 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
-	By("tearing down harvester runtime")
-	err := runtime.Destruct(context.Background(), kubeConfig)
-	MustNotError(err)
-
 	By("tearing down test cluster")
-	err = cluster.Stop(GinkgoWriter)
+	err := cluster.Stop(GinkgoWriter)
 	MustNotError(err)
 
 	By("tearing down harvester server")
@@ -116,7 +160,7 @@ var _ = AfterSuite(func() {
 })
 
 // validate the v1 api server is ready
-func validateApiIsReady() bool {
+func validateAPIIsReady() bool {
 	apiURL := helper.BuildAPIURL("v1", "", options.HTTPSListenPort)
 	code, _, err := helper.GetResponse(apiURL)
 	if err != nil || code != http.StatusOK {

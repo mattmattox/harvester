@@ -10,8 +10,8 @@ import (
 	"github.com/rancher/steve/pkg/clustercache"
 	"github.com/rancher/steve/pkg/schema"
 	"github.com/rancher/steve/pkg/schema/converter"
-	"github.com/rancher/wrangler/pkg/slice"
-	"github.com/rancher/wrangler/pkg/summary"
+	"github.com/rancher/wrangler/v3/pkg/slice"
+	"github.com/rancher/wrangler/v3/pkg/summary"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -80,6 +80,7 @@ func (s *SummaryCache) OnInboundRelationshipChange(ctx context.Context, schema *
 	s.cbs[id] = cb
 
 	go func() {
+		defer close(ret)
 		for rel := range cb {
 			if rel.Kind == kind &&
 				rel.APIVersion == apiVersion &&
@@ -94,7 +95,6 @@ func (s *SummaryCache) OnInboundRelationshipChange(ctx context.Context, schema *
 		s.Lock()
 		defer s.Unlock()
 		close(cb)
-		defer close(ret)
 		delete(s.cbs, id)
 	}()
 

@@ -32,6 +32,8 @@ type Interface interface {
 	BackingImageManagers() BackingImageManagerInformer
 	// Backups returns a BackupInformer.
 	Backups() BackupInformer
+	// BackupBackingImages returns a BackupBackingImageInformer.
+	BackupBackingImages() BackupBackingImageInformer
 	// BackupTargets returns a BackupTargetInformer.
 	BackupTargets() BackupTargetInformer
 	// BackupVolumes returns a BackupVolumeInformer.
@@ -56,8 +58,16 @@ type Interface interface {
 	ShareManagers() ShareManagerInformer
 	// Snapshots returns a SnapshotInformer.
 	Snapshots() SnapshotInformer
+	// SupportBundles returns a SupportBundleInformer.
+	SupportBundles() SupportBundleInformer
+	// SystemBackups returns a SystemBackupInformer.
+	SystemBackups() SystemBackupInformer
+	// SystemRestores returns a SystemRestoreInformer.
+	SystemRestores() SystemRestoreInformer
 	// Volumes returns a VolumeInformer.
 	Volumes() VolumeInformer
+	// VolumeAttachments returns a VolumeAttachmentInformer.
+	VolumeAttachments() VolumeAttachmentInformer
 }
 
 type version struct {
@@ -89,6 +99,11 @@ func (v *version) BackingImageManagers() BackingImageManagerInformer {
 // Backups returns a BackupInformer.
 func (v *version) Backups() BackupInformer {
 	return &backupInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// BackupBackingImages returns a BackupBackingImageInformer.
+func (v *version) BackupBackingImages() BackupBackingImageInformer {
+	return &backupBackingImageInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
 // BackupTargets returns a BackupTargetInformer.
@@ -151,7 +166,27 @@ func (v *version) Snapshots() SnapshotInformer {
 	return &snapshotInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
+// SupportBundles returns a SupportBundleInformer.
+func (v *version) SupportBundles() SupportBundleInformer {
+	return &supportBundleInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// SystemBackups returns a SystemBackupInformer.
+func (v *version) SystemBackups() SystemBackupInformer {
+	return &systemBackupInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// SystemRestores returns a SystemRestoreInformer.
+func (v *version) SystemRestores() SystemRestoreInformer {
+	return &systemRestoreInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
 // Volumes returns a VolumeInformer.
 func (v *version) Volumes() VolumeInformer {
 	return &volumeInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// VolumeAttachments returns a VolumeAttachmentInformer.
+func (v *version) VolumeAttachments() VolumeAttachmentInformer {
+	return &volumeAttachmentInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

@@ -2,7 +2,6 @@ package manager
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -12,20 +11,24 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/longhorn/longhorn-manager/engineapi"
-
 	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	"github.com/longhorn/longhorn-manager/types"
+	"github.com/longhorn/longhorn-manager/util"
 )
 
 const (
 	BackupStatusQueryInterval = 2 * time.Second
+
+	// minSyncBackupTargetIntervalSec interval in seconds to synchronize backup target to avoid frequent sync
+	minSyncBackupTargetIntervalSec = 10
 )
 
-func (m *VolumeManager) ListSnapshots(volumeName string) (map[string]*longhorn.SnapshotInfo, error) {
+func (m *VolumeManager) ListSnapshotInfos(volumeName string) (map[string]*longhorn.SnapshotInfo, error) {
 	if volumeName == "" {
 		return nil, fmt.Errorf("volume name required")
 	}
 
-	engineCliClient, err := m.GetEngineBinaryClient(volumeName)
+	engineCliClient, err := engineapi.GetEngineBinaryClient(m.ds, volumeName, m.currentNodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -44,12 +47,12 @@ func (m *VolumeManager) ListSnapshots(volumeName string) (map[string]*longhorn.S
 	return engineClientProxy.SnapshotList(engine)
 }
 
-func (m *VolumeManager) GetSnapshot(snapshotName, volumeName string) (*longhorn.SnapshotInfo, error) {
+func (m *VolumeManager) GetSnapshotInfo(snapshotName, volumeName string) (*longhorn.SnapshotInfo, error) {
 	if volumeName == "" || snapshotName == "" {
 		return nil, fmt.Errorf("volume and snapshot name required")
 	}
 
-	engineCliClient, err := m.GetEngineBinaryClient(volumeName)
+	engineCliClient, err := engineapi.GetEngineBinaryClient(m.ds, volumeName, m.currentNodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -82,22 +85,25 @@ func (m *VolumeManager) CreateSnapshot(snapshotName string, labels map[string]st
 		return nil, fmt.Errorf("volume name required")
 	}
 
-	for k, v := range labels {
-		if strings.Contains(k, "=") || strings.Contains(v, "=") {
-			return nil, fmt.Errorf("labels cannot contain '='")
-		}
+	if err := util.VerifySnapshotLabels(labels); err != nil {
+		return nil, err
 	}
 
 	if err := m.checkVolumeNotInMigration(volumeName); err != nil {
 		return nil, err
 	}
 
-	engineCliClient, err := m.GetEngineBinaryClient(volumeName)
+	engineCliClient, err := engineapi.GetEngineBinaryClient(m.ds, volumeName, m.currentNodeID)
 	if err != nil {
 		return nil, err
 	}
 
 	e, err := m.GetRunningEngineByVolume(volumeName)
+	if err != nil {
+		return nil, err
+	}
+
+	freezeFilesystem, err := m.ds.GetFreezeFilesystemForSnapshotSetting(e)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +114,7 @@ func (m *VolumeManager) CreateSnapshot(snapshotName string, labels map[string]st
 	}
 	defer engineClientProxy.Close()
 
-	snapshotName, err = engineClientProxy.SnapshotCreate(e, snapshotName, labels)
+	snapshotName, err = engineClientProxy.SnapshotCreate(e, snapshotName, labels, freezeFilesystem)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +128,7 @@ func (m *VolumeManager) CreateSnapshot(snapshotName string, labels map[string]st
 		return nil, fmt.Errorf("cannot found just created snapshot '%s', for volume '%s'", snapshotName, volumeName)
 	}
 
-	logrus.Debugf("Created snapshot %v with labels %+v for volume %v", snapshotName, labels, volumeName)
+	logrus.Infof("Created snapshot %v with labels %+v for volume %v", snapshotName, labels, volumeName)
 	return snap, nil
 }
 
@@ -135,7 +141,7 @@ func (m *VolumeManager) DeleteSnapshot(snapshotName, volumeName string) error {
 		return err
 	}
 
-	engineCliClient, err := m.GetEngineBinaryClient(volumeName)
+	engineCliClient, err := engineapi.GetEngineBinaryClient(m.ds, volumeName, m.currentNodeID)
 	if err != nil {
 		return err
 	}
@@ -155,7 +161,7 @@ func (m *VolumeManager) DeleteSnapshot(snapshotName, volumeName string) error {
 		return err
 	}
 
-	logrus.Debugf("Deleted snapshot %v for volume %v", snapshotName, volumeName)
+	logrus.Infof("Deleted snapshot %v for volume %v", snapshotName, volumeName)
 	return nil
 }
 
@@ -168,7 +174,7 @@ func (m *VolumeManager) RevertSnapshot(snapshotName, volumeName string) error {
 		return err
 	}
 
-	engineCliClient, err := m.GetEngineBinaryClient(volumeName)
+	engineCliClient, err := engineapi.GetEngineBinaryClient(m.ds, volumeName, m.currentNodeID)
 	if err != nil {
 		return err
 	}
@@ -201,7 +207,7 @@ func (m *VolumeManager) RevertSnapshot(snapshotName, volumeName string) error {
 		return err
 	}
 
-	logrus.Debugf("Revert to snapshot %v for volume %v", snapshotName, volumeName)
+	logrus.Infof("Reverted to snapshot %v for volume %v", snapshotName, volumeName)
 	return nil
 }
 
@@ -210,11 +216,19 @@ func (m *VolumeManager) PurgeSnapshot(volumeName string) error {
 		return fmt.Errorf("volume name required")
 	}
 
+	disablePurge, err := m.ds.GetSettingAsBool(types.SettingNameDisableSnapshotPurge)
+	if err != nil {
+		return err
+	}
+	if disablePurge {
+		return errors.Errorf("cannot purge snapshots while %v setting is true", types.SettingNameDisableSnapshotPurge)
+	}
+
 	if err := m.checkVolumeNotInMigration(volumeName); err != nil {
 		return err
 	}
 
-	engineCliClient, err := m.GetEngineBinaryClient(volumeName)
+	engineCliClient, err := engineapi.GetEngineBinaryClient(m.ds, volumeName, m.currentNodeID)
 	if err != nil {
 		return err
 	}
@@ -234,11 +248,11 @@ func (m *VolumeManager) PurgeSnapshot(volumeName string) error {
 		return err
 	}
 
-	logrus.Debugf("Started snapshot purge for volume %v", volumeName)
+	logrus.Infof("Started snapshot purge for volume %v", volumeName)
 	return nil
 }
 
-func (m *VolumeManager) BackupSnapshot(backupName, volumeName, snapshotName string, labels map[string]string) error {
+func (m *VolumeManager) BackupSnapshot(backupName, volumeName, snapshotName string, labels map[string]string, backupMode string) error {
 	if volumeName == "" || snapshotName == "" {
 		return fmt.Errorf("volume and snapshot name required")
 	}
@@ -254,6 +268,7 @@ func (m *VolumeManager) BackupSnapshot(backupName, volumeName, snapshotName stri
 		Spec: longhorn.BackupSpec{
 			SnapshotName: snapshotName,
 			Labels:       labels,
+			BackupMode:   longhorn.BackupMode(backupMode),
 		},
 	}
 	_, err := m.ds.CreateBackup(backupCR, volumeName)
@@ -269,44 +284,6 @@ func (m *VolumeManager) checkVolumeNotInMigration(volumeName string) error {
 		return fmt.Errorf("cannot operate during migration")
 	}
 	return nil
-}
-
-func (m *VolumeManager) GetEngineBinaryClient(volumeName string) (client *engineapi.EngineBinary, err error) {
-	var e *longhorn.Engine
-
-	defer func() {
-		err = errors.Wrapf(err, "cannot get client for volume %v", volumeName)
-	}()
-	es, err := m.ds.ListVolumeEngines(volumeName)
-	if err != nil {
-		return nil, err
-	}
-	if len(es) == 0 {
-		return nil, fmt.Errorf("cannot find engine")
-	}
-	if len(es) != 1 {
-		return nil, fmt.Errorf("more than one engine exists")
-	}
-	for _, e = range es {
-		break
-	}
-	if e.Status.CurrentState != longhorn.InstanceStateRunning {
-		return nil, fmt.Errorf("engine is not running")
-	}
-	if isReady, err := m.ds.CheckEngineImageReadiness(e.Status.CurrentImage, m.currentNodeID); !isReady {
-		if err != nil {
-			return nil, fmt.Errorf("cannot get engine client with image %v: %v", e.Status.CurrentImage, err)
-		}
-		return nil, fmt.Errorf("cannot get engine client with image %v because it isn't deployed on this node", e.Status.CurrentImage)
-	}
-
-	engineCollection := &engineapi.EngineCollection{}
-	return engineCollection.NewEngineClient(&engineapi.EngineClientRequest{
-		VolumeName:  e.Spec.VolumeName,
-		EngineImage: e.Status.CurrentImage,
-		IP:          e.Status.IP,
-		Port:        e.Status.Port,
-	})
 }
 
 func (m *VolumeManager) GetRunningEngineByVolume(name string) (e *longhorn.Engine, err error) {
@@ -334,7 +311,7 @@ func (m *VolumeManager) GetRunningEngineByVolume(name string) (e *longhorn.Engin
 		return nil, errors.Errorf("engine is not running")
 	}
 
-	if isReady, err := m.ds.CheckEngineImageReadiness(e.Status.CurrentImage, m.currentNodeID); !isReady {
+	if isReady, err := m.ds.CheckDataEngineImageReadiness(e.Status.CurrentImage, e.Spec.DataEngine, m.currentNodeID); !isReady {
 		if err != nil {
 			return nil, errors.Errorf("cannot get engine with image %v: %v", e.Status.CurrentImage, err)
 		}
@@ -349,7 +326,7 @@ func (m *VolumeManager) ListBackupTargetsSorted() ([]*longhorn.BackupTarget, err
 	if err != nil {
 		return []*longhorn.BackupTarget{}, err
 	}
-	backupTargetNames, err := sortKeys(backupTargetMap)
+	backupTargetNames, err := util.SortKeys(backupTargetMap)
 	if err != nil {
 		return []*longhorn.BackupTarget{}, err
 	}
@@ -358,6 +335,19 @@ func (m *VolumeManager) ListBackupTargetsSorted() ([]*longhorn.BackupTarget, err
 		backupTargets[i] = backupTargetMap[backupTargetName]
 	}
 	return backupTargets, nil
+}
+
+func (m *VolumeManager) GetBackupTarget(backupTargetName string) (*longhorn.BackupTarget, error) {
+	return m.ds.GetBackupTarget(backupTargetName)
+}
+
+func (m *VolumeManager) SyncBackupTarget(backupTarget *longhorn.BackupTarget) (*longhorn.BackupTarget, error) {
+	now := metav1.Time{Time: time.Now().UTC()}
+	if now.Sub(backupTarget.Spec.SyncRequestedAt.Time).Seconds() < minSyncBackupTargetIntervalSec {
+		return nil, errors.Errorf("cannot synchronize backup target '%v' in %v seconds", backupTarget.Name, minSyncBackupTargetIntervalSec)
+	}
+	backupTarget.Spec.SyncRequestedAt = metav1.Time{Time: time.Now().UTC()}
+	return m.ds.UpdateBackupTarget(backupTarget)
 }
 
 func (m *VolumeManager) ListBackupVolumes() (map[string]*longhorn.BackupVolume, error) {
@@ -369,7 +359,7 @@ func (m *VolumeManager) ListBackupVolumesSorted() ([]*longhorn.BackupVolume, err
 	if err != nil {
 		return []*longhorn.BackupVolume{}, err
 	}
-	backupVolumeNames, err := sortKeys(backupVolumeMap)
+	backupVolumeNames, err := util.SortKeys(backupVolumeMap)
 	if err != nil {
 		return []*longhorn.BackupVolume{}, err
 	}
@@ -395,6 +385,15 @@ func (m *VolumeManager) GetBackupVolume(volumeName string) (*longhorn.BackupVolu
 	return backupVolume, err
 }
 
+func (m *VolumeManager) SyncBackupVolume(backupVolume *longhorn.BackupVolume) (*longhorn.BackupVolume, error) {
+	now := metav1.Time{Time: time.Now().UTC()}
+	if now.Sub(backupVolume.Spec.SyncRequestedAt.Time).Seconds() < minSyncBackupTargetIntervalSec {
+		return nil, errors.Errorf("failed to synchronize backup volume '%v' in %v seconds", backupVolume.Name, minSyncBackupTargetIntervalSec)
+	}
+	backupVolume.Spec.SyncRequestedAt = metav1.Time{Time: time.Now().UTC()}
+	return m.ds.UpdateBackupVolume(backupVolume)
+}
+
 func (m *VolumeManager) DeleteBackupVolume(volumeName string) error {
 	return m.ds.DeleteBackupVolume(volumeName)
 }
@@ -404,7 +403,7 @@ func (m *VolumeManager) ListAllBackupsSorted() ([]*longhorn.Backup, error) {
 	if err != nil {
 		return []*longhorn.Backup{}, err
 	}
-	backupNames, err := sortKeys(backupMap)
+	backupNames, err := util.SortKeys(backupMap)
 	if err != nil {
 		return []*longhorn.Backup{}, err
 	}
@@ -424,7 +423,7 @@ func (m *VolumeManager) ListBackupsForVolumeSorted(volumeName string) ([]*longho
 	if err != nil {
 		return []*longhorn.Backup{}, err
 	}
-	backupNames, err := sortKeys(backupMap)
+	backupNames, err := util.SortKeys(backupMap)
 	if err != nil {
 		return []*longhorn.Backup{}, err
 	}

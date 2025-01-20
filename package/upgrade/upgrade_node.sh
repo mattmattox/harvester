@@ -1,20 +1,44 @@
 #!/bin/bash -ex
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-ELEMENTAL_DIR="elemental_cli"
 
 source $SCRIPT_DIR/lib.sh
 UPGRADE_TMP_DIR=$HOST_DIR/usr/local/upgrade_tmp
+STATE_DIR=$HOST_DIR/run/initramfs/cos-state
+MAX_PODS=200
+
+cleanup_incomplete_state_file() {
+  STATE_FILE=${STATE_DIR}/state.yaml
+
+  INCOMPLETE_STATE_FILE=0
+  if [[ ! -f $STATE_FILE ]]; then
+      INCOMPLETE_STATE_FILE=0
+  else
+    found=$(yq '.state| has("label")' ${STATE_FILE})
+    if [[ $found == "false" ]]; then
+        INCOMPLETE_STATE_FILE=1
+    fi
+  fi
+
+  if [[ $INCOMPLETE_STATE_FILE == 1 ]]; then
+    echo "Start to remove the incomplete state.yaml"
+    mount -o rw,remount ${STATE_DIR}
+    cp ${STATE_FILE} ${STATE_FILE}.bak
+    rm -f ${STATE_FILE}
+    mount -o ro,remount ${STATE_DIR}
+  fi
+}
+
+is_mounted()
+{
+  mount | awk -v DIR="$1" '{ if ($3 == DIR) { exit 0 } } ENDFILE { exit 1 }'
+}
 
 clean_up_tmp_files()
 {
-  if [ -n "$tmp_rootfs_mount" ]; then
+  if [ -n "$tmp_rootfs_mount" ] && is_mounted "$tmp_rootfs_mount"; then
     echo "Try to unmount $tmp_rootfs_mount..."
     umount $tmp_rootfs_mount || echo "Umount $tmp_rootfs_mount failed with return code: $?"
-  fi
-  if [ -n "$target_elemental_cli" ]; then
-    echo "Try to unmount $target_elemental_cli..."
-    umount $target_elemental_cli || echo "Umount $target_elemental_cli failed with return code: $?"
   fi
   echo "Clean up tmp files..."
   if [ -n "$NEW_OS_SQUASHFS_IMAGE_FILE" ]; then
@@ -101,14 +125,24 @@ preload_images()
   download_image_archives_from_repo "agent" $HOST_DIR/var/lib/rancher/agent/images
 }
 
+# return the running VM count
+# if `kubectl get vmi` failed, then return "failed to get" for troubleshooting
 get_running_vm_count()
 {
-  local count
+  local vmioutput=/tmp/vmioutput.yaml
+  rm -f "$vmioutput"
+  local EXIT_CODE=0
 
-  count=$(kubectl get vmi -A -l kubevirt.io/nodeName=$HARVESTER_UPGRADE_NODE_NAME -ojson | jq '.items | length' || true)
-  echo $count
+  kubectl get vmi -A -l kubevirt.io/nodeName=$HARVESTER_UPGRADE_NODE_NAME -o yaml > "$vmioutput" || EXIT_CODE=$?
+
+  if [[ "$EXIT_CODE" -eq 0 ]]; then
+    local count=$(yq e '.items |  map(select(.status.phase!="Succeeded")) | length' "$vmioutput")
+    echo "$count"
+  else
+    echo "failed to get"
+  fi
+  rm -f "$vmioutput"
 }
-
 
 wait_vms_out()
 {
@@ -116,18 +150,17 @@ wait_vms_out()
 
   until [ "$vm_count" = "0" ]
   do
-    echo "Waiting for VM live-migration or shutdown...($vm_count left)"
+    echo "Waiting for VM shutdown...(count: $vm_count)"
     sleep 5
     vm_count="$(get_running_vm_count)"
   done
+  echo "all VMs are down"
 }
 
 wait_vms_out_or_shutdown()
 {
   local vm_count
-  local max_retries=240
 
-  retries=0
   while [ true ]; do
     vm_count="$(get_running_vm_count)"
 
@@ -135,15 +168,10 @@ wait_vms_out_or_shutdown()
       break
     fi
 
-    if [ "$retries" = "$max_retries" ]; then
-      echo "WARNING: fail to live-migrate $vm_count VM(s). Shutting down them..."
-      shutdown_vms_on_node
-    fi
-
-    echo "Waiting for VM live-migration or shutdown...($vm_count left)"
+    echo "Waiting for VM live-migration or shutdown...(count: $vm_count)"
     sleep 5
-    retries=$((retries+1))
   done
+  echo "all VMs on node $HARVESTER_UPGRADE_NODE_NAME have been live-migrated or shutdown"
 }
 
 shutdown_repo_vm()
@@ -171,60 +199,6 @@ shutdown_vms_on_node()
     done
 }
 
-
-shutdown_non_migrate_able_vms()
-{
-  # VMs with nodeSelector
-  kubectl get vmi -A -l kubevirt.io/nodeName=$HARVESTER_UPGRADE_NODE_NAME -o json |
-    jq -r '.items[] | select(.spec.nodeSelector != null) | [.metadata.name, .metadata.namespace] | @tsv' |
-    while IFS=$'\t' read -r name namespace; do
-      if [ -z "$name" ]; then
-        break
-      fi
-      echo "Stop ${namespace}/${name}"
-      virtctl stop $name -n $namespace
-    done
-
-  # VMs with nodeAffinity
-  # Skip only when the VMs have other places to go
-  local node_labels=""
-  local node_count=0
-  kubectl get vmi -A -l kubevirt.io/nodeName=$HARVESTER_UPGRADE_NODE_NAME -o json |
-    jq -r '.items[] | select(.spec.affinity.nodeAffinity != null) | [.metadata.name, .metadata.namespace] | @tsv' |
-    while IFS=$'\t' read -r name namespace; do
-      if [ -z "$name" ]; then
-        break
-      fi
-      node_labels=$(kubectl -n "$namespace" get vmi "$name" -o yaml |
-        yq '.spec.affinity.nodeAffinity.*.nodeSelectorTerms[].matchExpressions[] | select(.operator=="In" and .values[] == "true") | .key')
-      for nl in $node_labels; do
-        # For nodes considered "candidates" for the VM to live-migrate to, they should
-        # 1. match the same labels as nodeAffinity described
-        # 2. not be the node that the VM currently runs on
-        # 3. be schedulable at the time
-        node_count=$(kubectl get nodes -o yaml |
-                nl="$nl" n="$HARVESTER_UPGRADE_NODE_NAME" yq '.items[] | select(.metadata.labels.[env(nl)] == "true" and .metadata.name != env(n) and .spec.unschedulable == null) | .metadata.name' | wc -l)
-
-        if [ "$node_count" -gt 0 ]; then
-          # If such nodes exist, continue to check for the next label
-          echo "$namespace/$name still has $node_count place(s) to go for label $nl"
-          continue
-        else
-          # If there is no candidates for any of the labels, just break the loop and shut the VM down
-          echo "$namespace/$name has no other places to go for label $nl"
-          break
-        fi
-      done
-
-      if [ $node_count -gt 0 ]; then
-        echo "$namespace/$name is considered live-migratable"
-      else
-        echo "$namespace/$name is non-migratable, shutdown immediately"
-        virtctl stop "$name" -n "$namespace"
-      fi
-    done
-}
-
 command_prepare()
 {
   wait_repo
@@ -242,6 +216,10 @@ wait_evacuation_pdb_gone()
     echo "Waiting for evacuation PDB gone..."
     sleep 5
   done
+}
+
+recover_rancher_system_agent() {
+  chroot "$HOST_DIR" /bin/bash -c "rm -rf /run/systemd/system/rancher-system-agent.service.d && systemctl daemon-reload && systemctl restart rancher-system-agent.service"
 }
 
 wait_longhorn_engines() {
@@ -370,9 +348,12 @@ EOF
 }
 
 command_pre_drain() {
+  recover_rancher_system_agent
+
   wait_longhorn_engines
 
-  shutdown_non_migrate_able_vms
+  # Shut down non-live migratable VMs
+  upgrade-helper vm-live-migrate-detector "$HARVESTER_UPGRADE_NODE_NAME" --shutdown
 
   # Live migrate VMs
   kubectl taint node $HARVESTER_UPGRADE_NODE_NAME --overwrite kubevirt.io/drain=draining:NoSchedule
@@ -387,6 +368,7 @@ command_pre_drain() {
   patch_logging_event_audit
 
   remove_rke2_canal_config
+  disable_rke2_charts
 }
 
 get_node_rke2_version() {
@@ -428,8 +410,22 @@ remove_rke2_canal_config() {
   rm -f "$HOST_DIR/var/lib/rancher/rke2/server/manifests/rke2-canal-config.yaml"
 }
 
+# Disable snapshot-controller related charts because we manage them in Harvester.
+# RKE2 enables these charts by default after v1.25.7 (https://github.com/rancher/rke2/releases/tag/v1.25.7%2Brke2r1)
+disable_rke2_charts() {
+  cat > "$HOST_DIR/etc/rancher/rke2/config.yaml.d/40-disable-charts.yaml" <<EOF
+disable:
+- rke2-snapshot-controller
+- rke2-snapshot-controller-crd
+- rke2-snapshot-validation-webhook
+EOF
+}
+
 convert_nodenetwork_to_vlanconfig() {
-  detect_upgrade
+  # sometimes (e.g. apiserver is busy/not ready), the kubectl may fail, use the saved value
+  if [ -z "$UPGRADE_PREVIOUS_VERSION" ]; then
+    detect_upgrade
+  fi
   detect_node_current_harvester_version
   echo "The UPGRADE_PREVIOUS_VERSION is $UPGRADE_PREVIOUS_VERSION, NODE_CURRENT_HARVESTER_VERSION is $NODE_CURRENT_HARVESTER_VERSION, will check nodenetwork upgrade node option"
 
@@ -491,6 +487,84 @@ spec:
 EOF
 }
 
+# host / is mounted under /host in the upgrade pod
+set_max_pods() {
+cat > /host/etc/rancher/rke2/config.yaml.d/99-max-pods.yaml <<EOF
+kubelet-arg:
+- "max-pods=$MAX_PODS"
+EOF
+}
+
+# system-reserved/kube-reserved is required if we want to set cpu-manager-policy to static
+set_reserved_resource() {
+  local cores=$(chroot $HOST_DIR nproc)
+  local reservedCPU=$(calculateCPUReservedInMilliCPU $cores $MAX_PODS)
+  # make system:kube cpu reservation ration 2:3
+  local systemReservedCPU=$((reservedCPU * 2 * 2 / 5))
+  local kubeReservedCPU=$((reservedCPU * 2 * 3 / 5))
+  local systemReserverConfig="$HOST_DIR/etc/rancher/rke2/config.yaml.d/99-z00-harvester-reserved-resources.yaml"
+  if [ ! -e $systemReserverConfig ]; then
+    cat > $systemReserverConfig << EOF
+kubelet-arg+:
+- "system-reserved=cpu=${systemReservedCPU}m"
+- "kube-reserved=cpu=${kubeReservedCPU}m"
+EOF
+  fi
+}
+
+# Delete the cpu_manager_state file during the initramfs stage. During a reboot, this state file is always reverted
+# because it was originally created during the system installation, becoming part of the root filesystem. As a result,
+# the policy in cpu_manager_state file is "none" (default policy) after reboot. If we've already set the cpu-manager-policy
+# to "static" before reboot, this mismatch can prevent kubelet from starting, and make the entire node unavailable.
+set_oem_cleanup_kubelet() {
+  cat > $HOST_DIR/oem/91_cleanup_kubelet.yaml << EOF
+name: Cleanup Kubelet
+stages:
+    initramfs:
+        - commands:
+            - rm -f /var/lib/kubelet/cpu_manager_state
+EOF
+}
+
+calculateCPUReservedInMilliCPU() {
+  local cores=$1
+  local maxPods=$2
+
+  # This shouldn't happen
+  if (( $cores <= 0 || $maxPods <= 0 )); then
+    echo 0
+    return
+  fi
+
+  local reserved=0
+
+  # 6% of the first core (60 milliCPU)
+  reserved=$(( $reserved + 6 * 1000 / 100 ))
+
+  # 1% of the next core (up to 2 cores) (10 milliCPU)
+  if (( cores > 1 )); then
+    reserved=$(( $reserved + 1 * 1000 / 100 ))
+  fi
+
+  # 0.5% of the next 2 cores (up to 4 cores) (5 milliCPU)
+  if (( cores > 2 )); then
+    reserved=$(( $reserved + 2 * 500 / 100 ))
+  fi
+
+  # 0.25% of any cores above 4 cores (2.5 milliCPU per core)
+  if (( cores > 4 )); then
+    reserved=$(( $reserved + (cores - 4) * 250 / 100 ))
+  fi
+
+  # If the maximum number of Pods per node is beyond the default of 110,
+  # reserve an extra 400 mCPU in addition to the preceding reservations.
+  if (( maxPods > 110 )); then
+    reserved=$(( $reserved + 400 ))
+  fi
+
+  echo $reserved
+}
+
 upgrade_os() {
   # The trap will be only effective from this point to the end of the execution
   trap clean_up_tmp_files EXIT
@@ -513,13 +587,24 @@ upgrade_os() {
   tmp_rootfs_mount=$(mktemp -d -p $HOST_DIR/tmp)
   mount $tmp_rootfs_squashfs $tmp_rootfs_mount
 
-  # replace the fixed elemental CLI for fix elemental upgrade issues
-  new_elemental_cli=$SCRIPT_DIR/$ELEMENTAL_DIR/elemental
-  target_elemental_cli=$HOST_DIR/usr/bin/elemental
+  tmp_elemental_config_dir=$(mktemp -d -p $HOST_DIR/tmp)
+  # adjust new active.img size
+  cat > $tmp_elemental_config_dir/config.yaml <<EOF
+upgrade:
+  system:
+    size: 3072
+EOF
+
+  # we would like to clean up the incomplete state.yaml to avoid the issue of https://github.com/harvester/harvester/issues/4526
+  cleanup_incomplete_state_file
+
   elemental_upgrade_log="${UPGRADE_TMP_DIR#"$HOST_DIR"}/elemental-upgrade-$(date +%Y%m%d%H%M%S).log"
   local ret=0
-  mount --bind $new_elemental_cli $target_elemental_cli
-  chroot $HOST_DIR elemental upgrade --logfile "$elemental_upgrade_log" --directory ${tmp_rootfs_mount#"$HOST_DIR"} || ret=$?
+  chroot $HOST_DIR elemental upgrade \
+    --logfile "$elemental_upgrade_log" \
+    --directory ${tmp_rootfs_mount#"$HOST_DIR"} \
+    --config-dir ${tmp_elemental_config_dir#"$HOST_DIR"} \
+    --debug || ret=$?
   if [ "$ret" != 0 ]; then
     echo "elemental upgrade failed with return code: $ret"
     cat "$HOST_DIR$elemental_upgrade_log"
@@ -530,11 +615,30 @@ upgrade_os() {
   # stuck on the grub file search for about 30 minutes, this can be
   # mitigated by adding the `grubenv` file.
   #
-  # PATCH: add /oem/grubenv if it does not exist on upgrade_path
+  # We need to patch grubenv, grubcustom
+
+  # PATCH1: add /oem/grubenv if it does not exist
+  # grubenv use load_env to load, so we use grub2-editenv
   GRUBENV_FILE="/oem/grubenv"
   chroot $HOST_DIR /bin/bash -c "if ! [ -f ${GRUBENV_FILE} ]; then grub2-editenv ${GRUBENV_FILE} create; fi"
 
-  umount $target_elemental_cli
+  # PATCH2: add /oem/grubcustom if it does not exist
+  # grubcustom use source to load, so we can use touch directly
+  GRUBENV_FILE="/oem/grubcustom"
+  chroot $HOST_DIR /bin/bash -c "if ! [ -f ${GRUBENV_FILE} ]; then touch ${GRUBENV_FILE}; fi" 
+
+  multiPathEnabled=$(yq '.os.externalStorageConfig.enabled // false' ${HOST_DIR}/oem/harvester.config)
+  if [ ${multiPathEnabled} == false ]
+  then
+    thirdPartyArgs=$(chroot $HOST_DIR grub2-editenv /oem/grubenv list |grep third_party_kernel_args | awk -F"third_party_kernel_args=" '{print $2}')
+    if [[ ${thirdPartyArgs} != *"multipath=off"* ]]
+    then
+      thirdPartyArgs="${thirdPartyArgs} multipath=off"
+      thirdPartyArgs=$(echo ${thirdPartyArgs} | xargs)
+      chroot $HOST_DIR grub2-editenv /oem/grubenv set third_party_kernel_args="${thirdPartyArgs}"
+    fi
+  fi
+
   umount $tmp_rootfs_mount
   rm -rf $tmp_rootfs_squashfs
 
@@ -555,6 +659,10 @@ command_post_drain() {
   wait_repo
   detect_repo
 
+  # update max-pods to 200
+  set_max_pods
+  set_reserved_resource
+  set_oem_cleanup_kubelet
   # A post-drain signal from Rancher doesn't mean RKE2 agent/server is already patched and restarted
   # Let's wait until the RKE2 settled.
   wait_rke2_upgrade
@@ -570,10 +678,13 @@ command_post_drain() {
 command_single_node_upgrade() {
   echo "Upgrade single node"
 
+  recover_rancher_system_agent
+
   wait_repo
   detect_repo
 
   remove_rke2_canal_config
+  disable_rke2_charts
 
   # Copy OS things, we need to shutdown repo VMs.
   NEW_OS_SQUASHFS_IMAGE_FILE=$(mktemp -p $UPGRADE_TMP_DIR)
@@ -586,8 +697,17 @@ command_single_node_upgrade() {
   # Add logging related kube-audit policy file
   patch_logging_event_audit
 
+  echo "wait for fleet bundles before upgrading RKE2"
+  # wait all fleet bundles in limited time
+  wait_for_fleet_bundles
+
+  # update max-pods to 200
+  set_max_pods
+  set_reserved_resource
+  set_oem_cleanup_kubelet
   # Upgarde RKE2
   upgrade_rke2
+
   wait_rke2_upgrade
   clean_rke2_archives
 

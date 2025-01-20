@@ -29,6 +29,12 @@ const BACKUP_LOCK LockType = 1
 const RESTORE_LOCK LockType = 1
 const DELETION_LOCK LockType = 2
 
+type Operation string
+
+const BackupOperationCreateRestore Operation = "create/restore"
+const BackupOperationDelete Operation = "delete"
+const BackupOperationUndefined Operation = "undefined"
+
 type FileLock struct {
 	Name       string
 	Type       LockType
@@ -62,8 +68,8 @@ func (lock *FileLock) canAcquire() bool {
 	canAcquire := true
 	locks := getLocksForVolume(lock.volume, lock.driver)
 	file := getLockFilePath(lock.volume, lock.Name)
-	log.WithField("lock", lock).Debugf("trying to acquire lock %v", file)
-	log.Debugf("backupstore volume %v contains locks %v", lock.volume, locks)
+	log.WithField("lock", lock).Infof("Trying to acquire lock %v", file)
+	log.Infof("backupstore volume %v contains locks %v", lock.volume, locks)
 
 	for _, serverLock := range locks {
 		serverLockHasDifferentType := serverLock.Type != lock.Type
@@ -80,6 +86,14 @@ func (lock *FileLock) canAcquire() bool {
 func (lock *FileLock) Lock() error {
 	lock.mutex.Lock()
 	defer lock.mutex.Unlock()
+
+	operation := BackupOperationUndefined
+	if lock.Type == BACKUP_LOCK || lock.Type == RESTORE_LOCK {
+		operation = BackupOperationCreateRestore
+	} else if lock.Type == DELETION_LOCK {
+		operation = BackupOperationDelete
+	}
+
 	if lock.Acquired {
 		atomic.AddInt32(&lock.count, 1)
 		_ = saveLock(lock)
@@ -107,16 +121,16 @@ func (lock *FileLock) Lock() error {
 	if !lock.canAcquire() {
 		file := getLockFilePath(lock.volume, lock.Name)
 		_ = removeLock(lock)
-		return fmt.Errorf("failed lock %v type %v acquisition", file, lock.Type)
+		return fmt.Errorf("failed to acquire lock %v when performing backup %v, please try again later.", file, operation)
 	}
 
 	file := getLockFilePath(lock.volume, lock.Name)
-	log.Debugf("Acquired lock %v type %v on backupstore", file, lock.Type)
+	log.Infof("Acquired lock %v for backup %v on backupstore", file, operation)
 	lock.Acquired = true
 	atomic.AddInt32(&lock.count, 1)
 	if err := saveLock(lock); err != nil {
 		_ = removeLock(lock)
-		return errors.Wrapf(err, "failed to store updated lock %v type %v after acquisition", file, lock.Type)
+		return errors.Wrapf(err, "failed to store updated lock %v when performing backup %v, please try again later", file, operation)
 	}
 
 	// enable lock refresh
@@ -133,7 +147,7 @@ func (lock *FileLock) Lock() error {
 				if lock.Acquired {
 					if err := saveLock(lock); err != nil {
 						// nothing we can do here, that's why the lock acquisition time is 2x lock refresh interval
-						log.Debugf("Failed to refresh acquired lock %v type %v", file, lock.Type)
+						log.WithError(err).Warnf("Failed to refresh acquired lock %v when performing backup %v, please try again later", file, operation)
 					}
 				}
 				lock.mutex.Unlock()
@@ -164,11 +178,11 @@ func (lock *FileLock) Unlock() error {
 func loadLock(volumeName string, name string, driver BackupStoreDriver) (*FileLock, error) {
 	lock := &FileLock{}
 	file := getLockFilePath(volumeName, name)
-	if err := loadConfigInBackupStore(file, driver, lock); err != nil {
+	if err := LoadConfigInBackupStore(driver, file, lock); err != nil {
 		return nil, err
 	}
 	lock.serverTime = driver.FileTime(file)
-	log.Debugf("Loaded lock %v type %v on backupstore", file, lock.Type)
+	log.Infof("Loaded lock %v type %v on backupstore", file, lock.Type)
 	return lock, nil
 }
 
@@ -177,17 +191,17 @@ func removeLock(lock *FileLock) error {
 	if err := lock.driver.Remove(file); err != nil {
 		return err
 	}
-	log.Debugf("Removed lock %v type %v on backupstore", file, lock.Type)
+	log.Infof("Removed lock %v type %v on backupstore", file, lock.Type)
 	return nil
 }
 
 func saveLock(lock *FileLock) error {
 	file := getLockFilePath(lock.volume, lock.Name)
-	if err := saveConfigInBackupStore(file, lock.driver, lock); err != nil {
+	if err := SaveConfigInBackupStore(lock.driver, file, lock); err != nil {
 		return err
 	}
 	lock.serverTime = lock.driver.FileTime(file)
-	log.Debugf("Stored lock %v type %v on backupstore", file, lock.Type)
+	log.Infof("Stored lock %v type %v on backupstore", file, lock.Type)
 	return nil
 }
 
@@ -226,7 +240,7 @@ func getLocksForVolume(volumeName string, driver BackupStoreDriver) []*FileLock 
 		lock, err := loadLock(volumeName, name, driver)
 		if err != nil {
 			file := getLockFilePath(volumeName, name)
-			log.Warnf("failed to load lock %v on backupstore reason %v", file, err)
+			log.WithError(err).Warnf("Failed to load lock %v on backupstore", file)
 			continue
 		}
 		locks = append(locks, lock)

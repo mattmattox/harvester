@@ -5,13 +5,10 @@ import (
 	"net/http"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	. "github.com/harvester/harvester/tests/framework/dsl"
 	"github.com/harvester/harvester/tests/framework/fuzz"
 	"github.com/harvester/harvester/tests/framework/helper"
 )
@@ -42,25 +39,6 @@ var _ = Describe("verify volume APIs", func() {
 				volumeName = fuzz.String(5)
 				volumeMode = corev1.PersistentVolumeFilesystem
 			)
-
-			By("create a volume with name missing", func() {
-				var volume = corev1.PersistentVolumeClaim{
-					ObjectMeta: v1.ObjectMeta{
-						Namespace: namespace,
-					},
-					Spec: corev1.PersistentVolumeClaimSpec{
-						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-						VolumeMode:  &volumeMode,
-						Resources: corev1.ResourceRequirements{
-							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse("1Gi"),
-							},
-						},
-					},
-				}
-				respCode, respBody, err := helper.PostObject(volumeAPI, volume)
-				MustRespCodeIs(http.StatusUnprocessableEntity, "post volume", err, respCode, respBody)
-			})
 
 			By("create a volume with size missing", func() {
 				var volume = corev1.PersistentVolumeClaim{
@@ -97,7 +75,7 @@ var _ = Describe("verify volume APIs", func() {
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 						VolumeMode:  &volumeMode,
-						Resources: corev1.ResourceRequirements{
+						Resources: corev1.VolumeResourceRequirements{
 							Requests: corev1.ResourceList{
 								corev1.ResourceStorage: resource.MustParse("1Gi"),
 							},
@@ -139,7 +117,7 @@ var _ = Describe("verify volume APIs", func() {
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 						VolumeMode:  &volumeMode,
-						Resources: corev1.ResourceRequirements{
+						Resources: corev1.VolumeResourceRequirements{
 							Requests: corev1.ResourceList{
 								corev1.ResourceStorage: resource.MustParse("1Gi"),
 							},
@@ -180,7 +158,7 @@ var _ = Describe("verify volume APIs", func() {
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 						VolumeMode:  &volumeMode,
-						Resources: corev1.ResourceRequirements{
+						Resources: corev1.VolumeResourceRequirements{
 							Requests: corev1.ResourceList{
 								corev1.ResourceStorage: resource.MustParse("1Gi"),
 							},

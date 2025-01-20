@@ -8,7 +8,7 @@ import (
 
 	"github.com/rancher/apiserver/pkg/apierror"
 	"github.com/rancher/apiserver/pkg/types"
-	"github.com/rancher/wrangler/pkg/schemas/validation"
+	"github.com/rancher/wrangler/v3/pkg/schemas/validation"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
@@ -16,7 +16,7 @@ import (
 	"github.com/harvester/harvester/pkg/util"
 )
 
-func Formatter(request *types.APIRequest, resource *types.RawResource) {
+func Formatter(_ *types.APIRequest, resource *types.RawResource) {
 	resource.Actions = nil
 	delete(resource.Links, "update")
 }

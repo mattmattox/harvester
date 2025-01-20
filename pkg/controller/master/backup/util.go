@@ -3,17 +3,17 @@ package backup
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"time"
 
-	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
-	wranglername "github.com/rancher/wrangler/pkg/name"
+	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
+	wranglername "github.com/rancher/wrangler/v3/pkg/name"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
-	"github.com/harvester/harvester/pkg/settings"
 )
 
 const (
@@ -35,10 +35,6 @@ func isBackupMissingStatus(backup *harvesterv1.VirtualMachineBackup) bool {
 	return backup.Status == nil || backup.Status.SourceSpec == nil || backup.Status.VolumeBackups == nil
 }
 
-func IsBackupTargetSame(vmBackupTarget *harvesterv1.BackupTarget, target *settings.BackupTarget) bool {
-	return vmBackupTarget.Endpoint == target.Endpoint && vmBackupTarget.BucketName == target.BucketName && vmBackupTarget.BucketRegion == target.BucketRegion
-}
-
 func isBackupTargetOnAnnotation(backup *harvesterv1.VirtualMachineBackup) bool {
 	return backup.Annotations != nil &&
 		(backup.Annotations[backupTargetAnnotation] != "" ||
@@ -52,10 +48,10 @@ func isVMRestoreProgressing(vmRestore *harvesterv1.VirtualMachineRestore) bool {
 
 func isVMRestoreMissingVolumes(vmRestore *harvesterv1.VirtualMachineRestore) bool {
 	return len(vmRestore.Status.VolumeRestores) == 0 ||
-		(!isNewVMOrHasRetainPolicy(vmRestore) && len(vmRestore.Status.DeletedVolumes) == 0)
+		(!IsNewVMOrHasRetainPolicy(vmRestore) && len(vmRestore.Status.DeletedVolumes) == 0)
 }
 
-func isNewVMOrHasRetainPolicy(vmRestore *harvesterv1.VirtualMachineRestore) bool {
+func IsNewVMOrHasRetainPolicy(vmRestore *harvesterv1.VirtualMachineRestore) bool {
 	return vmRestore.Spec.NewVM || vmRestore.Spec.DeletionPolicy == harvesterv1.VirtualMachineRestoreRetain
 }
 
@@ -225,6 +221,6 @@ func getSecretRefName(vmName string, secretName string) string {
 	return fmt.Sprintf("vm-%s-%s-ref", vmName, wranglername.Hex(secretName, 8))
 }
 
-func getVMBackupMetadataFileName(vmBackupNamespace, vmBackupName string) string {
-	return fmt.Sprintf("%s-%s.cfg", vmBackupNamespace, vmBackupName)
+func getVMBackupMetadataFilePath(vmBackupNamespace, vmBackupName string) string {
+	return filepath.Join(vmBackupMetadataFolderPath, vmBackupNamespace, fmt.Sprintf("%s.cfg", vmBackupName))
 }

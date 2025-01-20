@@ -8,21 +8,23 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
-	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
-)
+	etypes "github.com/longhorn/longhorn-engine/pkg/types"
 
-const (
-	VolumeHeadName = "volume-head"
+	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 )
 
 // SnapshotCreate calls engine binary
 // TODO: Deprecated, replaced by gRPC proxy
-func (e *EngineBinary) SnapshotCreate(engine *longhorn.Engine, name string, labels map[string]string) (string, error) {
+func (e *EngineBinary) SnapshotCreate(engine *longhorn.Engine, name string, labels map[string]string,
+	freezeFilesystem bool) (string, error) {
 	args := []string{"snapshot", "create"}
 	for k, v := range labels {
 		args = append(args, "--label", k+"="+v)
 	}
 	args = append(args, name)
+
+	// Ignore freezeFilesystem argument. v1.7.0 engines understand the corresponding freeze-fs CLI flag, but older
+	// engines do not.
 
 	output, err := e.ExecuteEngineBinary(args...)
 	if err != nil {
@@ -58,8 +60,8 @@ func (e *EngineBinary) SnapshotGet(engine *longhorn.Engine, name string) (*longh
 // SnapshotDelete calls engine binary
 // TODO: Deprecated, replaced by gRPC proxy
 func (e *EngineBinary) SnapshotDelete(engine *longhorn.Engine, name string) error {
-	if name == VolumeHeadName {
-		return fmt.Errorf("invalid operation: cannot remove %v", VolumeHeadName)
+	if name == etypes.VolumeHeadName {
+		return fmt.Errorf("invalid operation: cannot remove %v", etypes.VolumeHeadName)
 	}
 	if _, err := e.ExecuteEngineBinary("snapshot", "rm", name); err != nil {
 		return errors.Wrapf(err, "error deleting snapshot '%s'", name)
@@ -70,8 +72,8 @@ func (e *EngineBinary) SnapshotDelete(engine *longhorn.Engine, name string) erro
 // SnapshotRevert calls engine binary
 // TODO: Deprecated, replaced by gRPC proxy
 func (e *EngineBinary) SnapshotRevert(engine *longhorn.Engine, name string) error {
-	if name == VolumeHeadName {
-		return fmt.Errorf("invalid operation: cannot revert to %v", VolumeHeadName)
+	if name == etypes.VolumeHeadName {
+		return fmt.Errorf("invalid operation: cannot revert to %v", etypes.VolumeHeadName)
 	}
 	if _, err := e.ExecuteEngineBinary("snapshot", "revert", name); err != nil {
 		return errors.Wrapf(err, "error reverting to snapshot '%s'", name)
@@ -85,7 +87,7 @@ func (e *EngineBinary) SnapshotPurge(*longhorn.Engine) error {
 	if _, err := e.ExecuteEngineBinaryWithoutTimeout([]string{}, "snapshot", "purge", "--skip-if-in-progress"); err != nil {
 		return errors.Wrapf(err, "error starting snapshot purge")
 	}
-	logrus.Debugf("Volume %v snapshot purge started", e.Name())
+	logrus.Infof("Volume %v snapshot purge started", e.Name())
 	return nil
 }
 
@@ -107,12 +109,23 @@ func (e *EngineBinary) SnapshotPurgeStatus(*longhorn.Engine) (map[string]*longho
 
 // SnapshotClone calls engine binary
 // TODO: Deprecated, replaced by gRPC proxy
-func (e *EngineBinary) SnapshotClone(engine *longhorn.Engine, snapshotName, fromControllerAddress string) error {
-	args := []string{"snapshot", "clone", "--snapshot-name", snapshotName, "--from-controller-address", fromControllerAddress}
+func (e *EngineBinary) SnapshotClone(engine *longhorn.Engine, snapshotName, fromEngineAddress, fromVolumeName,
+	fromEngineName string, fileSyncHTTPClientTimeout, grpcTimeoutSeconds int64) error {
+	args := []string{"snapshot", "clone", "--snapshot-name", snapshotName, "--from-controller-address",
+		fromEngineAddress}
+
+	version, err := e.VersionGet(engine, true)
+	if err != nil {
+		return err
+	}
+	if version.ClientVersion.CLIAPIVersion >= 9 {
+		args = append(args, "--from-controller-instance-name", fromEngineName)
+	}
+
 	if _, err := e.ExecuteEngineBinaryWithoutTimeout([]string{}, args...); err != nil {
 		return errors.Wrapf(err, "error starting snapshot clone")
 	}
-	logrus.Debugf("Cloned snapshot %v from volume %v to volume %v", snapshotName, fromControllerAddress, e.cURL)
+	logrus.Infof("Cloned snapshot %v from volume %v to volume %v", snapshotName, fromEngineAddress, e.cURL)
 	return nil
 }
 
@@ -129,4 +142,39 @@ func (e *EngineBinary) SnapshotCloneStatus(*longhorn.Engine) (map[string]*longho
 		return nil, err
 	}
 	return snapshotCloneStatusMap, nil
+}
+
+// SnapshotHash calls engine binary
+// TODO: Deprecated, replaced by gRPC proxy
+func (e *EngineBinary) SnapshotHash(engine *longhorn.Engine, snapshotName string, rehash bool) error {
+	args := []string{"snapshot", "hash"}
+
+	if rehash {
+		args = append(args, "--rehash")
+	}
+
+	args = append(args, snapshotName)
+
+	if _, err := e.ExecuteEngineBinaryWithoutTimeout([]string{}, args...); err != nil {
+		return errors.Wrapf(err, "error starting hashing snapshot")
+	}
+
+	logrus.Infof("Volume %v snapshot hashing started", e.Name())
+	return nil
+}
+
+// SnapshotHashStatus calls engine binary
+// TODO: Deprecated, replaced by gRPC proxy
+func (e *EngineBinary) SnapshotHashStatus(engine *longhorn.Engine, snapshotName string) (map[string]*longhorn.HashStatus, error) {
+	output, err := e.ExecuteEngineBinary("snapshot", "hash-status", "--snapshot-name", snapshotName)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error getting snapshot hashing status")
+	}
+
+	data := map[string]*longhorn.HashStatus{}
+	if err := json.Unmarshal([]byte(output), &data); err != nil {
+		return nil, errors.Wrapf(err, "error parsing snapshot hashing status")
+	}
+
+	return data, nil
 }

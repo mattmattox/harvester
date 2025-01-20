@@ -30,6 +30,7 @@ type LonghornV1beta2Interface interface {
 	BackingImageDataSourcesGetter
 	BackingImageManagersGetter
 	BackupsGetter
+	BackupBackingImagesGetter
 	BackupTargetsGetter
 	BackupVolumesGetter
 	EnginesGetter
@@ -42,7 +43,11 @@ type LonghornV1beta2Interface interface {
 	SettingsGetter
 	ShareManagersGetter
 	SnapshotsGetter
+	SupportBundlesGetter
+	SystemBackupsGetter
+	SystemRestoresGetter
 	VolumesGetter
+	VolumeAttachmentsGetter
 }
 
 // LonghornV1beta2Client is used to interact with features provided by the longhorn.io group.
@@ -64,6 +69,10 @@ func (c *LonghornV1beta2Client) BackingImageManagers(namespace string) BackingIm
 
 func (c *LonghornV1beta2Client) Backups(namespace string) BackupInterface {
 	return newBackups(c, namespace)
+}
+
+func (c *LonghornV1beta2Client) BackupBackingImages(namespace string) BackupBackingImageInterface {
+	return newBackupBackingImages(c, namespace)
 }
 
 func (c *LonghornV1beta2Client) BackupTargets(namespace string) BackupTargetInterface {
@@ -114,8 +123,24 @@ func (c *LonghornV1beta2Client) Snapshots(namespace string) SnapshotInterface {
 	return newSnapshots(c, namespace)
 }
 
+func (c *LonghornV1beta2Client) SupportBundles(namespace string) SupportBundleInterface {
+	return newSupportBundles(c, namespace)
+}
+
+func (c *LonghornV1beta2Client) SystemBackups(namespace string) SystemBackupInterface {
+	return newSystemBackups(c, namespace)
+}
+
+func (c *LonghornV1beta2Client) SystemRestores(namespace string) SystemRestoreInterface {
+	return newSystemRestores(c, namespace)
+}
+
 func (c *LonghornV1beta2Client) Volumes(namespace string) VolumeInterface {
 	return newVolumes(c, namespace)
+}
+
+func (c *LonghornV1beta2Client) VolumeAttachments(namespace string) VolumeAttachmentInterface {
+	return newVolumeAttachments(c, namespace)
 }
 
 // NewForConfig creates a new LonghornV1beta2Client for the given config.

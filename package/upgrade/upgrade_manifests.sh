@@ -51,7 +51,7 @@ wait_helm_release() {
   chart=$3
   app_version=$4
   status=$5
-
+  echo "wait helm release $namespace $release_name $chart $app_version $status"
   while [ true ]; do
     last_history=$(helm history $release_name -n $namespace -o yaml | yq e '.[-1]' -)
 
@@ -82,8 +82,318 @@ wait_rollout() {
   namespace=$1
   resource_type=$2
   name=$3
+  echo "wait rollout -n $namespace $resource_type $name"
 
   kubectl rollout status --watch=true -n $namespace $resource_type $name
+}
+
+wait_rollout_with_loop() {
+  local namespace=$1
+  local resource_type=$2
+  local name=$3
+  echo "wait rollout -n $namespace $resource_type $name"
+
+  # if resource is new and not created yet, need to wait, otherwise, it will return right now and no error returned
+  while [ true ]; do
+    local obj=$(kubectl get -n $namespace $resource_type $name)
+    if [ -z "$obj" ]; then
+      echo "resource was not created, continue"
+      sleep 2
+    else
+      break
+    fi
+  done
+
+  kubectl rollout status --watch=true -n $namespace $resource_type $name
+}
+
+wait_cluster_local_and_fleet() {
+  wait_new_fileds_in_cluster_fleet_crd
+  wait_new_fileds_in_fleet_controller_configmap
+  restore_fleet_controller_configmap
+  wait_cluster_local_is_imported
+  wait_fleet_agent_is_redeployed
+  wait_cluster_local_is_ready
+}
+
+debug_cluster_local_and_fleet() {
+  # for better debugging
+  echo "cluster.fleet local status"
+  kubectl get cluster.fleet -n fleet-local local -ojsonpath="{.status}" || echo "cluster.fleet local is not found"
+
+  echo ""
+  echo ""
+  echo "fleet-controller pods and creationTimestamp"
+  kubectl -n cattle-fleet-system get pods -l "app=fleet-controller" -owide || echo "fleet-controller pods are not found"
+  kubectl -n cattle-fleet-system get pods -l "app=fleet-controller" -ojsonpath="{.items[].metadata.creationTimestamp}" || echo "fleet-controller pods are not found"
+
+  echo ""
+  echo "fleet-agent pods and creationTimestamp"
+  kubectl -n cattle-fleet-local-system get pods -l "app=fleet-agent" -owide || echo "fleet-agent pods are not found"
+  kubectl -n cattle-fleet-local-system get pods -l "app=fleet-agent" -ojsonpath="{.items[].metadata.creationTimestamp}" || echo "fleet-agent pods are not found"
+  echo ""
+}
+
+wait_cluster_local_is_imported() {
+  echo "wait until cluster.fleet local is Imported after fleet-controller is upgraded"
+  # take a look the possible ready pods
+  kubectl -n cattle-fleet-system get pods -l "app=fleet-controller" || echo "fleet-controller pods are not found"
+  local oldstamp=$(get_fleet_controller_timestamp)
+  while [ true ]; do
+    local tempupdatetime=$(kubectl get cluster.fleet -n fleet-local local -oyaml | yq -e '.status.conditions | map(select(.type=="Imported")) | .[0] | .lastUpdateTime')
+    local tempstatus=$(kubectl get cluster.fleet -n fleet-local local -oyaml | yq -e '.status.conditions | map(select(.type=="Imported")) | .[0] | .status')
+    if [ -z "$tempupdatetime" ]; then
+      echo "cluster.fleet -n fleet-local local condition Imported is not found, continue"
+      sleep 2
+    else
+      local tempstamp=$(date -u -d "$tempupdatetime" +'%s')
+      if [ "$tempstamp" -ge "$oldstamp" ]; then
+        echo "cluster.fleet -n fleet-local local condition Imported is updated, $tempstamp >= $oldstamp, status is $tempstatus"
+        break
+      else
+        echo "cluster.fleet -n fleet-local local condition Imported is not updated, $tempstamp < $oldstamp, status is $tempstatus, continue"
+        sleep 2
+      fi
+    fi
+    unset tempupdatetime
+    unset tempstatus
+    unset tempstamp
+  done
+  echo "cluster.fleet local is Imported"
+  debug_cluster_local_and_fleet
+}
+
+# wait at most 60 seconds
+wait_cluster_local_is_ready() {
+  echo "wait until cluster.fleet local is Ready after fleet-controller is upgraded"
+  local i=0
+  while [[ "$i" -lt 30 ]]; do
+    local tempstatus=$(kubectl get cluster.fleet -n fleet-local local -oyaml | yq -e '.status.conditions | map(select(.type=="Ready")) | .[0] | .status')
+    if [ -z "$tempstatus" ]; then
+      echo "cluster.fleet -n fleet-local local condition Ready is not found, continue"
+      sleep 2
+      i=$((i + 1))
+    else
+      if [ "$tempstatus" = "True" ]; then
+        echo "cluster.fleet -n fleet-local local condition Ready is true"
+        debug_cluster_local_and_fleet
+        return 0
+      else
+        echo "cluster.fleet -n fleet-local local condition Ready is false, continue"
+        sleep 2
+        i=$((i + 1))
+      fi
+    fi
+    unset tempstatus
+  done
+  echo "cluster.fleet local is not Ready, skip waiting"
+  debug_cluster_local_and_fleet
+}
+
+wait_fleet_agent_is_redeployed() {
+  echo "wait until fleet-agent is redeployed after fleet-controller is upgraded"
+  # take a look the possible ready pods
+  kubectl -n cattle-fleet-system get pods -l "app=fleet-controller" || echo "fleet-controller pods are not found"
+  local oldstamp=$(get_fleet_controller_timestamp)
+  while [ true ]; do
+    local tempcreatetime=$(kubectl -n cattle-fleet-local-system get pods -l "app=fleet-agent" -o jsonpath='{range .items[*]}{.status.containerStatuses[*].ready.true}{.metadata.creationTimestamp}{ "\n"}{end}')
+    if [ -z "$tempcreatetime" ]; then
+      echo "fleet-agent pod is not found, continue"
+      sleep 2
+    else
+      local tempstamp=$(date -u -d "$tempcreatetime" +'%s')
+      if [ "$tempstamp" -ge "$oldstamp" ]; then
+        echo "fleet-agent is new, $tempstamp >= $oldstamp"
+        break
+      else
+        echo "fleet-agent is old, $tempstamp < $oldstamp, continue"
+        sleep 2
+      fi
+    fi
+    unset tempcreatetime
+    unset tempstamp
+  done
+  echo "fleet-agent is redeployed"
+  kubectl -n cattle-fleet-local-system get pods
+  debug_cluster_local_and_fleet
+  # let new fleet-agent run for some time
+  sleep 5
+}
+
+# only pick the ready pod
+get_fleet_controller_timestamp() {
+  while [ true ]; do
+    local tempcreatetime=$(kubectl -n cattle-fleet-system get pods -l "app=fleet-controller" -o jsonpath='{range .items[*]}{.status.containerStatuses[*].ready.true}{.metadata.creationTimestamp}{ "\n"}{end}')
+    if [ -z "$tempcreatetime" ]; then
+      # did not get, continue
+      sleep 1
+    else
+      # when unlucky, there are >1 pods are ready, the return is like `2024-10-24T12:57:54Z\n2024-10-24T12:57:54Z\n2024-10-24T12:57:54Z`
+      # take the first one
+      local firsttime=${tempcreatetime:0:20}
+      local tempstamp=$(date -u -d "$firsttime" +'%s')
+      echo "$tempstamp"
+      break
+    fi
+  done
+}
+
+wait_managedchart_ready() {
+  local chart=$1
+  if [[ -z $chart ]]; then
+    echo "no target managedchart, skip wait"
+  fi;
+
+  # wait at most 60 seconds
+  echo "wait managedchart $chart to be ready"
+  local i=0
+  while [[ "$i" -lt 30 ]]; do
+    local ready=$(kubectl get managedchart -n fleet-local $chart -ojsonpath="{.status.summary.ready}")
+    if [ -z "$ready" ]; then
+      echo "chart is not found, continue"
+      sleep 2
+      i=$((i + 1))
+    else
+      if [ "$ready" = "0" ]; then
+        echo " ready is 0, continue"
+        sleep 2
+        i=$((i + 1))
+      else
+        echo " ready is $ready"
+        break
+      fi
+    fi
+    unset ready
+  done
+}
+
+wait_new_fileds_in_cluster_fleet_crd() {
+  while [ true ]; do
+    local crd=$(kubectl get crd clusters.fleet.cattle.io -o json)
+    local newfield="agentTLSMode"
+
+    if echo "$crd" | jq -e ".spec.versions[].schema.openAPIV3Schema.properties.status.properties | has(\"$newfield\")" > /dev/null; then
+      echo "new field agentTLSMode is found in clusters.fleet.cattle.io crd"
+      break
+    else
+      echo "wait for new field agentTLSMode in clusters.fleet.cattle.io crd"
+      sleep 2
+    fi
+
+    unset crd
+    unset newfield
+  done
+}
+
+wait_new_fileds_in_fleet_controller_configmap() {
+  while [ true ]; do
+    local configmap=$(kubectl get configmap fleet-controller -n cattle-fleet-system -ojsonpath="{.data.config}")
+    local newfield="agentTLSMode"
+
+    if echo "$configmap" | yq -e ". | has(\"$newfield\")" > /dev/null; then
+      echo "new field agentTLSMode is found in cattle-fleet-system/fleet-controller configmap"
+      break
+    else
+      echo "wait for new field agentTLSMode in cattle-fleet-system/fleet-controller configmap"
+      sleep 2
+    fi
+
+    unset configmap
+    unset newfield
+  done
+}
+
+# refer issue https://github.com/harvester/harvester/issues/6851
+save_fleet_controller_configmap()
+{
+  local name=fleet-controller
+  local namespace=cattle-fleet-system
+  local valuesfile="configmap-values-temp.yaml"
+  rm -f $valuesfile
+  local EXIT_CODE=0
+  kubectl get configmap -n $namespace $name -ojsonpath="{.data.config}" > $valuesfile || EXIT_CODE=1
+
+  if [[ "$EXIT_CODE" != 0 ]]; then
+    echo "config field on configmap $name -n $namespace is empty, skip saving"
+    # unset var
+    FLEET_APISERVERURL=""
+    FLEET_APISERVERCA=""
+    return 0
+  fi
+
+  # local var will escape yq field none-exsting error
+  local apiServerURL=$(yq -e '.apiServerURL' $valuesfile)
+  local apiServerCA=$(yq -e '.apiServerCA' $valuesfile)
+  FLEET_APISERVERURL=$apiServerURL
+  FLEET_APISERVERCA=$apiServerCA
+  echo "saved apiServerURL $FLEET_APISERVERURL"
+  echo "saved apiServerCA $FLEET_APISERVERCA"
+  rm -f $valuesfile
+}
+
+# refer issue https://github.com/harvester/harvester/issues/6851
+restore_fleet_controller_configmap()
+{
+  if [[ -z "$FLEET_APISERVERURL" && -z "$FLEET_APISERVERCA" ]]; then
+    echo "both apiServerURL and apiServerCA saved values are empty, skip restoring"
+    return 0
+  fi
+
+  local name=fleet-controller
+  local namespace=cattle-fleet-system
+  local valuesfile="configmap-values-temp.yaml"
+  rm -f $valuesfile
+  local EXIT_CODE=0
+  kubectl get configmap -n $namespace $name -ojsonpath="{.data.config}" > $valuesfile || EXIT_CODE=1
+
+  if [[ "$EXIT_CODE" != 0 ]]; then
+    echo "config field on configmap $name -n $namespace is empty or configmap is not existing, skip restoring"
+    return 0
+  fi
+
+  # local var will escape yq field none-exsting error
+  local apiServerURL=$(yq -e '.apiServerURL' $valuesfile)
+  local apiServerCA=$(yq -e '.apiServerCA' $valuesfile)
+  local patchURL=false
+  local patchCA=false
+  if [[ ! -z "$FLEET_APISERVERURL" && "$apiServerURL" != "$FLEET_APISERVERURL" ]]; then
+    patchURL=true
+    echo "restore apiServerURL from $apiServerURL to $FLEET_APISERVERURL"
+    PATCH_URL=$FLEET_APISERVERURL yq e '.apiServerURL = strenv(PATCH_URL)' -i $valuesfile
+  fi
+
+  if [[ ! -z "$FLEET_APISERVERCA" && "$apiServerCA" != "$FLEET_APISERVERCA" ]]; then
+    patchCA=true
+    echo "restore apiServerCA from $apiServerCA to $FLEET_APISERVERCA"
+    PATCH_CA=$FLEET_APISERVERCA yq e '.apiServerCA = strenv(PATCH_CA)' -i $valuesfile
+  fi
+
+  if [[ "$patchURL" == false &&  "$patchCA" == false ]]; then
+    echo "apiServerURL $apiServerURL and apiServerCA $apiServerCA have already been same with saved values"
+    return 0
+  fi
+
+  # add 4 spaces to each line
+  sed -i -e 's/^/    /' $valuesfile
+  local newvalues=$(<$valuesfile)
+  rm -f $valuesfile
+
+  local patchfile="configmap-patch-temp.yaml"
+  rm -f $patchfile
+
+cat > $patchfile <<EOF
+data:
+  config: |
+$newvalues
+EOF
+
+  echo "the configmap will be restored to"
+  cat ./$patchfile
+
+  kubectl patch configmap -n $namespace $name --patch-file ./$patchfile --type merge
+  rm -f ./$patchfile
+  echo "sleep 20s for fleet-controller to work on new configmap"
+  sleep 20
 }
 
 wait_capi_cluster() {
@@ -140,7 +450,7 @@ wait_longhorn_manager() {
   lm_repo=$(kubectl get apps.catalog.cattle.io/harvester -n harvester-system -o json | jq -r .spec.chart.values.longhorn.image.longhorn.manager.repository)
   lm_tag=$(kubectl get apps.catalog.cattle.io/harvester -n harvester-system -o json | jq -r .spec.chart.values.longhorn.image.longhorn.manager.tag)
   lm_image="${lm_repo}:${lm_tag}"
-  node_count=$(kubectl get nodes --selector=harvesterhci.io/managed=true -o json | jq -r '.items | length')
+  node_count=$(kubectl get nodes --selector=harvesterhci.io/managed=true,node-role.harvesterhci.io/witness!=true -o json | jq -r '.items | length')
 
   while [ true ]; do
     lm_ds_ready=0
@@ -158,36 +468,43 @@ wait_longhorn_manager() {
   done
 }
 
-wait_longhorn_instance_manager_r() {
+wait_longhorn_instance_manager_aio() {
+  node_count=$(kubectl get nodes --selector=harvesterhci.io/managed=true,node-role.harvesterhci.io/witness!=true -o json | jq -r '.items | length')
+  if [ $node_count -lt 2 ]; then
+    echo "Skip waiting instance-manager (aio), node count: $node_count"
+    return
+  fi
+
   im_repo=$(kubectl get apps.catalog.cattle.io/harvester -n harvester-system -o json | jq -r .spec.chart.values.longhorn.image.longhorn.instanceManager.repository)
   im_tag=$(kubectl get apps.catalog.cattle.io/harvester -n harvester-system -o json | jq -r .spec.chart.values.longhorn.image.longhorn.instanceManager.tag)
   im_image="${im_repo}:${im_tag}"
 
-  node_count=$(kubectl get nodes --selector=harvesterhci.io/managed=true -o json | jq -r '.items | length')
-  if [ $node_count -le 2 ]; then
-    echo "Skip waiting instance-manager-r, node count: $node_count"
-    return
-  fi
+  # Get instance-manager-image chechsum
+  # reference: https://github.com/longhorn/longhorn-manager/blob/2ec649c35486d782731982c9dff1db41c9031c99/types/types.go#L429
+  im_image_checksum="${im_image/\//-}" # replace / with -
+  im_image_checksum="${im_image_checksum/:/-}" # replace : with -
+  im_image_checksum=$(echo -n "$im_image_checksum" | openssl dgst -sha512 | awk '{print $2}')
+  im_image_checksum="imi-${im_image_checksum:0:8}"
 
-  # Wait for instance-manager-r pods upgraded to new version first.
-  kubectl get nodes -o json | jq -r '.items[].metadata.name' | while read -r node; do
-    echo "Checking instance-manager-r pod on node $node..."
+  # Wait for instance-manager (aio) pods upgraded to new version first.
+  kubectl get nodes.longhorn.io -n longhorn-system -o json | jq -r '.items[].metadata.name' | while read -r node; do
+    echo "Checking instance-manager (aio) pod on node $node..."
     while [ true ]; do
-      pod_count=$(kubectl get pod --selector=longhorn.io/node=$node,longhorn.io/instance-manager-type=replica -n longhorn-system -o json | jq -r '.items | length')
-      if [ "$pod_count" != "1" ]; then
-        echo "instance-manager-r pod count is not 1 on node $node, will retry..."
+      im_count=$(kubectl get instancemanager.longhorn.io --selector=longhorn.io/node=$node,longhorn.io/instance-manager-type=aio,longhorn.io/instance-manager-image=$im_image_checksum -n longhorn-system -o json | jq -r '.items | length')
+      if [ "$im_count" != "1" ]; then
+        echo "instance-manager (aio) (image=$im_image) count is not 1 on node $node, will retry..."
         sleep 5
         continue
       fi
 
-      container_image=$(kubectl get pod --selector=longhorn.io/node=$node,longhorn.io/instance-manager-type=replica -n longhorn-system -o json | jq -r '.items[0].spec.containers[0].image')
-      if [ "$container_image" != "$im_image" ]; then
-        echo "instance-manager-r pod image is not $im_image, will retry..."
+      im_status=$(kubectl get instancemanager.longhorn.io --selector=longhorn.io/node=$node,longhorn.io/instance-manager-type=aio,longhorn.io/instance-manager-image=$im_image_checksum -n longhorn-system -o json | jq -r '.items[0].status.currentState')
+      if [ "$im_status" != "running" ]; then
+        echo "instance-manager (aio) (image=$im_image) state is not running on node $node, will retry..."
         sleep 5
         continue
       fi
 
-      echo "Checking instance-manager-r pod on node $node OK."
+      echo "Checking instance-manager (aio) (image=$im_image) on node $node OK."
       break
     done
   done
@@ -196,7 +513,7 @@ wait_longhorn_instance_manager_r() {
 wait_longhorn_upgrade() {
   echo "Waiting for LH settling down..."
   wait_longhorn_manager
-  wait_longhorn_instance_manager_r
+  wait_longhorn_instance_manager_aio
 }
 
 get_running_rancher_version() {
@@ -229,6 +546,8 @@ upgrade_rancher() {
   cd $UPGRADE_TMP_DIR/rancher
 
   ./helm get values rancher -n cattle-system -o yaml >values.yaml
+  # Remove extraEnv fields from values.yaml. We don't want config like CATTLE_SHELL_IMAGE to overwrite shell-image setting.
+  yq -i 'del(.extraEnv)' values.yaml
   echo "Rancher values:"
   cat values.yaml
 
@@ -236,6 +555,16 @@ upgrade_rancher() {
   if [ -z "$RANCHER_CURRENT_VERSION" ]; then
     echo "[ERROR] Fail to get current Rancher version."
     exit 1
+  fi
+
+  # drop the potential manual patch upon shell-image to v0.1.26 on Harvester v1.3.2
+  local shellimage=$(kubectl get settings.management.cattle.io shell-image -ojsonpath='{.value}')
+  if [[ "$shellimage" = "rancher/shell:v0.1.26" ]]; then
+    echo "rancher shell-image is $shellimage, will be reverted to empty"
+    kubectl patch settings.management.cattle.io shell-image --type merge -p '{"value":""}'
+    kubectl get settings.management.cattle.io shell-image
+  else
+    echo "rancher shell-image is $shellimage, patch is not needed"
   fi
 
   if [ "$RANCHER_CURRENT_VERSION" = "$REPO_RANCHER_VERSION" ]; then
@@ -255,12 +584,16 @@ upgrade_rancher() {
   kubectl delete clusterrepos.catalog.cattle.io rancher-partner-charts
   kubectl delete settings.management.cattle.io chart-default-branch
 
+  save_fleet_controller_configmap
+
   REPO_RANCHER_VERSION=$REPO_RANCHER_VERSION yq -e e '.rancherImageTag = strenv(REPO_RANCHER_VERSION)' values.yaml -i
+  echo "Rancher patch file to be run via helm upgrade"
+  cat values.yaml
   ./helm upgrade rancher ./*.tgz --namespace cattle-system -f values.yaml --wait
 
   # Wait until new version ready
   until [ "$(get_running_rancher_version)" = "$REPO_RANCHER_VERSION" ]; do
-    echo "Wait for Rancher to be upgraded..."
+    echo "Wait for Rancher to be upgraded to $REPO_RANCHER_VERSION..."
     sleep 5
   done
 
@@ -268,12 +601,69 @@ upgrade_rancher() {
   wait_helm_release cattle-fleet-system fleet fleet-$REPO_FLEET_CHART_VERSION $REPO_FLEET_APP_VERSION deployed
   wait_helm_release cattle-fleet-system fleet-crd fleet-crd-$REPO_FLEET_CRD_CHART_VERSION $REPO_FLEET_CRD_APP_VERSION deployed
   wait_helm_release cattle-system rancher-webhook rancher-webhook-$REPO_RANCHER_WEBHOOK_CHART_VERSION $REPO_RANCHER_WEBHOOK_APP_VERSION deployed
+
+  # wait Rancher depoyment is ready
+  echo "Wait for Rancher deployment rollout..."
+  wait_rollout cattle-system deployment rancher
+  echo "Rancher deployment and pods"
+  kubectl get -n cattle-system deployment rancher -owide
+  kubectl get pods -n cattle-system -l "app=rancher" -owide
+
   echo "Wait for Rancher dependencies rollout..."
-  wait_rollout cattle-fleet-local-system deployment fleet-agent
   wait_rollout cattle-fleet-system deployment fleet-controller
   wait_rollout cattle-system deployment rancher-webhook
+  # fleet-agnet is deployed as statefulset after fleet v0.10.1
+  # v0.9.2: https://github.com/rancher/fleet/blob/e75c1fb498e3137ba39c2bdc4d59c9122f5ef9c6/internal/cmd/controller/agent/manifest.go#L136-L145
+  # v0.10.1: https://github.com/rancher/fleet/blob/62de718a20e1377d5a8702876077762ed9a37f27/internal/cmd/controller/agentmanagement/agent/manifest.go#L152-L161
+  wait_rollout_with_loop cattle-fleet-local-system statefulset fleet-agent
   echo "Wait for cluster settling down..."
   wait_capi_cluster fleet-local local $pre_generation
+
+  # Following patch is not enough
+  wait_for_statefulset cattle-fleet-local-system fleet-agent
+  pre_patch_timestamp=$(fleet_agent_timestamp)
+  patch_fleet_cluster
+  wait_for_fleet_agent $pre_patch_timestamp
+  wait_rollout_with_loop cattle-fleet-local-system statefulset fleet-agent
+
+  # After fleet-controller POD is restarted, it will check until the local cluster is imported, after that, redeploy the fleet-agent
+  # Need to wait until fleet-controller assumes the cluster is ready, avoid fleet-agent is accidentally re-deployed and influence related managedcharts
+  wait_cluster_local_and_fleet
+}
+
+update_local_rke_state_secret() {
+  # Starting from Rancher v2.7, the local-rke-state Secret needs to be in type of "rke.cattle.io/current-state"
+  # Need to convert it from the "Opaque" type; otherwise, the following RKE2 upgrades won't start
+  # Ref: https://github.com/rancher/rancher/pull/41088
+  readonly secret_name="local-rke-state"
+  readonly new_secret_type="rke.cattle.io/cluster-state"
+
+  echo "Check current local-rke-state secret type..."
+  local secret_file
+  secret_file=$(mktemp -p "$UPGRADE_TMP_DIR")
+  kubectl -n fleet-local get secrets "$secret_name" -o yaml > "$secret_file"
+  local current_secret_type
+  current_secret_type=$(yq '.type' "$secret_file")
+  if [ "$current_secret_type" = "Opaque" ]; then
+    secret_type="$new_secret_type" yq -e '.type = strenv(secret_type)' "$secret_file" -i
+  else
+    echo "Current secret type is: $current_secret_type, skip update"
+    return
+  fi
+
+  echo "Scale down Rancher deployment to 0"
+  local rancher_deployment_replica_count
+  rancher_deployment_replica_count=$(kubectl -n cattle-system get deployment rancher -o jsonpath='{.spec.replicas}')
+  kubectl -n cattle-system scale deployment rancher --replicas=0
+
+  echo "Remove old secret and apply new one"
+  kubectl -n fleet-local delete secret local-rke-state
+  kubectl -n fleet-local apply -f "$secret_file"
+
+  echo "Scale up Rancher deployment to original replica count"
+  kubectl -n cattle-system scale deployment rancher --replicas="$rancher_deployment_replica_count"
+  echo "Wait for Rancher deployment becoming ready"
+  wait_rollout cattle-system deployment rancher
 }
 
 upgrade_harvester_cluster_repo() {
@@ -290,7 +680,7 @@ spec:
         - name: httpd
           image: rancher/harvester-cluster-repo:$REPO_OS_VERSION
 EOF
-  kubectl patch deployment harvester-cluster-repo -n cattle-system --patch-file ./cluster_repo.yaml --type merge
+  kubectl patch deployment harvester-cluster-repo -n cattle-system --patch-file ./cluster_repo.yaml --type strategic
 
   until kubectl -n cattle-system rollout status -w deployment/harvester-cluster-repo; do
     echo "Waiting for harvester-cluster-repo deployment ready..."
@@ -368,8 +758,112 @@ modify_nad_bridge() {
       done
 }
 
+ensure_ingress_class_name() {
+  echo "Ensuring existing rancher-expose Ingress has ingress class name specified"
+
+  INGRESS_CLASS_NAME=$(kubectl -n cattle-system get ingress rancher-expose -o jsonpath='{.spec.ingressClassName}' || true)
+  if [ -n "$INGRESS_CLASS_NAME" ]; then
+    echo "The ingress class name of the rancher-expose Ingress has been set: $INGRESS_CLASS_NAME"
+    return 0
+  fi
+
+  # find out the default ingress class with the annotation "ingressclass.kubernetes.io/is-default-class"
+  # if more than one, take the oldest; if no matches, set it to "nginx"
+  DEFAULT_INGRESS_CLASS=$(kubectl get ingressclasses --sort-by=.metadata.creationTimestamp -o yaml | yq '.items[] | select(.metadata.annotations | has("ingressclass.kubernetes.io/is-default-class")) | .metadata.name' | head -n 1 || true)
+  DEFAULT_INGRESS_CLASS=${DEFAULT_INGRESS_CLASS:-nginx}
+
+  cat > rancher-expose.yaml <<EOF
+spec:
+  ingressClassName: "$DEFAULT_INGRESS_CLASS"
+EOF
+
+  echo "Setting the ingress class name $DEFAULT_INGRESS_CLASS for rancher-expose Ingress"
+  kubectl -n cattle-system patch ingress rancher-expose --patch-file ./rancher-expose.yaml --type=merge
+}
+
+patch_longhorn_settings() {
+  # set Longhorn default settings with Harvester expected values, only when they are not set in managedchart and LH uses the default value
+  local target=$1
+  local EXIT_CODE=0
+  # yq returns 'Error: no matches found' if an item is not found
+  yq -e '.spec.values.longhorn.defaultSettings.nodeDrainPolicy' $target || EXIT_CODE=$?
+  if [ $EXIT_CODE != 0 ]; then
+    local ndp=$(kubectl get setting.longhorn.io -n longhorn-system node-drain-policy -ojsonpath="{.value}")
+    if [ $ndp == "block-if-contains-last-replica" ]; then
+      echo "patch longhorn nodeDrainPolicy to allow-if-replica-is-stopped"
+      yq '.spec.values.longhorn.defaultSettings.nodeDrainPolicy = "allow-if-replica-is-stopped"' -i $target
+    else
+      # user may set it from LH UI
+      echo "longhorn nodeDrainPolicy $ndp is not the default value, do not patch"
+    fi
+  else
+    echo "longhorn nodeDrainPolicy has been set in managedchart, do not patch again"
+  fi
+
+  EXIT_CODE=0
+  yq -e '.spec.values.longhorn.defaultSettings.detachManuallyAttachedVolumesWhenCordoned' $target || EXIT_CODE=$?
+  if [ $EXIT_CODE != 0 ]; then
+    local dma=$(kubectl get setting.longhorn.io -n longhorn-system detach-manually-attached-volumes-when-cordoned  -ojsonpath="{.value}")
+    if [ $dma == "false" ]; then
+      echo "patch longhorn detachManuallyAttachedVolumesWhenCordoned to true"
+      yq '.spec.values.longhorn.defaultSettings.detachManuallyAttachedVolumesWhenCordoned = true' -i $target
+    else
+      # user may set it from LH UI
+      echo "longhorn detachManuallyAttachedVolumesWhenCordoned $dma is not the default value, do not patch"
+    fi
+  else
+    echo "longhorn detachManuallyAttachedVolumesWhenCordoned has been set in managedchart, do not patch again"
+  fi
+
+  echo "longhorn related config"
+  yq -e '.spec.values.longhorn' $target || echo "fail to get info .spec.values.longhorn"
+}
+
+# if user has configured a valid additionalGuestMemoryOverheadRatio value on kubevirt object
+# but Harvester setting additional-guest-memory-overhead-ratio is not existing
+# try to convert it to Harvester setting to keep the configured value
+convert_kubevirt_additional_guest_memory_overhead_to_harvester_setting() {
+  local settingfile="additional-guest-memory-overhead-ratio.yaml"
+  local settingname="additional-guest-memory-overhead-ratio"
+  local agmor=$(kubectl get kubevirt kubevirt -n harvester-system -ojsonpath="{.spec.configuration.additionalGuestMemoryOverheadRatio}")
+  local setting=$(kubectl get settings.harvesterhci.io "$settingname")
+
+  if [[ -n "$agmor" ]]; then
+    echo "kubevirt additionalGuestMemoryOverheadRatio setting is $agmor"
+    if [[ -z $setting ]]; then
+      echo "try to convert kubevirt additionalGuestMemoryOverheadRatio to harvester setting $settingname"
+
+cat > $settingfile << EOF
+apiVersion: harvesterhci.io/v1beta1
+default: "1.5"
+kind: Setting
+metadata:
+  name: $settingname
+status:
+value: "$agmor"
+EOF
+
+      echo "the prepared yaml file to create setting"
+      cat $settingfile
+      # if the value was not valid but kubevirt did not deny it in the past
+      # the apply may be denied by harvester webhook
+      kubectl apply -f $settingfile || echo "failed to create setting $settingname, skip"
+      echo "the created object yaml"
+      kubectl get settings.harvesterhci.io $settingname -oyaml ||  echo "failed to get setting $settingname"
+      rm -f $settingfile
+    else
+      echo "harvester setting $settingname is found, do not re-convert"
+    fi
+  else
+    echo "kubevirt additionalGuestMemoryOverheadRatio is not found, skip"
+  fi
+}
+
 upgrade_harvester() {
   echo "Upgrading Harvester"
+
+  # after v1.4 is released, this function may be dropped from master-head
+  convert_kubevirt_additional_guest_memory_overhead_to_harvester_setting
 
   pre_generation_harvester=$(kubectl get managedcharts.management.cattle.io harvester -n fleet-local -o=jsonpath='{.status.observedGeneration}')
   pre_generation_harvester_crd=$(kubectl get managedcharts.management.cattle.io harvester-crd -n fleet-local -o=jsonpath='{.status.observedGeneration}')
@@ -380,6 +874,7 @@ upgrade_harvester() {
   cat >harvester-crd.yaml <<EOF
 spec:
   version: $REPO_HARVESTER_CHART_VERSION
+  timeoutSeconds: 60
 EOF
   kubectl patch managedcharts.management.cattle.io harvester-crd -n fleet-local --patch-file ./harvester-crd.yaml --type merge
 
@@ -400,6 +895,11 @@ EOF
       yq e '.spec.values.storageClass.defaultStorageClass = false' -i harvester.yaml
   fi
 
+  patch_longhorn_settings harvester.yaml
+
+  # set timeoutSeconds to 10 minutes to avoid context deadline exceeded in post upgrade hooks
+  yq eval '.spec.timeoutSeconds = 600' -i harvester.yaml
+
   kubectl apply -f ./harvester.yaml
 
   pause_managed_chart harvester "false"
@@ -411,172 +911,74 @@ EOF
   wait_kubevirt harvester-system kubevirt $REPO_KUBEVIRT_VERSION
 }
 
-upgrade_monitoring() {
-  echo "Upgrading Monitoring"
 
-  pre_generation_monitoring=$(kubectl get managedcharts.management.cattle.io rancher-monitoring -n fleet-local -o=jsonpath='{.status.observedGeneration}')
-  pre_generation_monitoring_crd=$(kubectl get managedcharts.management.cattle.io rancher-monitoring-crd -n fleet-local -o=jsonpath='{.status.observedGeneration}')
+#upgrade only monitoring_crd
+upgrade_managedchart_monitoring_crd() {
+  local nm=rancher-monitoring-crd
+  echo "Upgrading Managedchart $nm to $REPO_MONITORING_CHART_VERSION"
+
+  local pre_version=$(kubectl get managedcharts.management.cattle.io "$nm" -n fleet-local -o=jsonpath='{.spec.version}')
+  if [ "$pre_version" = "$REPO_MONITORING_CHART_VERSION" ]; then
+    echo "the $nm has already been target version $REPO_MONITORING_CHART_VERSION, nothing to upgrade"
+    pause_managed_chart "$nm" "false"
+    return 0
+  fi
+
+  local pre_generation=$(kubectl get managedcharts.management.cattle.io "$nm" -n fleet-local -o=jsonpath='{.status.observedGeneration}')
 
   mkdir -p $UPGRADE_TMP_DIR/monitoring
   cd $UPGRADE_TMP_DIR/monitoring
 
-  cat >rancher-monitoring-crd.yaml <<EOF
+  cat >"$nm".yaml <<EOF
 spec:
   version: $REPO_MONITORING_CHART_VERSION
+  timeoutSeconds: 60
 EOF
-  kubectl patch managedcharts.management.cattle.io rancher-monitoring-crd -n fleet-local --patch-file ./rancher-monitoring-crd.yaml --type merge
 
-  cat >rancher-monitoring.yaml <<EOF
-apiVersion: management.cattle.io/v3
-kind: ManagedChart
-metadata:
-  name: rancher-monitoring
-  namespace: fleet-local
-EOF
-  kubectl get managedcharts.management.cattle.io -n fleet-local rancher-monitoring -o yaml | yq e '{"spec": .spec}' - >>rancher-monitoring.yaml
+  kubectl patch managedcharts.management.cattle.io "$nm" -n fleet-local --patch-file ./"$nm".yaml --type merge
 
-  upgrade_managed_chart_from_version $UPGRADE_PREVIOUS_VERSION rancher-monitoring rancher-monitoring.yaml
-  NEW_VERSION=$REPO_MONITORING_CHART_VERSION yq e '.spec.version = strenv(NEW_VERSION)' rancher-monitoring.yaml -i
-  kubectl apply -f ./rancher-monitoring.yaml
+  pause_managed_chart "$nm" "false"
 
-  pause_managed_chart rancher-monitoring "false"
-  pause_managed_chart rancher-monitoring-crd "false"
-
-  wait_managed_chart fleet-local rancher-monitoring $REPO_MONITORING_CHART_VERSION $pre_generation_monitoring ready
-  wait_managed_chart fleet-local rancher-monitoring-crd $REPO_MONITORING_CHART_VERSION $pre_generation_monitoring_crd ready
-
-  wait_rollout cattle-monitoring-system daemonset rancher-monitoring-prometheus-node-exporter
-  wait_rollout cattle-monitoring-system deployment rancher-monitoring-operator
+  wait_managed_chart fleet-local "$nm" $REPO_MONITORING_CHART_VERSION $pre_generation ready
 }
 
-loop_wait_rollout_logging_audit() {
-  local NS=cattle-logging-system
+upgrade_monitoring() {
+  # from v1.2.0, only crd here, rancher-monitoring is upgraded in addons
+  upgrade_managedchart_monitoring_crd
+}
 
-  for i in $(seq 1 $1)
-  do
-    local EXIT_CODE=0 # reset each loop
-    sleep 10
+upgrade_managedchart_logging_crd() {
+  nm=rancher-logging-crd
+  echo "Upgrading Managedchart $nm to $REPO_LOGGING_CHART_VERSION"
 
-    # logging operator
-    wait_rollout $NS deployment rancher-logging || EXIT_CODE=$?
-    if [ $EXIT_CODE != 0 ]; then
-      echo "continue waiting rollout deployment rancher-logging, $i"
-      continue
-    fi
-
-    # agent to grab log
-    wait_rollout $NS daemonset rancher-logging-root-fluentbit || EXIT_CODE=$?
-    if [ $EXIT_CODE != 0 ]; then
-      echo "continue waiting rollout daemonset rancher-logging-root-fluentbit, $i"
-      continue
-    fi
-
-    wait_rollout $NS daemonset rancher-logging-rke2-journald-aggregator || EXIT_CODE=$?
-    if [ $EXIT_CODE != 0 ]; then
-      echo "continue waiting rollout daemonset rancher-logging-rke2-journald-aggregator, $i"
-      continue
-    fi
-
-    wait_rollout $NS daemonset rancher-logging-kube-audit-fluentbit || EXIT_CODE=$?
-    if [ $EXIT_CODE != 0 ]; then
-      echo "continue waiting rollout daemonset rancher-logging-kube-audit-fluentbit, $i"
-      continue
-    fi
-
-    # fluentd, a known issue: https://github.com/harvester/harvester/issues/2787
-    # wait_rollout cattle-logging-system statefulset rancher-logging-root-fluentd
-    # wait_rollout cattle-logging-system statefulset rancher-logging-kube-audit-fluentd
-
-    break
-  done
-
-  if [ $EXIT_CODE != 0 ]; then
-    echo "fail to wait rollout logging audit"
-    return $EXIT_CODE
+  pre_version=$(kubectl get managedcharts.management.cattle.io "$nm" -n fleet-local -o=jsonpath='{.spec.version}')
+  if [ "$pre_version" = "$REPO_LOGGING_CHART_VERSION" ]; then
+    echo "the $nm has already been target version $REPO_LOGGING_CHART_VERSION, nothing to upgrade"
+    pause_managed_chart "$nm" "false"
+    return 0
   fi
 
-  echo "success to wait rollout logging audit"
-  return 0
+  pre_generation_logging_crd=$(kubectl get managedcharts.management.cattle.io "$nm" -n fleet-local -o=jsonpath='{.status.observedGeneration}')
+
+  mkdir -p $UPGRADE_TMP_DIR/logging
+  cd $UPGRADE_TMP_DIR/logging
+
+  cat >"$nm".yaml <<EOF
+spec:
+  version: $REPO_LOGGING_CHART_VERSION
+  timeoutSeconds: 60
+EOF
+
+  kubectl patch managedcharts.management.cattle.io "$nm" -n fleet-local --patch-file ./"$nm".yaml --type merge
+
+  pause_managed_chart "$nm" "false"
+
+  wait_managed_chart fleet-local "$nm" $REPO_LOGGING_CHART_VERSION $pre_generation_logging_crd ready
 }
-
-loop_wait_rollout_event() {
-  local NS=cattle-logging-system
-  local NAME=harvester-default-event-tailer
-
-  for i in $(seq 1 $1)
-  do
-    local EXIT_CODE=0 # reset each loop
-    sleep 10
-
-    wait_rollout $NS statefulset $NAME || EXIT_CODE=$?
-    if [ $EXIT_CODE != 0 ]; then
-      echo "continue waiting rollout statefulset $NAME, $i"
-      continue
-    fi
-
-    break
-  done
-
-  if [ $EXIT_CODE != 0 ]; then
-    echo "fail to wait rollout event"
-    return $EXIT_CODE
-  fi
-
-  echo "success to wait rollout event"
-  return 0
-}
-
 
 upgrade_logging_event_audit() {
-  # from v1.0.3, logging, event, audit are enabled by default
-  echo "The current version is $UPGRADE_PREVIOUS_VERSION, will check Logging Event Audit upgrade manifest option"
-
-  if test "$UPGRADE_PREVIOUS_VERSION" = "v1.0.3"; then
-    echo "Logging Event Audit: start to upgrade manifest"
-
-    # prepare a malformed yaml file, make sure it is effectively replaced
-    echo "to-be-replaced-file" > rancher-logging.yaml
-
-    # reuse frame work to generate yaml file
-    upgrade_managed_chart_from_version $UPGRADE_PREVIOUS_VERSION rancher-logging rancher-logging.yaml
-
-    echo "Apply resource file of logging and audit"
-
-    kubectl apply -f ./rancher-logging.yaml
-
-    # wait for managedchart to be applied
-    sleep 50
-
-    echo "Wait for rollout of logging and audit"
-    # loop wait for at most 6 minutes (36 * 10s)
-    loop_wait_rollout_logging_audit 36
-
-    # due to error: unable to recognize "./rancher-logging.yaml": no matches for kind "EventTailer" in version "logging-extensions.banzaicloud.io/v1alpha1"
-    # the eventtailer needs to be deployed after the managedcharts are deployed
-
-    # prepare a malformed yaml file, make sure it is effectively replaced
-    echo "to-be-replaced-file" > rancher-logging.yaml
-
-    # reuse frame work to generate yaml file
-    # rancher-logging_event-extension is reusing chart rancher-logging, but as an extension for event
-    upgrade_managed_chart_from_version $UPGRADE_PREVIOUS_VERSION rancher-logging_event-extension rancher-logging.yaml
-
-    echo "Apply resource file of event"
-
-    kubectl apply -f ./rancher-logging.yaml
-
-    # wait few seconds
-    sleep 20
-
-    echo "Wait for rollout of event"
-    # loop wait for at most 3 minutes (18 * 10s)
-    loop_wait_rollout_event 18
-
-    echo "Logging Event Audit: finish upgrading manifest"
-
-  else
-    echo "Logging Event Audit: nothing to do in $UPGRADE_PREVIOUS_VERSION"
-  fi
+  # from v1.2.0, only crd here, rancher-logging is upgraded in addons
+  upgrade_managedchart_logging_crd
 }
 
 apply_extra_manifests()
@@ -584,9 +986,24 @@ apply_extra_manifests()
   echo "Applying extra manifests"
 
   shopt -s nullglob
-  for manifest in /usr/local/share/extra_manifests/*.yaml; do
-    kubectl apply -f $manifest
-  done
+
+  # from v1.1.2, extra manifests are controlled by version
+  # related files should be put under specific version path, e.g. extra_manifests/v1.1.3/some_manifest.yaml
+  if [[ $(is_formal_release $UPGRADE_PREVIOUS_VERSION) = "true" ]] && [[ "$UPGRADE_PREVIOUS_VERSION" < "v1.1.2" ]]; then
+    local rootpath="/usr/local/share/extra_manifests/untilv1.1.1"
+  else
+    local rootpath="/usr/local/share/extra_manifests/$UPGRADE_PREVIOUS_VERSION"
+  fi
+
+  if [ -d "$rootpath" ]; then
+    for manifest in $rootpath/*.yaml; do
+      echo "Apply $manifest"
+      kubectl apply -f $manifest
+    done
+  else
+    echo "No extra manifests in $rootpath to apply"
+  fi
+
   shopt -u nullglob
 }
 
@@ -614,22 +1031,119 @@ EOF
 }
 
 pause_all_charts() {
-  charts="harvester harvester-crd rancher-monitoring rancher-monitoring-crd"
+  local charts="harvester harvester-crd rancher-monitoring-crd rancher-logging-crd"
   for chart in $charts; do
     pause_managed_chart $chart "true"
   done
+
+  # those charts may have been converted to addon, check if they are there first
+  charts="rancher-monitoring rancher-logging"
+  for chart in $charts; do
+    local cnt=$(kubectl get managedchart -n fleet-local "$chart" --no-headers | wc -l)
+    if [ "$cnt" -gt 0 ]; then
+      pause_managed_chart $chart "true"
+    fi
+  done
+}
+
+skip_restart_rancher_system_agent() {
+  # to prevent rke2-server/agent from restarting during the rancher upgrade.
+  # by adding an env var to temporarily make rancher-system-agent on each node skip restarting rke2-server/agent.
+  # issue link: https://github.com/rancher/rancher/issues/41965
+
+  plan_manifest="$(mktemp --suffix=.yaml)"
+  plan_name="$HARVESTER_UPGRADE_NAME"-skip-restart-rancher-system-agent
+  plan_version="$(openssl rand -hex 4)"
+
+  cat > "$plan_manifest" <<EOF
+apiVersion: upgrade.cattle.io/v1
+kind: Plan
+metadata:
+  name: $plan_name
+  namespace: cattle-system
+spec:
+  concurrency: 10
+  nodeSelector:
+    matchLabels:
+      harvesterhci.io/managed: "true"
+  serviceAccountName: system-upgrade-controller
+  tolerations:
+  - operator: "Exists"
+  upgrade:
+    image: registry.suse.com/bci/bci-base:15.6
+    command:
+    - chroot
+    - /host
+    args:
+    - sh
+    - -c
+    - set -x && mkdir -p /run/systemd/system/rancher-system-agent.service.d && echo -e '[Service]\nEnvironmentFile=-/run/systemd/system/rancher-system-agent.service.d/10-harvester-upgrade.env' | tee /run/systemd/system/rancher-system-agent.service.d/override.conf && echo 'INSTALL_RKE2_SKIP_ENABLE=true' | tee /run/systemd/system/rancher-system-agent.service.d/10-harvester-upgrade.env && systemctl daemon-reload && systemctl restart rancher-system-agent.service
+  version: "$plan_version"
+EOF
+
+  echo "Creating plan $plan_name to make rancher-system-agent temporarily skip restarting RKE2 server..."
+  kubectl create -f "$plan_manifest"
+
+  # Wait for all nodes complete
+  while [ true ]; do
+    plan_label="plan.upgrade.cattle.io/$plan_name"
+    plan_latest_version=$(kubectl get plans.upgrade.cattle.io "$plan_name" -n cattle-system -ojsonpath="{.status.latestVersion}")
+
+    if [ "$plan_latest_version" = "$plan_version" ]; then
+      plan_latest_hash=$(kubectl get plans.upgrade.cattle.io "$plan_name" -n cattle-system -ojsonpath="{.status.latestHash}")
+      total_nodes_count=$(kubectl get nodes -o json | jq '.items | length')
+      complete_nodes_count=$(kubectl get nodes --selector="plan.upgrade.cattle.io/$plan_name=$plan_latest_hash" -o json | jq '.items | length')
+
+      if [ "$total_nodes_count" = "$complete_nodes_count" ]; then
+        echo "Plan $plan_name completes."
+        break
+      fi
+    fi
+
+    echo "Waiting for plan $plan_name to complete..."
+    sleep 10
+  done
+
+  echo "Deleting plan $plan_name..."
+  kubectl delete plans.upgrade.cattle.io "$plan_name" -n cattle-system
+  rm -f "$plan_manifest"
+}
+
+# NOTE: review in each release, add corresponding process
+upgrade_addon_rancher_monitoring()
+{
+  echo "upgrade addon rancher_monitoring"
+  # .spec.valuesContent has dynamic fields, cannot merge simply, review in each release
+  # in v1.4.0, patch version is OK
+  upgrade_addon_try_patch_version_only "rancher-monitoring" "cattle-monitoring-system" $REPO_MONITORING_CHART_VERSION
+}
+
+# NOTE: review in each release, add corresponding process
+upgrade_addon_rancher_logging()
+{
+  echo "upgrade addon rancher_logging"
+  # .spec.valuesContent has dynamic fields, cannot merge simply, review in each release
+  # in v1.4.0, the eventrouter image needs to be patched
+  if [ "$REPO_LOGGING_CHART_VERSION" = "103.1.0+up4.4.0" ]; then
+    upgrade_addon_rancher_logging_with_patch_eventrouter_image $REPO_LOGGING_CHART_VERSION
+  else
+    upgrade_addon_try_patch_version_only "rancher-logging" "cattle-logging-system" $REPO_LOGGING_CHART_VERSION
+  fi
 }
 
 upgrade_addons()
 {
- local is_upgrade_required=$(lower_version_check $UPGRADE_PREVIOUS_VERSION v1.1.1)
- if [ ! -z "$is_upgrade_required" ]; then
-   wait_for_addons_crd
-  addons="vm-import-controller pcidevices-controller"
+  wait_for_addons_crd
+  addons="vm-import-controller pcidevices-controller harvester-seeder"
   for addon in $addons; do
     upgrade_addon $addon "harvester-system"
   done
-  fi
+
+  # those 2 addons have flexible user-configurable fields, only upgrade harvester related e.g. new image tag
+  # from v1.2.0, they are upgraded per following
+  upgrade_addon_rancher_monitoring
+  upgrade_addon_rancher_logging
+  upgrade_nvidia_driver_toolkit_addon
 }
 
 reuse_vlan_cn() {
@@ -639,19 +1153,157 @@ reuse_vlan_cn() {
   kubectl get clusternetwork vlan -o yaml | yq '.metadata.finalizers = []' | kubectl apply -f -
 }
 
+sync_containerd_registry_to_rancher() {
+  echo "Sync containerd-registry setting to Rancher"
+
+  # Check if .spec.rkeConfig.registries is not null or empty.
+  # If the field is not null or empty, then the registries have
+  # already previously been synced to Rancher and there's no work
+  # to do here.
+  local num_registries_keys=$(kubectl get --namespace=fleet-local clusters.provisioning.cattle.io local -o yaml | yq '.spec.rkeConfig.registries | length')
+  if [[ $num_registries_keys -gt 0 ]]; then
+    echo "Rancher registries already set"
+    return
+  fi
+
+  # Otherwise, write an annotation to the setting to trigger the
+  # controller which will sync the settings up to Rancher.
+  kubectl annotate --overwrite=true setting.harvesterhci.io containerd-registry "harvesterhci.io/upgrade-patched=$REPO_HARVESTER_VERSION"
+}
+
+# rancher v2.8.1 introduced a new field fleetWorkspaceName in the cluster.provisioning CRD.
+# for new installs this is already patched by rancherd during bootstrap of cluster however rancherd logic is not
+# re-run in the upgrade path as a result this needs to be handled out of band
+patch_local_cluster_details() {
+  kubectl label -n fleet-local cluster.provisioning local "provisioning.cattle.io/management-cluster-name=local" --overwrite=true
+  kubectl patch -n fleet-local cluster.provisioning local --subresource=status --type=merge --patch '{"status":{"fleetWorkspaceName": "fleet-local"}}'
+}
+
+# RedeployAgentGeneration can be used to force redeploying the agent.
+# RedeployAgentGeneration int64 `json:"redeployAgentGeneration,omitempty"`
+patch_fleet_cluster() {
+  local generation=$(kubectl get -n fleet-local cluster.fleet local -o jsonpath='{.status.agentDeployedGeneration}')
+  local new_generation=$((generation+1))
+  patch_manifest="$(mktemp --suffix=.json)"
+  cat > "$patch_manifest" <<EOF
+{
+  "spec": {
+    "redeployAgentGeneration": $new_generation
+  }
+}
+EOF
+  echo "patch cluster.fleet local to new generation $new_generation"
+  kubectl patch -n fleet-local cluster.fleet local  --type=merge --patch-file $patch_manifest
+  rm -f $patch_manifest
+}
+
+# wait for statefulset will wait until statefulset exists
+wait_for_statefulset() {
+  local namespace=$1
+  local name=$2
+  local found=$(kubectl get statefulset -n $namespace -o json | jq -r --arg DEPLOYMENT $name '.items[].metadata | select (.name == $DEPLOYMENT) | .name')
+  while [ -z $found ]
+  do
+    echo "waiting for statefulset $name to be created in namespace $namespace, sleeping for 10 seconds"
+    sleep 10
+    found=$(kubectl get statefulset -n $namespace -o json | jq -r --arg DEPLOYMENT $name '.items[].metadata | select (.name == $DEPLOYMENT) | .name')
+  done
+}
+
+fleet_agent_timestamp(){
+  wait_for_statefulset cattle-fleet-local-system fleet-agent &> /dev/null
+  local temptime=$(kubectl get statefulset -n cattle-fleet-local-system fleet-agent -o json | jq -r .metadata.creationTimestamp)
+  if [ -z "$temptime" ]; then
+    # if kubectl happens to fail due to deployment is just deleted, echo 0 to continue
+    echo "0"
+  else
+    date -u -d $temptime +'%s'
+  fi
+}
+
+wait_for_fleet_agent(){
+  local timestamp=$1
+  local newtimestamp=$(fleet_agent_timestamp)
+  echo "wait for fleet-agent, current timestamp $timestamp"
+  while [ $timestamp -ge $newtimestamp ]
+  do
+    echo "waiting for fleet-agent creation timestamp to be updated"
+    sleep 10
+    newtimestamp=$(fleet_agent_timestamp)
+  done
+  echo "end with new timestamp $newtimestamp"
+}
+
+upgrade_harvester_csi_rbac() {
+
+  # only versions before v1.4.0 that upgrading to v1.4.0 need this patch
+  if [[ ! "${UPGRADE_PREVIOUS_VERSION%%-rc*}" < "v1.4.0" ]]; then
+    echo "Only versions before v1.4.0 need this patch."
+    return
+  fi
+
+  if kubectl get clusterrole harvesterhci.io:csi-driver 2> /dev/null; then
+    echo "Upgrade ClusterRole harvesterhci.io:csi-driver ..."
+
+    cat <<EOF | kubectl apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/component: apiserver
+    app.kubernetes.io/name: harvester
+    app.kubernetes.io/part-of: harvester
+  name: harvesterhci.io:csi-driver
+rules:
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - storageclasses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - harvesterhci.io
+  resources:
+  - networkfilesystems
+  - networkfilesystems/status
+  verbs:
+  - '*'
+- apiGroups:
+  - longhorn.io
+  resources:
+  - volumes
+  - volumes/status
+  verbs:
+  - get
+  - list
+EOF
+  else
+    echo "ClusterRole harvesterhci.io:csi-driver not found, skip updating."
+  fi
+}
+
 wait_repo
 detect_repo
 detect_upgrade
-check_version
 pre_upgrade_manifest
 pause_all_charts
+skip_restart_rancher_system_agent
 upgrade_rancher
+patch_local_cluster_details
+update_local_rke_state_secret
 upgrade_harvester_cluster_repo
 upgrade_network
+ensure_ingress_class_name
 upgrade_harvester
+sync_containerd_registry_to_rancher
 wait_longhorn_upgrade
 reuse_vlan_cn
 upgrade_monitoring
 upgrade_logging_event_audit
 apply_extra_manifests
 upgrade_addons
+upgrade_harvester_csi_rbac
+# wait fleet bundles upto 90 seconds
+wait_for_fleet_bundles 9

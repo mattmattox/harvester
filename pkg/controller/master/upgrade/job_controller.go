@@ -5,22 +5,25 @@ import (
 	"fmt"
 	"reflect"
 
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	capiv1alpha4 "sigs.k8s.io/cluster-api/api/v1alpha4"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
-	clusterv1ctl "github.com/harvester/harvester/pkg/generated/controllers/cluster.x-k8s.io/v1alpha4"
+	"github.com/harvester/harvester/pkg/controller/master/upgrade/repoinfo"
+	ctlclusterv1 "github.com/harvester/harvester/pkg/generated/controllers/cluster.x-k8s.io/v1beta1"
 	ctlharvesterv1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	upgradev1 "github.com/harvester/harvester/pkg/generated/controllers/upgrade.cattle.io/v1"
 )
 
 const (
 	StateUpgrading               = "Upgrading"
+	StatePreparingLoggingInfra   = "PreparingLoggingInfra"
+	StateLoggingInfraPrepared    = "LoggingInfraPrepared"
 	StateCreatingUpgradeImage    = "CreatingUpgradeImage"
 	StatePreparingRepo           = "PreparingRepo"
 	StateRepoPrepared            = "RepoPrepared"
@@ -52,13 +55,13 @@ type jobHandler struct {
 	upgradeClient ctlharvesterv1.UpgradeClient
 	upgradeCache  ctlharvesterv1.UpgradeCache
 
-	machineCache clusterv1ctl.MachineCache
+	machineCache ctlclusterv1.MachineCache
 	secretClient ctlcorev1.SecretClient
 	nodeClient   ctlcorev1.NodeClient
 	nodeCache    ctlcorev1.NodeCache
 }
 
-func (h *jobHandler) OnChanged(key string, job *batchv1.Job) (*batchv1.Job, error) {
+func (h *jobHandler) OnChanged(_ string, job *batchv1.Job) (*batchv1.Job, error) {
 	if job == nil || job.DeletionTimestamp != nil || job.Labels == nil || (job.Namespace != upgradeNamespace && job.Namespace != sucNamespace) {
 		return job, nil
 	}
@@ -97,7 +100,7 @@ func (h *jobHandler) syncNodeJob(job *batchv1.Job) (*batchv1.Job, error) {
 		return job, nil
 	}
 
-	machineName, ok := node.Annotations[capiv1alpha4.MachineAnnotation]
+	machineName, ok := node.Annotations[clusterv1.MachineAnnotation]
 	if !ok {
 		return job, nil
 	}
@@ -236,23 +239,28 @@ func (h *jobHandler) syncPlanJob(job *batchv1.Job, planName string, nodeName str
 }
 
 func (h *jobHandler) syncManifestJob(job *batchv1.Job) (*batchv1.Job, error) {
-	sets := labels.Set{
-		harvesterLatestUpgradeLabel: "true",
+	upgradeName, ok := job.Labels[harvesterUpgradeLabel]
+	if !ok {
+		return job, nil
 	}
-	onGoingUpgrades, err := h.upgradeCache.List(h.namespace, sets.AsSelector())
+
+	upgrade, err := h.upgradeCache.Get(h.namespace, upgradeName)
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return job, nil
+		}
 		return job, err
 	}
-	if len(onGoingUpgrades) == 0 {
-		return job, nil
-	}
-	currentUpgrade := onGoingUpgrades[0]
-	toUpdate := currentUpgrade.DeepCopy()
 
-	if !harvesterv1.SystemServicesUpgraded.IsUnknown(currentUpgrade) || job.Status.Active > 0 {
+	if upgrade.Labels[harvesterLatestUpgradeLabel] != "true" {
 		return job, nil
 	}
 
+	if !harvesterv1.SystemServicesUpgraded.IsUnknown(upgrade) || job.Status.Active > 0 {
+		return job, nil
+	}
+
+	toUpdate := upgrade.DeepCopy()
 	for _, condition := range job.Status.Conditions {
 		if condition.Type == batchv1.JobFailed && condition.Status == "True" {
 			setHelmChartUpgradeStatus(toUpdate, v1.ConditionFalse, condition.Reason, condition.Message)
@@ -260,7 +268,7 @@ func (h *jobHandler) syncManifestJob(job *batchv1.Job) (*batchv1.Job, error) {
 			setHelmChartUpgradeStatus(toUpdate, v1.ConditionTrue, condition.Reason, condition.Message)
 		}
 	}
-	if !reflect.DeepEqual(currentUpgrade, toUpdate) {
+	if !reflect.DeepEqual(upgrade, toUpdate) {
 		if _, err := h.upgradeClient.Update(toUpdate); err != nil {
 			return job, err
 		}
@@ -269,7 +277,7 @@ func (h *jobHandler) syncManifestJob(job *batchv1.Job) (*batchv1.Job, error) {
 	return job, nil
 }
 
-func (h *jobHandler) setNodeWaitRebootLabel(node *v1.Node, repoInfo *UpgradeRepoInfo) error {
+func (h *jobHandler) setNodeWaitRebootLabel(node *v1.Node, repoInfo *repoinfo.RepoInfo) error {
 	nodeUpdate := node.DeepCopy()
 	nodeUpdate.Annotations[harvesterNodePendingOSImage] = repoInfo.Release.OS
 	_, err := h.nodeClient.Update(nodeUpdate)

@@ -1,19 +1,19 @@
 package util
 
 import (
-	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
+	"regexp"
 	"time"
 
 	"github.com/pkg/errors"
@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
@@ -92,8 +93,12 @@ func DetectGRPCServerAvailability(address string, waitIntervalInSecond int, shou
 		<-ticker.C
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		conn, err := grpc.DialContext(ctx, address, grpc.WithInsecure())
-		cancel()
+		grpcOpts := []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(), // nolint: staticcheck
+		}
+		conn, err := grpc.DialContext(ctx, address, grpcOpts...) // nolint: staticcheck
+		defer cancel()
 		if !shouldAvailable {
 			if err != nil {
 				return true
@@ -105,7 +110,7 @@ func DetectGRPCServerAvailability(address string, waitIntervalInSecond int, shou
 		}
 		if shouldAvailable && err == nil {
 			state := conn.GetState()
-			if state == connectivity.Ready || state == connectivity.Idle {
+			if state == connectivity.Ready || state == connectivity.Idle || state == connectivity.Connecting {
 				return true
 			}
 		}
@@ -125,7 +130,7 @@ type DiskConfig struct {
 
 func GetDiskConfig(diskPath string) (string, error) {
 	filePath := filepath.Join(diskPath, DiskConfigFile)
-	output, err := ioutil.ReadFile(filePath)
+	output, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", fmt.Errorf("cannot find disk config file %v: %v", filePath, err)
 	}
@@ -145,6 +150,7 @@ type SyncingFileConfig struct {
 	FilePath         string `json:"name"`
 	UUID             string `json:"uuid"`
 	Size             int64  `json:"size"`
+	VirtualSize      int64  `json:"virtualSize"`
 	ExpectedChecksum string `json:"expectedChecksum"`
 	CurrentChecksum  string `json:"currentChecksum"`
 	ModificationTime string `json:"modificationTime"`
@@ -168,11 +174,11 @@ func WriteSyncingFileConfig(configFilePath string, config *SyncingFileConfig) (e
 		}
 	}()
 	// We don't care the previous config file content.
-	return ioutil.WriteFile(configFilePath, encoded, 0666)
+	return os.WriteFile(configFilePath, encoded, 0666)
 }
 
 func ReadSyncingFileConfig(configFilePath string) (*SyncingFileConfig, error) {
-	output, err := ioutil.ReadFile(configFilePath)
+	output, err := os.ReadFile(configFilePath)
 	if err != nil {
 		return nil, errors.Wrapf(err, "cannot find the syncing file config file %v", configFilePath)
 	}
@@ -225,48 +231,60 @@ func ExecuteWithTimeout(timeout time.Duration, envs []string, binary string, arg
 	return output.String(), nil
 }
 
-func DetectFileFormat(filePath string) (string, error) {
+type QemuImgInfo struct {
+	// For qcow2 files, VirtualSize may be larger than the physical
+	// image size on disk.  For raw files, `qemu-img info` will report
+	// VirtualSize as being the same as the physical file size.
+	VirtualSize int64  `json:"virtual-size"`
+	Format      string `json:"format"`
+}
+
+func GetQemuImgInfo(filePath string) (imgInfo QemuImgInfo, err error) {
 
 	/* Example command outputs
-	   $ qemu-img info parrot.raw
-	   image: parrot.raw
-	   file format: raw
-	   virtual size: 32M (33554432 bytes)
-	   disk size: 2.2M
+	   $ qemu-img info --output=json SLE-Micro.x86_64-5.5.0-Default-qcow-GM.qcow2
+	   {
+	       "virtual-size": 21474836480,
+	       "filename": "SLE-Micro.x86_64-5.5.0-Default-qcow-GM.qcow2",
+	       "cluster-size": 65536,
+	       "format": "qcow2",
+	       "actual-size": 1001656320,
+	       "format-specific": {
+	           "type": "qcow2",
+	           "data": {
+	               "compat": "1.1",
+	               "compression-type": "zlib",
+	               "lazy-refcounts": false,
+	               "refcount-bits": 16,
+	               "corrupt": false,
+	               "extended-l2": false
+	           }
+	       },
+	       "dirty-flag": false
+	   }
 
-	   $ qemu-img info parrot.qcow2
-	   image: parrot.qcow2
-	   file format: qcow2
-	   virtual size: 32M (33554432 bytes)
-	   disk size: 2.3M
-	   cluster_size: 65536
-	   Format specific information:
-	       compat: 1.1
-	       lazy refcounts: false
-	       refcount bits: 16
-	       corrupt: false
+	   $ qemu-img info --output=json SLE-15-SP5-Full-x86_64-GM-Media1.iso
+	   {
+	       "virtual-size": 14548992000,
+	       "filename": "SLE-15-SP5-Full-x86_64-GM-Media1.iso",
+	       "format": "raw",
+	       "actual-size": 14548996096,
+	       "dirty-flag": false
+	   }
 	*/
 
-	output, err := Execute([]string{}, QemuImgBinary, "info", filePath)
+	output, err := Execute([]string{}, QemuImgBinary, "info", "--output=json", filePath)
 	if err != nil {
-		return "", err
+		return
 	}
-
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "file format: ") {
-			return strings.TrimPrefix(line, "file format: "), nil
-		}
-	}
-
-	return "", fmt.Errorf("cannot find the file format in the output %s", output)
+	err = json.Unmarshal([]byte(output), &imgInfo)
+	return
 }
 
 func ConvertFromRawToQcow2(filePath string) error {
-	if format, err := DetectFileFormat(filePath); err != nil {
+	if imgInfo, err := GetQemuImgInfo(filePath); err != nil {
 		return err
-	} else if format == "qcow2" {
+	} else if imgInfo.Format == "qcow2" {
 		return nil
 	}
 
@@ -282,10 +300,69 @@ func ConvertFromRawToQcow2(filePath string) error {
 	return os.Rename(tmpFilePath, filePath)
 }
 
+func ConvertFromQcow2ToRaw(sourcePath, targetPath string) error {
+	if imgInfo, err := GetQemuImgInfo(sourcePath); err != nil {
+		return err
+	} else if imgInfo.Format == "raw" {
+		return nil
+	}
+
+	if _, err := Execute([]string{}, QemuImgBinary, "convert", "-f", "qcow2", "-O", "raw", sourcePath, targetPath); err != nil {
+		return err
+	}
+	return nil
+}
+
 func FileModificationTime(filePath string) string {
 	fi, err := os.Stat(filePath)
 	if err != nil {
 		return ""
 	}
 	return fi.ModTime().UTC().String()
+}
+
+func GunzipFile(filePath string, dstFilePath string) error {
+	gzipfile, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer gzipfile.Close()
+
+	reader, err := gzip.NewReader(gzipfile)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	writer, err := os.Create(dstFilePath)
+	if err != nil {
+		return err
+	}
+	defer writer.Close()
+
+	if _, err = io.Copy(writer, reader); err != nil {
+		return err
+	}
+	return nil
+}
+
+var (
+	MaximumBackingImageNameSize = 64
+	validBackingImageName       = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
+)
+
+func CheckBackupType(backupTarget string) (string, error) {
+	u, err := url.Parse(backupTarget)
+	if err != nil {
+		return "", err
+	}
+
+	return u.Scheme, nil
+}
+
+func ValidBackingImageName(name string) bool {
+	if len(name) > MaximumBackingImageNameSize {
+		return false
+	}
+	return validBackingImageName.MatchString(name)
 }

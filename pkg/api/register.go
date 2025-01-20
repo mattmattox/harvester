@@ -5,9 +5,12 @@ import (
 
 	"github.com/rancher/steve/pkg/server"
 
+	"github.com/harvester/harvester/pkg/api/cluster"
 	"github.com/harvester/harvester/pkg/api/image"
 	"github.com/harvester/harvester/pkg/api/keypair"
+	"github.com/harvester/harvester/pkg/api/namespace"
 	"github.com/harvester/harvester/pkg/api/node"
+	"github.com/harvester/harvester/pkg/api/upgradelog"
 	"github.com/harvester/harvester/pkg/api/vm"
 	"github.com/harvester/harvester/pkg/api/vmtemplate"
 	"github.com/harvester/harvester/pkg/api/volume"
@@ -26,7 +29,7 @@ func registerSchemas(scaled *config.Scaled, server *server.Server, options confi
 	return nil
 }
 
-func Setup(ctx context.Context, server *server.Server, controllers *server.Controllers, options config.Options) error {
+func Setup(ctx context.Context, server *server.Server, _ *server.Controllers, options config.Options) error {
 	scaled := config.ScaledWithContext(ctx)
 	return registerSchemas(scaled, server, options,
 		image.RegisterSchema,
@@ -34,6 +37,10 @@ func Setup(ctx context.Context, server *server.Server, controllers *server.Contr
 		vmtemplate.RegisterSchema,
 		vm.RegisterSchema,
 		node.RegisterSchema,
+		upgradelog.RegisterSchema,
 		volume.RegisterSchema,
-		volumesnapshot.RegisterSchema)
+		volumesnapshot.RegisterSchema,
+		cluster.RegisterSchema,
+		namespace.RegisterSchema,
+	)
 }

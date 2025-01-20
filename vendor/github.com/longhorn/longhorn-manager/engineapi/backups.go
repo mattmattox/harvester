@@ -5,15 +5,23 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
 	"github.com/longhorn/backupstore"
 
-	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	btypes "github.com/longhorn/backupstore/types"
+	lhexec "github.com/longhorn/go-common-libs/exec"
+	lhtypes "github.com/longhorn/go-common-libs/types"
+	etypes "github.com/longhorn/longhorn-engine/pkg/types"
+
+	"github.com/longhorn/longhorn-manager/datastore"
 	"github.com/longhorn/longhorn-manager/types"
 	"github.com/longhorn/longhorn-manager/util"
+
+	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 )
 
 const (
@@ -29,12 +37,38 @@ type BackupTargetClient struct {
 }
 
 // NewBackupTargetClient returns the backup target client
-func NewBackupTargetClient(defaultEngineImage, url string, credential map[string]string) *BackupTargetClient {
+func NewBackupTargetClient(engineImage, url string, credential map[string]string) *BackupTargetClient {
 	return &BackupTargetClient{
-		Image:      defaultEngineImage,
+		Image:      engineImage,
 		URL:        url,
 		Credential: credential,
 	}
+}
+
+func NewBackupTargetClientFromBackupTarget(backupTarget *longhorn.BackupTarget, ds *datastore.DataStore) (*BackupTargetClient, error) {
+	defaultEngineImage, err := ds.GetSettingValueExisted(types.SettingNameDefaultEngineImage)
+	if err != nil {
+		return nil, err
+	}
+
+	backupType, err := util.CheckBackupType(backupTarget.Spec.BackupTargetURL)
+	if err != nil {
+		return nil, err
+	}
+
+	var credential map[string]string
+	if types.BackupStoreRequireCredential(backupType) {
+		if backupTarget.Spec.CredentialSecret == "" {
+			return nil, errors.Errorf("cannot access %s without credential secret", backupType)
+		}
+
+		credential, err = ds.GetCredentialFromSecret(backupTarget.Spec.CredentialSecret)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return NewBackupTargetClient(defaultEngineImage, backupTarget.Spec.BackupTargetURL, credential), nil
 }
 
 func (btc *BackupTargetClient) LonghornEngineBinary() string {
@@ -49,31 +83,45 @@ func getBackupCredentialEnv(backupTarget string, credential map[string]string) (
 		return envs, err
 	}
 
-	if backupType != types.BackupStoreTypeS3 || credential == nil {
+	if !types.BackupStoreRequireCredential(backupType) || credential == nil {
 		return envs, nil
 	}
 
-	var missingKeys []string
-	if credential[types.AWSAccessKey] == "" {
-		missingKeys = append(missingKeys, types.AWSAccessKey)
+	switch backupType {
+	case types.BackupStoreTypeS3:
+		var missingKeys []string
+		if credential[types.AWSAccessKey] == "" {
+			missingKeys = append(missingKeys, types.AWSAccessKey)
+		}
+		if credential[types.AWSSecretKey] == "" {
+			missingKeys = append(missingKeys, types.AWSSecretKey)
+		}
+		// If AWS IAM Role not present, then the AWS credentials must be exists
+		if credential[types.AWSIAMRoleArn] == "" && len(missingKeys) > 0 {
+			return nil, fmt.Errorf("could not backup to %s, missing %v in the secret", backupType, missingKeys)
+		}
+		if len(missingKeys) == 0 {
+			envs = append(envs, fmt.Sprintf("%s=%s", types.AWSAccessKey, credential[types.AWSAccessKey]))
+			envs = append(envs, fmt.Sprintf("%s=%s", types.AWSSecretKey, credential[types.AWSSecretKey]))
+		}
+		envs = append(envs, fmt.Sprintf("%s=%s", types.AWSEndPoint, credential[types.AWSEndPoint]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.AWSCert, credential[types.AWSCert]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.HTTPSProxy, credential[types.HTTPSProxy]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.HTTPProxy, credential[types.HTTPProxy]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.NOProxy, credential[types.NOProxy]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.VirtualHostedStyle, credential[types.VirtualHostedStyle]))
+	case types.BackupStoreTypeCIFS:
+		envs = append(envs, fmt.Sprintf("%s=%s", types.CIFSUsername, credential[types.CIFSUsername]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.CIFSPassword, credential[types.CIFSPassword]))
+	case types.BackupStoreTypeAZBlob:
+		envs = append(envs, fmt.Sprintf("%s=%s", types.AZBlobAccountName, credential[types.AZBlobAccountName]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.AZBlobAccountKey, credential[types.AZBlobAccountKey]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.AZBlobEndpoint, credential[types.AZBlobEndpoint]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.AZBlobCert, credential[types.AZBlobCert]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.HTTPSProxy, credential[types.HTTPSProxy]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.HTTPProxy, credential[types.HTTPProxy]))
+		envs = append(envs, fmt.Sprintf("%s=%s", types.NOProxy, credential[types.NOProxy]))
 	}
-	if credential[types.AWSSecretKey] == "" {
-		missingKeys = append(missingKeys, types.AWSSecretKey)
-	}
-	// If AWS IAM Role not present, then the AWS credentials must be exists
-	if credential[types.AWSIAMRoleArn] == "" && len(missingKeys) > 0 {
-		return nil, fmt.Errorf("could not backup to %s, missing %v in the secret", backupType, missingKeys)
-	}
-	if len(missingKeys) == 0 {
-		envs = append(envs, fmt.Sprintf("%s=%s", types.AWSAccessKey, credential[types.AWSAccessKey]))
-		envs = append(envs, fmt.Sprintf("%s=%s", types.AWSSecretKey, credential[types.AWSSecretKey]))
-	}
-	envs = append(envs, fmt.Sprintf("%s=%s", types.AWSEndPoint, credential[types.AWSEndPoint]))
-	envs = append(envs, fmt.Sprintf("%s=%s", types.AWSCert, credential[types.AWSCert]))
-	envs = append(envs, fmt.Sprintf("%s=%s", types.HTTPSProxy, credential[types.HTTPSProxy]))
-	envs = append(envs, fmt.Sprintf("%s=%s", types.HTTPProxy, credential[types.HTTPProxy]))
-	envs = append(envs, fmt.Sprintf("%s=%s", types.NOProxy, credential[types.NOProxy]))
-	envs = append(envs, fmt.Sprintf("%s=%s", types.VirtualHostedStyle, credential[types.VirtualHostedStyle]))
 	return envs, nil
 }
 
@@ -82,7 +130,15 @@ func (btc *BackupTargetClient) ExecuteEngineBinary(args ...string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	return util.Execute(envs, btc.LonghornEngineBinary(), args...)
+	return lhexec.NewExecutor().Execute(envs, btc.LonghornEngineBinary(), args, lhtypes.ExecuteDefaultTimeout)
+}
+
+func (btc *BackupTargetClient) ExecuteEngineBinaryWithTimeout(timeout time.Duration, args ...string) (string, error) {
+	envs, err := getBackupCredentialEnv(btc.URL, btc.Credential)
+	if err != nil {
+		return "", err
+	}
+	return lhexec.NewExecutor().Execute(envs, btc.LonghornEngineBinary(), args, timeout)
 }
 
 func (btc *BackupTargetClient) ExecuteEngineBinaryWithoutTimeout(args ...string) (string, error) {
@@ -90,7 +146,7 @@ func (btc *BackupTargetClient) ExecuteEngineBinaryWithoutTimeout(args ...string)
 	if err != nil {
 		return "", err
 	}
-	return util.ExecuteWithoutTimeout(envs, btc.LonghornEngineBinary(), args...)
+	return lhexec.NewExecutor().Execute(envs, btc.LonghornEngineBinary(), args, lhtypes.ExecuteNoTimeout)
 }
 
 // parseBackupVolumeNamesList parses a list of backup volume names into a sorted string slice
@@ -102,14 +158,16 @@ func parseBackupVolumeNamesList(output string) ([]string, error) {
 
 	volumeNames := []string{}
 	for volumeName := range data {
-		volumeNames = append(volumeNames, volumeName)
+		if util.ValidateName(volumeName) {
+			volumeNames = append(volumeNames, volumeName)
+		}
 	}
 	sort.Strings(volumeNames)
 	return volumeNames, nil
 }
 
 // BackupVolumeNameList returns a list of backup volume names
-func (btc *BackupTargetClient) BackupVolumeNameList(destURL string, credential map[string]string) ([]string, error) {
+func (btc *BackupTargetClient) BackupVolumeNameList() ([]string, error) {
 	output, err := btc.ExecuteEngineBinary("backup", "ls", "--volume-only", btc.URL)
 	if err != nil {
 		if types.ErrorIsNotFound(err) {
@@ -133,8 +191,8 @@ func parseBackupNamesList(output, volumeName string) ([]string, error) {
 	}
 
 	backupNames := []string{}
-	if volumeData.Messages[string(backupstore.MessageTypeError)] != "" {
-		return backupNames, errors.New(volumeData.Messages[string(backupstore.MessageTypeError)])
+	if volumeData.Messages[string(btypes.MessageTypeError)] != "" {
+		return backupNames, errors.New(volumeData.Messages[string(btypes.MessageTypeError)])
 	}
 	for backupName := range volumeData.Backups {
 		backupNames = append(backupNames, backupName)
@@ -247,22 +305,30 @@ func (btc *BackupTargetClient) BackupDelete(backupURL string, credential map[str
 	return nil
 }
 
+// BackupCleanUpAllMounts clean up all mount points of backup store on the node
+func (btc *BackupTargetClient) BackupCleanUpAllMounts() (err error) {
+	_, err = btc.ExecuteEngineBinary("backup", "cleanup-all-mounts")
+	if err != nil {
+		return errors.Wrapf(err, "error clean up all mount points")
+	}
+	return nil
+}
+
 // SnapshotBackup calls engine binary
 // TODO: Deprecated, replaced by gRPC proxy
-func (e *EngineBinary) SnapshotBackup(engine *longhorn.Engine,
-	snapName, backupName, backupTarget,
-	backingImageName, backingImageChecksum string,
-	labels, credential map[string]string) (string, string, error) {
-	if snapName == VolumeHeadName {
-		return "", "", fmt.Errorf("invalid operation: cannot backup %v", VolumeHeadName)
+func (e *EngineBinary) SnapshotBackup(engine *longhorn.Engine, snapName, backupName, backupTarget,
+	backingImageName, backingImageChecksum, compressionMethod string, concurrentLimit int, storageClassName string,
+	labels, credential, parameters map[string]string) (string, string, error) {
+	if snapName == etypes.VolumeHeadName {
+		return "", "", fmt.Errorf("invalid operation: cannot backup %v", etypes.VolumeHeadName)
 	}
 	// TODO: update when replacing this function
 	snap, err := e.SnapshotGet(nil, snapName)
 	if err != nil {
-		return "", "", errors.Wrapf(err, "error getting snapshot '%s', volume '%s'", snapName, e.name)
+		return "", "", errors.Wrapf(err, "error getting snapshot '%s', volume '%s'", snapName, e.volumeName)
 	}
 	if snap == nil {
-		return "", "", errors.Errorf("could not find snapshot '%s' to backup, volume '%s'", snapName, e.name)
+		return "", "", errors.Errorf("could not find snapshot '%s' to backup, volume '%s'", snapName, e.volumeName)
 	}
 	version, err := e.VersionGet(nil, true)
 	if err != nil {
@@ -300,16 +366,28 @@ func (e *EngineBinary) SnapshotBackup(engine *longhorn.Engine,
 		return "", "", err
 	}
 
-	logrus.Debugf("Backup %v created for volume %v snapshot %v", backupCreateInfo.BackupID, e.Name(), snapName)
+	logrus.Infof("Backup %v created for volume %v snapshot %v", backupCreateInfo.BackupID, e.Name(), snapName)
 	return backupCreateInfo.BackupID, backupCreateInfo.ReplicaAddress, nil
 }
 
 // SnapshotBackupStatus calls engine binary
 // TODO: Deprecated, replaced by gRPC proxy
-func (e *EngineBinary) SnapshotBackupStatus(engine *longhorn.Engine, backupName, replicaAddress string) (*longhorn.EngineBackupStatus, error) {
+func (e *EngineBinary) SnapshotBackupStatus(engine *longhorn.Engine, backupName, replicaAddress,
+	replicaName string) (*longhorn.EngineBackupStatus, error) {
 	args := []string{"backup", "status", backupName}
 	if replicaAddress != "" {
 		args = append(args, "--replica", replicaAddress)
+	}
+
+	// For now, we likely don't know the replica name here. Don't bother checking the binary version if we don't.
+	if replicaName != "" {
+		version, err := e.VersionGet(engine, true)
+		if err != nil {
+			return nil, err
+		}
+		if version.ClientVersion.CLIAPIVersion >= 9 {
+			args = append(args, "--replica-instance-name", replicaName)
+		}
 	}
 
 	output, err := e.ExecuteEngineBinary(args...)
@@ -341,7 +419,8 @@ func ConvertEngineBackupState(state string) longhorn.BackupState {
 
 // BackupRestore calls engine binary
 // TODO: Deprecated, replaced by gRPC proxy
-func (e *EngineBinary) BackupRestore(engine *longhorn.Engine, backupTarget, backupName, backupVolumeName, lastRestored string, credential map[string]string) error {
+func (e *EngineBinary) BackupRestore(engine *longhorn.Engine, backupTarget, backupName, backupVolumeName,
+	lastRestored string, credential map[string]string, concurrentLimit int) error {
 	backup := backupstore.EncodeBackupURL(backupName, backupVolumeName, backupTarget)
 
 	// get environment variables if backup for s3
@@ -366,7 +445,7 @@ func (e *EngineBinary) BackupRestore(engine *longhorn.Engine, backupTarget, back
 		return taskErr
 	}
 
-	logrus.Debugf("Backup %v restored for volume %v", backup, e.Name())
+	logrus.Infof("Backup %v restored for volume %v", backup, e.Name())
 	return nil
 }
 
@@ -383,4 +462,10 @@ func (e *EngineBinary) BackupRestoreStatus(*longhorn.Engine) (map[string]*longho
 		return nil, err
 	}
 	return replicaStatusMap, nil
+}
+
+// CleanupBackupMountPoints calls engine binary
+// TODO: Deprecated, replaced by gRPC proxy, just to match the interface
+func (e *EngineBinary) CleanupBackupMountPoints() error {
+	return fmt.Errorf(ErrNotImplement)
 }

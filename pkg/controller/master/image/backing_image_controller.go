@@ -1,14 +1,16 @@
 package image
 
 import (
+	"fmt"
 	"reflect"
 
-	lhv1beta1 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta1"
+	lhv1beta2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	"github.com/rancher/norman/condition"
 	"k8s.io/apimachinery/pkg/api/errors"
 
 	harvesterv1beta1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	ctlharvesterv1beta1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
-	ctllhv1beta1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta1"
+	ctllhv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta2"
 	"github.com/harvester/harvester/pkg/ref"
 	"github.com/harvester/harvester/pkg/util"
 )
@@ -17,11 +19,11 @@ import (
 type backingImageHandler struct {
 	vmImages          ctlharvesterv1beta1.VirtualMachineImageClient
 	vmImageCache      ctlharvesterv1beta1.VirtualMachineImageCache
-	backingImages     ctllhv1beta1.BackingImageClient
-	backingImageCache ctllhv1beta1.BackingImageCache
+	backingImages     ctllhv1.BackingImageClient
+	backingImageCache ctllhv1.BackingImageCache
 }
 
-func (h *backingImageHandler) OnChanged(_ string, backingImage *lhv1beta1.BackingImage) (*lhv1beta1.BackingImage, error) {
+func (h *backingImageHandler) OnChanged(_ string, backingImage *lhv1beta2.BackingImage) (*lhv1beta2.BackingImage, error) {
 	if backingImage == nil || backingImage.DeletionTimestamp != nil {
 		return nil, nil
 	}
@@ -35,22 +37,41 @@ func (h *backingImageHandler) OnChanged(_ string, backingImage *lhv1beta1.Backin
 	} else if err != nil {
 		return nil, err
 	}
-	if !harvesterv1beta1.ImageInitialized.IsTrue(vmImage) || !harvesterv1beta1.ImageImported.IsUnknown(vmImage) {
+	// There are two states that we care about here:
+	// - ImageInitialized
+	// - ImageImported
+	// If ImageInitialized isn't yet true, it means there's no backing
+	// image or storage class, so we've got nothing to work with yet and
+	// should return immediately.
+	if !harvesterv1beta1.ImageInitialized.IsTrue(vmImage) {
+		return nil, nil
+	}
+	// If ImageImported is not unknown, it means the backing image has
+	// been imported, and we think we know everything about it, i.e. we've
+	// now been through a series of progress updates during image download,
+	// and those are finally done, so let's not worry about further updates.
+	// TODO: Improve image to keep sync with LH backing image #6936
+	if !harvesterv1beta1.ImageImported.IsUnknown(vmImage) {
 		return nil, nil
 	}
 	toUpdate := vmImage.DeepCopy()
 	for _, status := range backingImage.Status.DiskFileStatusMap {
-		if status.State == lhv1beta1.BackingImageStateFailed {
-			harvesterv1beta1.ImageImported.False(toUpdate)
-			harvesterv1beta1.ImageImported.Reason(toUpdate, "ImportFailed")
-			harvesterv1beta1.ImageImported.Message(toUpdate, status.Message)
+		if status.State == lhv1beta2.BackingImageStateFailed {
+			toUpdate = handleFail(toUpdate, condition.Cond(harvesterv1beta1.ImageImported), fmt.Errorf(status.Message))
 			toUpdate.Status.Progress = status.Progress
-		} else if status.State == lhv1beta1.BackingImageStateReady || status.State == lhv1beta1.BackingImageStateReadyForTransfer {
+		} else if status.State == lhv1beta2.BackingImageStateReady {
 			harvesterv1beta1.ImageImported.True(toUpdate)
 			harvesterv1beta1.ImageImported.Reason(toUpdate, "Imported")
 			harvesterv1beta1.ImageImported.Message(toUpdate, status.Message)
+			// Clear the ImageRetryLimitExceeded reason and message to prevent the error message
+			// from lingering in the Harvester dashboard after multiple image import retries
+			// have failed but eventually succeeded.
+			harvesterv1beta1.ImageRetryLimitExceeded.False(toUpdate)
+			harvesterv1beta1.ImageRetryLimitExceeded.Reason(toUpdate, "")
+			harvesterv1beta1.ImageRetryLimitExceeded.Message(toUpdate, "")
 			toUpdate.Status.Progress = status.Progress
 			toUpdate.Status.Size = backingImage.Status.Size
+			toUpdate.Status.VirtualSize = backingImage.Status.VirtualSize
 		} else if status.Progress != toUpdate.Status.Progress {
 			harvesterv1beta1.ImageImported.Unknown(toUpdate)
 			harvesterv1beta1.ImageImported.Reason(toUpdate, "Importing")

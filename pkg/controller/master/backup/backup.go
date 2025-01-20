@@ -9,30 +9,38 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"reflect"
+	"strconv"
 	"time"
 
-	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
-	"github.com/longhorn/backupstore"
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
-	ctlstoragev1 "github.com/rancher/wrangler/pkg/generated/controllers/storage/v1"
+	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
+
+	// Although we don't use following drivers directly, we need to import them to register drivers.
+	// NFS Ref: https://github.com/longhorn/backupstore/blob/3912081eb7c5708f0027ebbb0da4934537eb9d72/nfs/nfs.go#L47-L51
+	// S3 Ref: https://github.com/longhorn/backupstore/blob/3912081eb7c5708f0027ebbb0da4934537eb9d72/s3/s3.go#L33-L37
+	_ "github.com/longhorn/backupstore/nfs" //nolint
+	_ "github.com/longhorn/backupstore/s3"  //nolint
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
+	ctlstoragev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/storage/v1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/pointer"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	"github.com/harvester/harvester/pkg/config"
+	"github.com/harvester/harvester/pkg/generated/clientset/versioned/scheme"
 	ctlharvesterv1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	ctlkubevirtv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
-	ctllonghornv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta1"
-	ctlsnapshotv1 "github.com/harvester/harvester/pkg/generated/controllers/snapshot.storage.k8s.io/v1beta1"
+	ctllonghornv2 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta2"
+	ctlsnapshotv1 "github.com/harvester/harvester/pkg/generated/controllers/snapshot.storage.k8s.io/v1"
 	"github.com/harvester/harvester/pkg/settings"
 	"github.com/harvester/harvester/pkg/util"
 )
@@ -49,43 +57,57 @@ const (
 	backupTargetAnnotation       = "backup.harvesterhci.io/backup-target"
 	backupBucketNameAnnotation   = "backup.harvesterhci.io/bucket-name"
 	backupBucketRegionAnnotation = "backup.harvesterhci.io/bucket-region"
+
+	defaultFreezeDuration = 1 * time.Second
 )
 
 var vmBackupKind = harvesterv1.SchemeGroupVersion.WithKind(vmBackupKindName)
 
 // RegisterBackup register the vmBackup and volumeSnapshot controller
-func RegisterBackup(ctx context.Context, management *config.Management, opts config.Options) error {
+func RegisterBackup(ctx context.Context, management *config.Management, _ config.Options) error {
 	vmBackups := management.HarvesterFactory.Harvesterhci().V1beta1().VirtualMachineBackup()
 	pv := management.CoreFactory.Core().V1().PersistentVolume()
 	pvc := management.CoreFactory.Core().V1().PersistentVolumeClaim()
 	secrets := management.CoreFactory.Core().V1().Secret()
 	storageClasses := management.StorageFactory.Storage().V1().StorageClass()
 	vms := management.VirtFactory.Kubevirt().V1().VirtualMachine()
-	volumes := management.LonghornFactory.Longhorn().V1beta1().Volume()
-	lhbackups := management.LonghornFactory.Longhorn().V1beta1().Backup()
-	snapshots := management.SnapshotFactory.Snapshot().V1beta1().VolumeSnapshot()
-	snapshotContents := management.SnapshotFactory.Snapshot().V1beta1().VolumeSnapshotContent()
-	snapshotClass := management.SnapshotFactory.Snapshot().V1beta1().VolumeSnapshotClass()
+	vmis := management.VirtFactory.Kubevirt().V1().VirtualMachineInstance()
+	lhbackups := management.LonghornFactory.Longhorn().V1beta2().Backup()
+	volumes := management.LonghornFactory.Longhorn().V1beta2().Volume()
+	snapshots := management.SnapshotFactory.Snapshot().V1().VolumeSnapshot()
+	snapshotContents := management.SnapshotFactory.Snapshot().V1().VolumeSnapshotContent()
+	snapshotClass := management.SnapshotFactory.Snapshot().V1().VolumeSnapshotClass()
+
+	virtSubsrcConfig := rest.CopyConfig(management.RestConfig)
+	virtSubsrcConfig.GroupVersion = &k8sschema.GroupVersion{Group: "subresources.kubevirt.io", Version: "v1"}
+	virtSubsrcConfig.APIPath = "/apis"
+	virtSubsrcConfig.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
+	virtSubresourceClient, err := rest.RESTClientFor(virtSubsrcConfig)
+	if err != nil {
+		return err
+	}
 
 	vmBackupController := &Handler{
-		vmBackups:            vmBackups,
-		vmBackupController:   vmBackups,
-		vmBackupCache:        vmBackups.Cache(),
-		pvCache:              pv.Cache(),
-		pvcCache:             pvc.Cache(),
-		secretCache:          secrets.Cache(),
-		storageClassCache:    storageClasses.Cache(),
-		vms:                  vms,
-		vmsCache:             vms.Cache(),
-		volumeCache:          volumes.Cache(),
-		volumes:              volumes,
-		lhbackupCache:        lhbackups.Cache(),
-		snapshots:            snapshots,
-		snapshotCache:        snapshots.Cache(),
-		snapshotContents:     snapshotContents,
-		snapshotContentCache: snapshotContents.Cache(),
-		snapshotClassCache:   snapshotClass.Cache(),
-		recorder:             management.NewRecorder(backupControllerName, "", ""),
+		vmBackups:                 vmBackups,
+		vmBackupController:        vmBackups,
+		vmBackupCache:             vmBackups.Cache(),
+		pvCache:                   pv.Cache(),
+		pvcCache:                  pvc.Cache(),
+		secretCache:               secrets.Cache(),
+		storageClassCache:         storageClasses.Cache(),
+		vms:                       vms,
+		vmsCache:                  vms.Cache(),
+		vmis:                      vmis,
+		vmisCache:                 vmis.Cache(),
+		lhbackupCache:             lhbackups.Cache(),
+		volumeCache:               volumes.Cache(),
+		snapshots:                 snapshots,
+		snapshotCache:             snapshots.Cache(),
+		snapshotContents:          snapshotContents,
+		snapshotContentCache:      snapshotContents.Cache(),
+		snapshotClassCache:        snapshotClass.Cache(),
+		virtSubresourceRestClient: virtSubresourceClient,
+		recorder:                  management.NewRecorder(backupControllerName, "", ""),
 	}
 
 	vmBackups.OnChange(ctx, backupControllerName, vmBackupController.OnBackupChange)
@@ -96,28 +118,30 @@ func RegisterBackup(ctx context.Context, management *config.Management, opts con
 }
 
 type Handler struct {
-	vmBackups            ctlharvesterv1.VirtualMachineBackupClient
-	vmBackupCache        ctlharvesterv1.VirtualMachineBackupCache
-	vmBackupController   ctlharvesterv1.VirtualMachineBackupController
-	vms                  ctlkubevirtv1.VirtualMachineClient
-	vmsCache             ctlkubevirtv1.VirtualMachineCache
-	pvCache              ctlcorev1.PersistentVolumeCache
-	pvcCache             ctlcorev1.PersistentVolumeClaimCache
-	secretCache          ctlcorev1.SecretCache
-	storageClassCache    ctlstoragev1.StorageClassCache
-	volumeCache          ctllonghornv1.VolumeCache
-	volumes              ctllonghornv1.VolumeClient
-	lhbackupCache        ctllonghornv1.BackupCache
-	snapshots            ctlsnapshotv1.VolumeSnapshotClient
-	snapshotCache        ctlsnapshotv1.VolumeSnapshotCache
-	snapshotContents     ctlsnapshotv1.VolumeSnapshotContentClient
-	snapshotContentCache ctlsnapshotv1.VolumeSnapshotContentCache
-	snapshotClassCache   ctlsnapshotv1.VolumeSnapshotClassCache
-	recorder             record.EventRecorder
+	vmBackups                 ctlharvesterv1.VirtualMachineBackupClient
+	vmBackupCache             ctlharvesterv1.VirtualMachineBackupCache
+	vmBackupController        ctlharvesterv1.VirtualMachineBackupController
+	vms                       ctlkubevirtv1.VirtualMachineClient
+	vmsCache                  ctlkubevirtv1.VirtualMachineCache
+	vmis                      ctlkubevirtv1.VirtualMachineInstanceClient
+	vmisCache                 ctlkubevirtv1.VirtualMachineInstanceCache
+	pvCache                   ctlcorev1.PersistentVolumeCache
+	pvcCache                  ctlcorev1.PersistentVolumeClaimCache
+	secretCache               ctlcorev1.SecretCache
+	storageClassCache         ctlstoragev1.StorageClassCache
+	lhbackupCache             ctllonghornv2.BackupCache
+	volumeCache               ctllonghornv2.VolumeCache
+	snapshots                 ctlsnapshotv1.VolumeSnapshotClient
+	snapshotCache             ctlsnapshotv1.VolumeSnapshotCache
+	snapshotContents          ctlsnapshotv1.VolumeSnapshotContentClient
+	snapshotContentCache      ctlsnapshotv1.VolumeSnapshotContentCache
+	snapshotClassCache        ctlsnapshotv1.VolumeSnapshotClassCache
+	virtSubresourceRestClient rest.Interface
+	recorder                  record.EventRecorder
 }
 
 // OnBackupChange handles vm backup object on change and reconcile vm backup status
-func (h *Handler) OnBackupChange(key string, vmBackup *harvesterv1.VirtualMachineBackup) (*harvesterv1.VirtualMachineBackup, error) {
+func (h *Handler) OnBackupChange(_ string, vmBackup *harvesterv1.VirtualMachineBackup) (*harvesterv1.VirtualMachineBackup, error) {
 	if vmBackup == nil || vmBackup.DeletionTimestamp != nil {
 		return nil, nil
 	}
@@ -135,14 +159,12 @@ func (h *Handler) OnBackupChange(key string, vmBackup *harvesterv1.VirtualMachin
 		if err != nil {
 			return nil, h.setStatusError(vmBackup, err)
 		}
-		// check if the VM is running, if not make sure the volumes are mounted to the host
-		if !sourceVM.Status.Ready || !sourceVM.Status.Created {
-			if err := h.mountLonghornVolumes(sourceVM); err != nil {
-				return nil, h.setStatusError(vmBackup, err)
-			}
+
+		if err = h.initBackup(vmBackup, sourceVM); err != nil {
+			return nil, h.setStatusError(vmBackup, err)
 		}
 
-		return nil, h.initBackup(vmBackup, sourceVM)
+		return nil, nil
 	}
 
 	// TODO, make sure status is initialized, and "Lock" the source VM by adding a finalizer and setting snapshotInProgress in status
@@ -166,7 +188,7 @@ func (h *Handler) OnBackupChange(key string, vmBackup *harvesterv1.VirtualMachin
 }
 
 // OnBackupRemove remove remote vm backup metadata
-func (h *Handler) OnBackupRemove(key string, vmBackup *harvesterv1.VirtualMachineBackup) (*harvesterv1.VirtualMachineBackup, error) {
+func (h *Handler) OnBackupRemove(_ string, vmBackup *harvesterv1.VirtualMachineBackup) (*harvesterv1.VirtualMachineBackup, error) {
 	if vmBackup == nil || vmBackup.Status == nil || vmBackup.Status.BackupTarget == nil {
 		return nil, nil
 	}
@@ -186,7 +208,7 @@ func (h *Handler) OnBackupRemove(key string, vmBackup *harvesterv1.VirtualMachin
 	// when we delete VM Backup and its backup target is not same as current backup target,
 	// VolumeSnapshot and VolumeSnapshotContent may not be deleted immediately.
 	// We should force delete them to avoid that users re-config backup target back and associated LH Backup may be deleted.
-	if !IsBackupTargetSame(vmBackup.Status.BackupTarget, target) {
+	if !util.IsBackupTargetSame(vmBackup.Status.BackupTarget, target) {
 		if err := h.forceDeleteVolumeSnapshotAndContent(vmBackup.Namespace, vmBackup.Status.VolumeBackups); err != nil {
 			return nil, err
 		}
@@ -215,6 +237,112 @@ func (h *Handler) getBackupSource(vmBackup *harvesterv1.VirtualMachineBackup) (*
 	return sourceVM, nil
 }
 
+func (h *Handler) getBackupSourceInstance(vmBackup *harvesterv1.VirtualMachineBackup) (*kubevirtv1.VirtualMachineInstance, error) {
+	if vmBackup.Spec.Source.Kind != kubevirtv1.VirtualMachineGroupVersionKind.Kind {
+		return nil, fmt.Errorf("unsupported source: %+v", vmBackup.Spec.Source)
+	}
+
+	sourceVMI, err := h.vmisCache.Get(vmBackup.Namespace, vmBackup.Spec.Source.Name)
+	if err != nil {
+		return nil, err
+	}
+	if sourceVMI.DeletionTimestamp != nil {
+		return nil, fmt.Errorf("vm %s/%s is being deleted", vmBackup.Namespace, vmBackup.Spec.Source.Name)
+	}
+
+	return sourceVMI, nil
+}
+
+func (h *Handler) tryFreezeFS(backup *harvesterv1.VirtualMachineBackup) error {
+	backup, err := h.withFreezeFSAnnotation(backup)
+	if err != nil {
+		return err
+	}
+
+	freezeText := backup.Annotations[util.AnnotationSnapshotFreezeFS]
+	freeze, err := strconv.ParseBool(freezeText)
+	if err != nil {
+		return fmt.Errorf("annotation %q=%q, should be \"true\" or \"false\"", util.AnnotationSnapshotFreezeFS, freezeText)
+	}
+
+	if !freeze {
+		return nil
+	}
+
+	sourceVMI, err := h.getBackupSourceInstance(backup)
+	if apierrors.IsNotFound(err) {
+		return errors.New("virtual machine must be running for qemu-guest-agent-assisted snapshot/backup")
+	}
+	if err != nil {
+		return err
+	}
+
+	err = h.freezeFS(context.Background(), sourceVMI, defaultFreezeDuration)
+	if err != nil {
+		logrus.WithError(err).Warn("qemu-guest-agent fs-freeze")
+		return errors.New("failed to freeze file system")
+	}
+
+	return nil
+}
+
+func (h *Handler) withFreezeFSAnnotation(backup *harvesterv1.VirtualMachineBackup) (*harvesterv1.VirtualMachineBackup, error) {
+	// Annotation already exists with valid bool text
+	val, ok := backup.Annotations[util.AnnotationSnapshotFreezeFS]
+	if ok && (val == "true" || val == "false") {
+		return backup, nil
+	}
+
+	sourceVMI, err := h.getBackupSourceInstance(backup)
+	if apierrors.IsNotFound(err) {
+		return h.saveFreezeFSAnnotation(backup, false)
+	}
+	if err != nil {
+		return backup, err
+	}
+
+	hasAgent := false
+
+	for _, condition := range sourceVMI.Status.Conditions {
+		if condition.Type == kubevirtv1.VirtualMachineInstanceAgentConnected {
+			hasAgent = condition.Status == corev1.ConditionTrue
+			break
+		}
+	}
+
+	return h.saveFreezeFSAnnotation(backup, hasAgent)
+}
+
+func (h *Handler) saveFreezeFSAnnotation(backup *harvesterv1.VirtualMachineBackup, value bool) (*harvesterv1.VirtualMachineBackup, error) {
+	backupCopy := backup.DeepCopy()
+
+	if backupCopy.Annotations == nil {
+		backupCopy.Annotations = make(map[string]string)
+	}
+
+	backupCopy.Annotations[util.AnnotationSnapshotFreezeFS] = strconv.FormatBool(value)
+
+	return h.vmBackups.Update(backupCopy)
+}
+
+func (h *Handler) freezeFS(ctx context.Context, vmi *kubevirtv1.VirtualMachineInstance, timeout time.Duration) error {
+	body, err := json.Marshal(kubevirtv1.FreezeUnfreezeTimeout{UnfreezeTimeout: &metav1.Duration{
+		Duration: timeout,
+	}})
+	if err != nil {
+		return err
+	}
+
+	res := h.virtSubresourceRestClient.Put().
+		Namespace(vmi.Namespace).
+		Resource("virtualmachineinstances").
+		Name(vmi.Name).
+		SubResource("freeze").
+		Body(body).
+		Do(ctx)
+	return res.Error()
+}
+
 // getVolumeBackups helps to build a list of VolumeBackup upon the volume list of backup VM
 func (h *Handler) getVolumeBackups(backup *harvesterv1.VirtualMachineBackup, vm *kubevirtv1.VirtualMachine) ([]harvesterv1.VolumeBackup, error) {
 	sourceVolumes := vm.Spec.Template.Spec.Volumes
@@ -235,6 +363,9 @@ func (h *Handler) getVolumeBackups(backup *harvesterv1.VirtualMachineBackup, vm 
 			return nil, fmt.Errorf("PV %s is not from CSI driver, cannot take a %s", pv.Name, backup.Spec.Type)
 		}
 
+		storageCapacity := pv.Spec.Capacity[corev1.ResourceStorage]
+		volumeSize := storageCapacity.Value()
+
 		volumeBackupName := fmt.Sprintf("%s-volume-%s", backup.Name, pvcName)
 
 		vb := harvesterv1.VolumeBackup{
@@ -251,6 +382,7 @@ func (h *Handler) getVolumeBackups(backup *harvesterv1.VirtualMachineBackup, vm 
 				Spec: pvc.Spec,
 			},
 			ReadyToUse: pointer.BoolPtr(false),
+			VolumeSize: volumeSize,
 		}
 
 		volumeBackups = append(volumeBackups, vb)
@@ -262,8 +394,18 @@ func (h *Handler) getVolumeBackups(backup *harvesterv1.VirtualMachineBackup, vm 
 // getCSIDriverMap retrieves VolumeSnapshotClassName for each csi driver
 func (h *Handler) getCSIDriverMap(backup *harvesterv1.VirtualMachineBackup) (map[string]string, map[string]snapshotv1.VolumeSnapshotClass, error) {
 	csiDriverConfig := map[string]settings.CSIDriverInfo{}
-	if err := json.Unmarshal([]byte(settings.CSIDriverConfig.Get()), &csiDriverConfig); err != nil {
+	if err := json.Unmarshal([]byte(settings.CSIDriverConfig.GetDefault()), &csiDriverConfig); err != nil {
+		return nil, nil, fmt.Errorf("unmarshal failed, error: %w, value: %s", err, settings.CSIDriverConfig.GetDefault())
+	}
+	tmpDriverConfig := map[string]settings.CSIDriverInfo{}
+	if err := json.Unmarshal([]byte(settings.CSIDriverConfig.Get()), &tmpDriverConfig); err != nil {
 		return nil, nil, fmt.Errorf("unmarshal failed, error: %w, value: %s", err, settings.CSIDriverConfig.Get())
+	}
+
+	for key, val := range tmpDriverConfig {
+		if _, ok := csiDriverConfig[key]; !ok {
+			csiDriverConfig[key] = val
+		}
 	}
 
 	csiDriverVolumeSnapshotClassNameMap := map[string]string{}
@@ -274,23 +416,23 @@ func (h *Handler) getCSIDriverMap(backup *harvesterv1.VirtualMachineBackup) (map
 			continue
 		}
 
-		if driverInfo, ok := csiDriverConfig[csiDriverName]; !ok {
+		driverInfo, ok := csiDriverConfig[csiDriverName]
+		if !ok {
 			return nil, nil, fmt.Errorf("can't find CSI driver %s in setting CSIDriverInfo", csiDriverName)
-		} else {
-			volumeSnapshotClassName := ""
-			switch backup.Spec.Type {
-			case harvesterv1.Backup:
-				volumeSnapshotClassName = driverInfo.BackupVolumeSnapshotClassName
-			case harvesterv1.Snapshot:
-				volumeSnapshotClassName = driverInfo.VolumeSnapshotClassName
-			}
-			volumeSnapshotClass, err := h.snapshotClassCache.Get(volumeSnapshotClassName)
-			if err != nil {
-				return nil, nil, fmt.Errorf("can't find volumeSnapshotClass %s for CSI driver %s", volumeSnapshotClassName, csiDriverName)
-			}
-			csiDriverVolumeSnapshotClassNameMap[csiDriverName] = volumeSnapshotClassName
-			csiDriverVolumeSnapshotClassMap[csiDriverName] = *volumeSnapshotClass
 		}
+		volumeSnapshotClassName := ""
+		switch backup.Spec.Type {
+		case harvesterv1.Backup:
+			volumeSnapshotClassName = driverInfo.BackupVolumeSnapshotClassName
+		case harvesterv1.Snapshot:
+			volumeSnapshotClassName = driverInfo.VolumeSnapshotClassName
+		}
+		volumeSnapshotClass, err := h.snapshotClassCache.Get(volumeSnapshotClassName)
+		if err != nil {
+			return nil, nil, fmt.Errorf("can't find volumeSnapshotClass %s for CSI driver %s", volumeSnapshotClassName, csiDriverName)
+		}
+		csiDriverVolumeSnapshotClassNameMap[csiDriverName] = volumeSnapshotClassName
+		csiDriverVolumeSnapshotClassMap[csiDriverName] = *volumeSnapshotClass
 	}
 
 	return csiDriverVolumeSnapshotClassNameMap, csiDriverVolumeSnapshotClassMap, nil
@@ -451,6 +593,11 @@ func (h *Handler) reconcileVolumeSnapshots(vmBackup *harvesterv1.VirtualMachineB
 		}
 
 		if volumeSnapshot == nil {
+			err := h.tryFreezeFS(vmBackupCpy)
+			if err != nil {
+				return err
+			}
+
 			volumeSnapshotClass := csiDriverVolumeSnapshotClassMap[volumeBackup.CSIDriverName]
 			volumeSnapshot, err = h.createVolumeSnapshot(vmBackupCpy, volumeBackup, &volumeSnapshotClass)
 			if err != nil {
@@ -612,6 +759,10 @@ func (h *Handler) createVolumeSnapshotContent(
 
 func (h *Handler) setStatusError(vmBackup *harvesterv1.VirtualMachineBackup, err error) error {
 	vmBackupCpy := vmBackup.DeepCopy()
+	if vmBackupCpy.Status == nil {
+		vmBackupCpy.Status = &harvesterv1.VirtualMachineBackupStatus{}
+	}
+
 	vmBackupCpy.Status.Error = &harvesterv1.Error{
 		Time:    currentTime(),
 		Message: pointer.StringPtr(err.Error()),
@@ -639,27 +790,16 @@ func (h *Handler) deleteVMBackupMetadata(vmBackup *harvesterv1.VirtualMachineBac
 		return nil
 	}
 
-	if !IsBackupTargetSame(vmBackup.Status.BackupTarget, target) {
+	if !util.IsBackupTargetSame(vmBackup.Status.BackupTarget, target) {
 		return nil
 	}
 
-	if target.Type == settings.S3BackupType {
-		secret, err := h.secretCache.Get(util.LonghornSystemNamespaceName, util.BackupTargetSecretName)
-		if err != nil {
-			return err
-		}
-		os.Setenv(AWSAccessKey, string(secret.Data[AWSAccessKey]))
-		os.Setenv(AWSSecretKey, string(secret.Data[AWSSecretKey]))
-		os.Setenv(AWSEndpoints, string(secret.Data[AWSEndpoints]))
-		os.Setenv(AWSCERT, string(secret.Data[AWSCERT]))
-	}
-
-	bsDriver, err := backupstore.GetBackupStoreDriver(ConstructEndpoint(target))
+	bsDriver, err := util.GetBackupStoreDriver(h.secretCache, target)
 	if err != nil {
 		return err
 	}
 
-	destURL := filepath.Join(metadataFolderPath, getVMBackupMetadataFileName(vmBackup.Namespace, vmBackup.Name))
+	destURL := getVMBackupMetadataFilePath(vmBackup.Namespace, vmBackup.Name)
 	if exist := bsDriver.FileExists(destURL); exist {
 		logrus.Debugf("delete vm backup metadata %s/%s in backup target %s", vmBackup.Namespace, vmBackup.Name, target.Type)
 		return bsDriver.Remove(destURL)
@@ -685,22 +825,11 @@ func (h *Handler) uploadVMBackupMetadata(vmBackup *harvesterv1.VirtualMachineBac
 		return nil
 	}
 
-	if !IsBackupTargetSame(vmBackup.Status.BackupTarget, target) {
+	if !util.IsBackupTargetSame(vmBackup.Status.BackupTarget, target) {
 		return nil
 	}
 
-	if target.Type == settings.S3BackupType {
-		secret, err := h.secretCache.Get(util.LonghornSystemNamespaceName, util.BackupTargetSecretName)
-		if err != nil {
-			return err
-		}
-		os.Setenv(AWSAccessKey, string(secret.Data[AWSAccessKey]))
-		os.Setenv(AWSSecretKey, string(secret.Data[AWSSecretKey]))
-		os.Setenv(AWSEndpoints, string(secret.Data[AWSEndpoints]))
-		os.Setenv(AWSCERT, string(secret.Data[AWSCERT]))
-	}
-
-	bsDriver, err := backupstore.GetBackupStoreDriver(ConstructEndpoint(target))
+	bsDriver, err := util.GetBackupStoreDriver(h.secretCache, target)
 	if err != nil {
 		return err
 	}
@@ -723,7 +852,7 @@ func (h *Handler) uploadVMBackupMetadata(vmBackup *harvesterv1.VirtualMachineBac
 	}
 
 	shouldUpload := true
-	destURL := filepath.Join(metadataFolderPath, getVMBackupMetadataFileName(vmBackup.Namespace, vmBackup.Name))
+	destURL := getVMBackupMetadataFilePath(vmBackup.Namespace, vmBackup.Name)
 	if bsDriver.FileExists(destURL) {
 		if remoteVMBackupMetadata, err := loadBackupMetadataInBackupTarget(destURL, bsDriver); err != nil {
 			return err
@@ -739,6 +868,16 @@ func (h *Handler) uploadVMBackupMetadata(vmBackup *harvesterv1.VirtualMachineBac
 		}
 	}
 
+	vmBackupCopy := vmBackup.DeepCopy()
+	updateBackupCondition(vmBackupCopy, harvesterv1.Condition{
+		Type:               harvesterv1.BackupConditionMetadataReady,
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: currentTime().Format(time.RFC3339),
+	})
+	if !reflect.DeepEqual(vmBackup.Status, vmBackupCopy.Status) {
+		_, err = h.vmBackups.Update(vmBackupCopy)
+		return err
+	}
 	return nil
 }
 

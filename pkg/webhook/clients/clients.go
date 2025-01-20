@@ -4,31 +4,39 @@ import (
 	"context"
 
 	ctlfleetv1 "github.com/rancher/rancher/pkg/generated/controllers/fleet.cattle.io"
-	"github.com/rancher/wrangler/pkg/clients"
-	storagev1 "github.com/rancher/wrangler/pkg/generated/controllers/storage"
-	"github.com/rancher/wrangler/pkg/schemes"
+	rancherv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io"
+	"github.com/rancher/wrangler/v3/pkg/clients"
+	ctrlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core"
+	storagev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/storage"
+	"github.com/rancher/wrangler/v3/pkg/schemes"
 	v1 "k8s.io/api/admissionregistration/v1"
 	"k8s.io/client-go/rest"
 
 	ctlclusterv1 "github.com/harvester/harvester/pkg/generated/controllers/cluster.x-k8s.io"
+	ctlharvestercorev1 "github.com/harvester/harvester/pkg/generated/controllers/core"
 	ctlharvesterv1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io"
 	ctlcniv1 "github.com/harvester/harvester/pkg/generated/controllers/k8s.cni.cncf.io"
 	ctlkubevirtv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io"
 	ctllonghornv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io"
+	ctlnetwork "github.com/harvester/harvester/pkg/generated/controllers/network.harvesterhci.io"
 	ctlsnapshotv1 "github.com/harvester/harvester/pkg/generated/controllers/snapshot.storage.k8s.io"
 )
 
 type Clients struct {
 	clients.Clients
 
-	HarvesterFactory *ctlharvesterv1.Factory
-	KubevirtFactory  *ctlkubevirtv1.Factory
-	CNIFactory       *ctlcniv1.Factory
-	SnapshotFactory  *ctlsnapshotv1.Factory
-	FleetFactory     *ctlfleetv1.Factory
-	StorageFactory   *storagev1.Factory
-	LonghornFactory  *ctllonghornv1.Factory
-	ClusterFactory   *ctlclusterv1.Factory
+	HarvesterFactory         *ctlharvesterv1.Factory
+	HarvesterCoreFactory     *ctlharvestercorev1.Factory
+	KubevirtFactory          *ctlkubevirtv1.Factory
+	CNIFactory               *ctlcniv1.Factory
+	SnapshotFactory          *ctlsnapshotv1.Factory
+	FleetFactory             *ctlfleetv1.Factory
+	StorageFactory           *storagev1.Factory
+	LonghornFactory          *ctllonghornv1.Factory
+	ClusterFactory           *ctlclusterv1.Factory
+	RancherManagementFactory *rancherv3.Factory
+	CoreFactory              *ctrlcorev1.Factory
+	HarvesterNetworkFactory  *ctlnetwork.Factory
 }
 
 func New(ctx context.Context, rest *rest.Config, threadiness int) (*Clients, error) {
@@ -47,6 +55,15 @@ func New(ctx context.Context, rest *rest.Config, threadiness int) (*Clients, err
 	}
 
 	if err = harvesterFactory.Start(ctx, threadiness); err != nil {
+		return nil, err
+	}
+
+	harvesterCoreFactory, err := ctlharvestercorev1.NewFactoryFromConfigWithOptions(rest, clients.FactoryOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = harvesterCoreFactory.Start(ctx, threadiness); err != nil {
 		return nil, err
 	}
 
@@ -105,15 +122,38 @@ func New(ctx context.Context, rest *rest.Config, threadiness int) (*Clients, err
 		return nil, err
 	}
 
+	rancherFactory, err := rancherv3.NewFactoryFromConfigWithOptions(rest, clients.FactoryOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	coreFactory, err := ctrlcorev1.NewFactoryFromConfigWithOptions(rest, clients.FactoryOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	harvesterNetworkFactory, err := ctlnetwork.NewFactoryFromConfigWithOptions(rest, (*ctlnetwork.FactoryOptions)(clients.FactoryOptions))
+	if err != nil {
+		return nil, err
+	}
+
+	if err = harvesterNetworkFactory.Start(ctx, threadiness); err != nil {
+		return nil, err
+	}
+
 	return &Clients{
-		Clients:          *clients,
-		HarvesterFactory: harvesterFactory,
-		KubevirtFactory:  kubevirtFactory,
-		CNIFactory:       cniFactory,
-		SnapshotFactory:  snapshotFactory,
-		FleetFactory:     fleetFactory,
-		StorageFactory:   storageFactory,
-		LonghornFactory:  longhornFactory,
-		ClusterFactory:   clusterFactory,
+		Clients:                  *clients,
+		HarvesterFactory:         harvesterFactory,
+		HarvesterCoreFactory:     harvesterCoreFactory,
+		KubevirtFactory:          kubevirtFactory,
+		CNIFactory:               cniFactory,
+		SnapshotFactory:          snapshotFactory,
+		FleetFactory:             fleetFactory,
+		StorageFactory:           storageFactory,
+		LonghornFactory:          longhornFactory,
+		ClusterFactory:           clusterFactory,
+		RancherManagementFactory: rancherFactory,
+		CoreFactory:              coreFactory,
+		HarvesterNetworkFactory:  harvesterNetworkFactory,
 	}, nil
 }

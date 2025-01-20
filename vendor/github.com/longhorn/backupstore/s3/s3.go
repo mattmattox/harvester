@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/longhorn/backupstore"
-	"github.com/longhorn/backupstore/http"
 	"github.com/sirupsen/logrus"
+
+	"github.com/longhorn/backupstore"
 )
 
 var (
@@ -22,7 +22,7 @@ var (
 type BackupStoreDriver struct {
 	destURL string
 	path    string
-	service Service
+	service *service
 }
 
 const (
@@ -36,8 +36,6 @@ func init() {
 }
 
 func initFunc(destURL string) (backupstore.BackupStoreDriver, error) {
-	b := &BackupStoreDriver{}
-
 	u, err := url.Parse(destURL)
 	if err != nil {
 		return nil, err
@@ -47,25 +45,15 @@ func initFunc(destURL string) (backupstore.BackupStoreDriver, error) {
 		return nil, fmt.Errorf("BUG: Why dispatch %v to %v?", u.Scheme, KIND)
 	}
 
-	if u.User != nil {
-		b.service.Region = u.Host
-		b.service.Bucket = u.User.Username()
-	} else {
-		//We would depends on AWS_REGION environment variable
-		b.service.Bucket = u.Host
-	}
-	b.path = u.Path
-	if b.service.Bucket == "" || b.path == "" {
-		return nil, fmt.Errorf("Invalid URL. Must be either s3://bucket@region/path/, or s3://bucket/path")
+	b := &BackupStoreDriver{}
+	b.service, err = newService(u)
+	if err != nil {
+		return nil, err
 	}
 
-	// add custom ca to http client that is used by s3 service
-	if customCerts := getCustomCerts(); customCerts != nil {
-		client, err := http.GetClientWithCustomCerts(customCerts)
-		if err != nil {
-			return nil, err
-		}
-		b.service.Client = client
+	b.path = u.Path
+	if b.service.Bucket == "" || b.path == "" {
+		return nil, fmt.Errorf("invalid URL. Must be either s3://bucket@region/path/, or s3://bucket/path")
 	}
 
 	//Leading '/' can cause mystery problems for s3
@@ -82,7 +70,7 @@ func initFunc(destURL string) (backupstore.BackupStoreDriver, error) {
 	}
 	b.destURL += "/" + b.path
 
-	log.Debugf("Loaded driver for %v", b.destURL)
+	log.Infof("Loaded driver for %v", b.destURL)
 	return b, nil
 }
 
@@ -105,16 +93,27 @@ func (s *BackupStoreDriver) GetURL() string {
 }
 
 func (s *BackupStoreDriver) updatePath(path string) string {
-	return filepath.Join(s.path, path)
+	joinedPath := filepath.Join(s.path, path)
+
+	// The filepath.Join removes the trailing slash when joining paths, so we
+	// need to check and add back the trailing slash if it exists in the input
+	// path.
+	if !strings.HasSuffix(path, "/") {
+		return joinedPath
+	}
+	return joinedPath + "/"
 }
 
 func (s *BackupStoreDriver) List(listPath string) ([]string, error) {
 	var result []string
 
-	path := s.updatePath(listPath) + "/"
+	path := s.updatePath(listPath)
+	if !strings.HasSuffix(path, "/") {
+		path += "/"
+	}
 	contents, prefixes, err := s.service.ListObjects(path, "/")
 	if err != nil {
-		log.Error("Fail to list s3: ", err)
+		log.WithError(err).Error("Failed to list s3")
 		return result, err
 	}
 
@@ -195,11 +194,17 @@ func (s *BackupStoreDriver) Download(src, dst string) error {
 	if _, err := os.Stat(dst); err != nil {
 		os.Remove(dst)
 	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), os.ModeDir|0700); err != nil {
+		return err
+	}
+
 	f, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+
 	path := s.updatePath(src)
 	rc, err := s.service.GetObject(path)
 	if err != nil {
@@ -208,8 +213,5 @@ func (s *BackupStoreDriver) Download(src, dst string) error {
 	defer rc.Close()
 
 	_, err = io.Copy(f, rc)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }

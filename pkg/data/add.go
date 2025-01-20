@@ -15,6 +15,9 @@ func Init(ctx context.Context, mgmtCtx *config.Management, options config.Option
 	if err := addPublicNamespace(mgmtCtx.Apply); err != nil {
 		return err
 	}
+	if err := addFleetDefaultNamespace(mgmtCtx.Apply); err != nil {
+		return err
+	}
 	if err := addAPIService(mgmtCtx.Apply, options.Namespace); err != nil {
 		return err
 	}
@@ -26,8 +29,5 @@ func Init(ctx context.Context, mgmtCtx *config.Management, options config.Option
 	if err := createTemplates(mgmtCtx, publicNamespace); err != nil {
 		return err
 	}
-	if err := createSecrets(mgmtCtx); err != nil {
-		return err
-	}
-	return nil
+	return createSecrets(mgmtCtx)
 }

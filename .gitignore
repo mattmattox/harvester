@@ -9,3 +9,7 @@
 api.test
 .docker
 .nocalhost
+package/harvester
+package/harvester-webhook
+package/upgrade/upgrade-helper
+package/upgrade/addons

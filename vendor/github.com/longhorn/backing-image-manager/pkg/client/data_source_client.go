@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/longhorn/backing-image-manager/api"
 	"github.com/longhorn/backing-image-manager/pkg/util"
+	"github.com/pkg/errors"
 )
 
 type DataSourceClient struct {
@@ -33,7 +33,7 @@ func (client *DataSourceClient) Get() (*api.DataSourceInfo, error) {
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
 	}
@@ -71,9 +71,9 @@ func (client *DataSourceClient) Transfer() error {
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
+		return errors.Wrapf(err, "%v, failed to read the response body", util.GetHTTPClientErrorPrefix(resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("%s or http.StatusNotFound(%d), response body content: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), http.StatusNotFound, string(bodyContent))
@@ -127,9 +127,9 @@ func (client *DataSourceClient) Upload(filePath string) error {
 	}
 	defer resp.Body.Close()
 
-	bodyContent, err := ioutil.ReadAll(resp.Body)
+	bodyContent, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%s, failed to read the response body: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), err)
+		return errors.Wrapf(err, "%v, failed to read the response body", util.GetHTTPClientErrorPrefix(resp.StatusCode))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s, response body content: %v", util.GetHTTPClientErrorPrefix(resp.StatusCode), string(bodyContent))

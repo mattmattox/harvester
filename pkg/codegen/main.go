@@ -7,19 +7,27 @@ import (
 	"path/filepath"
 
 	cniv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
-	storagev1beta1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
-	longhornv1 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta1"
-	monitoring "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring"
+	whereaboutscniv1 "github.com/k8snetworkplumbingwg/whereabouts/pkg/api/whereabouts.cni.cncf.io/v1alpha1"
+	loggingv1 "github.com/kube-logging/logging-operator/pkg/sdk/logging/api/v1beta1"
+	storagesnapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
+	longhornv1 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	"github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	catalogv1 "github.com/rancher/rancher/pkg/apis/catalog.cattle.io/v1"
+	mgmtv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	upgradev1 "github.com/rancher/system-upgrade-controller/pkg/apis/upgrade.cattle.io/v1"
-	controllergen "github.com/rancher/wrangler/pkg/controller-gen"
-	"github.com/rancher/wrangler/pkg/controller-gen/args"
+	controllergen "github.com/rancher/wrangler/v3/pkg/controller-gen"
+	"github.com/rancher/wrangler/v3/pkg/controller-gen/args"
 	"github.com/sirupsen/logrus"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	kubevirtv1 "kubevirt.io/api/core/v1"
-	capi "sigs.k8s.io/cluster-api/api/v1alpha4"
+	capi "sigs.k8s.io/cluster-api/api/v1beta1"
 
+	networkv1 "github.com/harvester/harvester-network-controller/pkg/apis/network.harvesterhci.io/v1beta1"
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 )
 
@@ -35,6 +43,7 @@ func main() {
 					harvesterv1.Preference{},
 					harvesterv1.Setting{},
 					harvesterv1.Upgrade{},
+					harvesterv1.UpgradeLog{},
 					harvesterv1.Version{},
 					harvesterv1.VirtualMachineBackup{},
 					harvesterv1.VirtualMachineRestore{},
@@ -43,8 +52,19 @@ func main() {
 					harvesterv1.VirtualMachineTemplateVersion{},
 					harvesterv1.SupportBundle{},
 					harvesterv1.Addon{},
+					harvesterv1.ResourceQuota{},
+					harvesterv1.ScheduleVMBackup{},
 				},
 				GenerateTypes:   true,
+				GenerateClients: true,
+			},
+			loggingv1.GroupVersion.Group: {
+				Types: []interface{}{
+					loggingv1.Logging{},
+					loggingv1.ClusterFlow{},
+					loggingv1.ClusterOutput{},
+				},
+				GenerateTypes:   false,
 				GenerateClients: true,
 			},
 			kubevirtv1.SchemeGroupVersion.Group: {
@@ -52,6 +72,7 @@ func main() {
 					kubevirtv1.VirtualMachine{},
 					kubevirtv1.VirtualMachineInstance{},
 					kubevirtv1.VirtualMachineInstanceMigration{},
+					kubevirtv1.KubeVirt{},
 				},
 				GenerateTypes:   false,
 				GenerateClients: true,
@@ -63,6 +84,13 @@ func main() {
 				GenerateTypes:   false,
 				GenerateClients: true,
 			},
+			whereaboutscniv1.SchemeGroupVersion.Group: {
+				Types: []interface{}{
+					whereaboutscniv1.IPPool{},
+				},
+				GenerateTypes:   false,
+				GenerateClients: true,
+			},
 			networkingv1.SchemeGroupVersion.Group: {
 				Types: []interface{}{
 					networkingv1.Ingress{},
@@ -70,22 +98,34 @@ func main() {
 				GenerateTypes:   false,
 				GenerateClients: true,
 			},
-			storagev1beta1.SchemeGroupVersion.Group: {
+			storagev1.SchemeGroupVersion.Group: {
 				Types: []interface{}{
-					storagev1beta1.VolumeSnapshotClass{},
-					storagev1beta1.VolumeSnapshot{},
-					storagev1beta1.VolumeSnapshotContent{},
+					storagev1.VolumeAttachment{},
+				},
+				GenerateTypes:   false,
+				GenerateClients: true,
+			},
+			storagesnapshotv1.SchemeGroupVersion.Group: {
+				Types: []interface{}{
+					storagesnapshotv1.VolumeSnapshotClass{},
+					storagesnapshotv1.VolumeSnapshot{},
+					storagesnapshotv1.VolumeSnapshotContent{},
 				},
 				GenerateTypes:   false,
 				GenerateClients: true,
 			},
 			longhornv1.SchemeGroupVersion.Group: {
 				Types: []interface{}{
+					longhornv1.Node{},
 					longhornv1.BackingImage{},
 					longhornv1.BackingImageDataSource{},
 					longhornv1.Volume{},
 					longhornv1.Setting{},
 					longhornv1.Backup{},
+					longhornv1.BackupBackingImage{},
+					longhornv1.Replica{},
+					longhornv1.Engine{},
+					longhornv1.Snapshot{},
 				},
 				GenerateClients: true,
 			},
@@ -107,10 +147,29 @@ func main() {
 			corev1.GroupName: {
 				Types: []interface{}{
 					corev1.PersistentVolume{},
+					corev1.ResourceQuota{},
 				},
-				InformersPackage: "k8s.io/client-go/informers",
-				ClientSetPackage: "k8s.io/client-go/kubernetes",
-				ListersPackage:   "k8s.io/client-go/listers",
+			},
+			batchv1.GroupName: {
+				Types: []interface{}{
+					batchv1.CronJob{},
+				},
+				GenerateTypes:   false,
+				GenerateClients: true,
+			},
+			catalogv1.SchemeGroupVersion.Group: {
+				Types: []interface{}{
+					catalogv1.App{},
+				},
+				GenerateTypes:   false,
+				GenerateClients: true,
+			},
+			mgmtv3.SchemeGroupVersion.Group: {
+				Types: []interface{}{
+					mgmtv3.ManagedChart{},
+				},
+				GenerateTypes:   false,
+				GenerateClients: true,
 			},
 			monitoring.GroupName: {
 				Types: []interface{}{
@@ -119,10 +178,25 @@ func main() {
 				},
 				GenerateClients: true,
 			},
+			appsv1.GroupName: {
+				Types: []interface{}{
+					appsv1.ControllerRevision{},
+				},
+			},
+			networkv1.SchemeGroupVersion.Group: {
+				Types: []interface{}{
+					networkv1.VlanConfig{},
+					networkv1.VlanStatus{},
+					networkv1.ClusterNetwork{},
+				},
+				GenerateTypes:   false,
+				GenerateClients: true,
+			},
 		},
 	})
 	nadControllerInterfaceRefactor()
 	capiWorkaround()
+	loggingWorkaround()
 }
 
 // NB(GC), nadControllerInterfaceRefactor modify the generated resource name of NetworkAttachmentDefinition controller using a dash-separator,
@@ -145,16 +219,49 @@ func nadControllerInterfaceRefactor() {
 
 // capiWorkaround replaces the variable `SchemeGroupVersion` with `GroupVersion` in clusters.cluster.x-k8s.io client because
 // `SchemeGroupVersion` is not declared in the vendor package but wrangler uses it.
-// https://github.com/kubernetes-sigs/cluster-api/blob/56f9e9db7a9e9ca625ffe4bdc1e5e93a14d5e96c/api/v1alpha4/groupversion_info.go#L29
+// https://github.com/kubernetes-sigs/cluster-api/blob/56f9e9db7a9e9ca625ffe4bdc1e5e93a14d5e96c/api/v1beta1/groupversion_info.go#L29
 func capiWorkaround() {
-	absPath, _ := filepath.Abs("pkg/generated/clientset/versioned/typed/cluster.x-k8s.io/v1alpha4/cluster.x-k8s.io_client.go")
-	input, err := ioutil.ReadFile(absPath)
-	if err != nil {
-		logrus.Fatalf("failed to read the clusters.cluster.x-k8s.io client file: %v", err)
+	files := []string{
+		"pkg/generated/clientset/versioned/typed/cluster.x-k8s.io/v1beta1/cluster.x-k8s.io_client.go",
+		"pkg/generated/clientset/versioned/typed/cluster.x-k8s.io/v1beta1/fake/fake_machine.go",
+		"pkg/generated/clientset/versioned/typed/cluster.x-k8s.io/v1beta1/fake/fake_cluster.go",
 	}
-	output := bytes.Replace(input, []byte("v1alpha4.SchemeGroupVersion"), []byte("v1alpha4.GroupVersion"), -1)
 
-	if err = ioutil.WriteFile(absPath, output, 0644); err != nil {
-		logrus.Fatalf("failed to update the clusters.cluster.x-k8s.io client file: %v", err)
+	// Replace the variable `SchemeGroupVersion` with `GroupVersion` in the above files path
+	for _, absPath := range files {
+		input, err := ioutil.ReadFile(absPath)
+		if err != nil {
+			logrus.Fatalf("failed to read the clusters.cluster.x-k8s.io client file: %v", err)
+		}
+		output := bytes.Replace(input, []byte("v1beta1.SchemeGroupVersion"), []byte("v1beta1.GroupVersion"), -1)
+
+		if err = ioutil.WriteFile(absPath, output, 0644); err != nil {
+			logrus.Fatalf("failed to update the clusters.cluster.x-k8s.io client file: %v", err)
+		}
+	}
+}
+
+// loggingWorkaround replaces the variable `SchemeGroupVersion` with `GroupVersion` in logging.banzaicloud.io client because
+// `SchemeGroupVersion` is not declared in the vendor package but wrangler uses it.
+// https://github.com/banzaicloud/logging-operator/blob/e935c5d60604036a6f40cd4ab991420c6eaf096b/pkg/sdk/logging/api/v1beta1/groupversion_info.go#L27
+func loggingWorkaround() {
+	files := []string{
+		"pkg/generated/clientset/versioned/typed/logging.banzaicloud.io/v1beta1/logging.banzaicloud.io_client.go",
+		"pkg/generated/clientset/versioned/typed/logging.banzaicloud.io/v1beta1/fake/fake_clusterflow.go",
+		"pkg/generated/clientset/versioned/typed/logging.banzaicloud.io/v1beta1/fake/fake_clusteroutput.go",
+		"pkg/generated/clientset/versioned/typed/logging.banzaicloud.io/v1beta1/fake/fake_logging.go",
+	}
+
+	// Replace the variable `SchemeGroupVersion` with `GroupVersion` in the above files path
+	for _, absPath := range files {
+		input, err := ioutil.ReadFile(absPath)
+		if err != nil {
+			logrus.Fatalf("failed to read the logging.banzaicloud.io client file: %v", err)
+		}
+		output := bytes.Replace(input, []byte("v1beta1.SchemeGroupVersion"), []byte("v1beta1.GroupVersion"), -1)
+
+		if err = ioutil.WriteFile(absPath, output, 0644); err != nil {
+			logrus.Fatalf("failed to update the logging.banzaicloud.io client file: %v", err)
+		}
 	}
 }

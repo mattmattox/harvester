@@ -11,6 +11,7 @@ import (
 
 	"github.com/longhorn/longhorn-manager/datastore"
 	"github.com/longhorn/longhorn-manager/types"
+	"github.com/longhorn/longhorn-manager/util"
 
 	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 )
@@ -31,7 +32,7 @@ func (m *VolumeManager) ListEngineImagesSorted() ([]*longhorn.EngineImage, error
 	}
 
 	engineImages := make([]*longhorn.EngineImage, len(engineImageMap))
-	engineImageNames, err := sortKeys(engineImageMap)
+	engineImageNames, err := util.SortKeys(engineImageMap)
 	if err != nil {
 		return []*longhorn.EngineImage{}, err
 	}
@@ -66,7 +67,7 @@ func (m *VolumeManager) CreateEngineImage(image string) (*longhorn.EngineImage, 
 	if err != nil {
 		return nil, err
 	}
-	logrus.Debugf("Created engine image %v (%v)", ei.Name, ei.Spec.Image)
+	logrus.Infof("Created engine image %v (%v)", ei.Name, ei.Spec.Image)
 	return ei, nil
 }
 
@@ -91,7 +92,7 @@ func (m *VolumeManager) DeleteEngineImageByName(name string) error {
 	if err := m.ds.DeleteEngineImage(name); err != nil {
 		return err
 	}
-	logrus.Debugf("Deleted engine image %v (%v)", ei.Name, ei.Spec.Image)
+	logrus.Infof("Deleted engine image %v (%v)", ei.Name, ei.Spec.Image)
 	return nil
 }
 

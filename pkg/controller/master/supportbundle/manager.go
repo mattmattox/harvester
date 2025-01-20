@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	rancherv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	ctlappsv1 "github.com/rancher/wrangler/pkg/generated/controllers/apps/v1"
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	ctlappsv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/apps/v1"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -19,10 +20,14 @@ import (
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	"github.com/harvester/harvester/pkg/controller/master/supportbundle/types"
 	"github.com/harvester/harvester/pkg/settings"
+	supportBundleUtil "github.com/harvester/harvester/pkg/util/supportbundle"
 )
 
 const (
 	HarvesterServiceAccount = "harvester"
+	//AdditionalTaintToleration value when passed to SUPPORT_BUNDLE_TAINT_TOLERATION env variable, is processed as v1.TolerationOpExists
+	//which allows the support-bundle-kit pods to be scheduled on nodes with custom taints
+	AdditionalTaintToleration = ":"
 )
 
 type Manager struct {
@@ -40,8 +45,20 @@ func (m *Manager) getManagerName(sb *harvesterv1.SupportBundle) string {
 }
 
 func (m *Manager) Create(sb *harvesterv1.SupportBundle, image string, pullPolicy corev1.PullPolicy) error {
-	deployName := m.getManagerName(sb)
+
+	var (
+		nodeTimeout time.Duration
+		deployName  string
+	)
+
+	deployName = m.getManagerName(sb)
 	logrus.Debugf("creating deployment %s with image %s", deployName, image)
+
+	if expiration := settings.SupportBundleNodeCollectionTimeout.GetInt(); expiration == 0 {
+		nodeTimeout = time.Duration(supportBundleUtil.SupportBundleNodeCollectionTimeoutDefault) * time.Minute
+	} else {
+		nodeTimeout = time.Duration(expiration) * time.Minute
+	}
 
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -88,6 +105,14 @@ func (m *Manager) Create(sb *harvesterv1.SupportBundle, image string, pullPolicy
 									Value: sb.Name,
 								},
 								{
+									Name:  "SUPPORT_BUNDLE_DESCRIPTION",
+									Value: sb.Spec.Description,
+								},
+								{
+									Name:  "SUPPORT_BUNDLE_ISSUE_URL",
+									Value: sb.Spec.IssueURL,
+								},
+								{
 									Name:  "SUPPORT_BUNDLE_DEBUG",
 									Value: "true",
 								},
@@ -119,6 +144,14 @@ func (m *Manager) Create(sb *harvesterv1.SupportBundle, image string, pullPolicy
 									Name:  "SUPPORT_BUNDLE_EXTRA_COLLECTORS",
 									Value: m.getExtraCollectors(),
 								},
+								{
+									Name:  "SUPPORT_BUNDLE_TAINT_TOLERATION",
+									Value: AdditionalTaintToleration,
+								},
+								{
+									Name:  "SUPPORT_BUNDLE_NODE_TIMEOUT",
+									Value: nodeTimeout.String(),
+								},
 							},
 							Ports: []corev1.ContainerPort{
 								{
@@ -148,6 +181,10 @@ func (m *Manager) getCollectNamespaces() string {
 		"harvester-system",
 		"local",
 		"longhorn-system",
+		"cattle-logging-system",
+		// namespace for CAPI system components
+		// https://github.com/rancher/rancher/blob/4ac81b66b0f971548be78f2d1c72ecb906171a0b/pkg/controllers/dashboard/systemcharts/controller.go#L176
+		"cattle-provisioning-capi-system",
 	}
 
 	extraNamespaces := settings.SupportBundleNamespaces.Get()

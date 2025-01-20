@@ -10,18 +10,18 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	lhv1beta1 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta1"
+	lhv1beta2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 	"github.com/pkg/errors"
 	"github.com/rancher/apiserver/pkg/apierror"
 	"github.com/rancher/apiserver/pkg/types"
-	"github.com/rancher/wrangler/pkg/schemas/validation"
+	"github.com/rancher/wrangler/v3/pkg/schemas/validation"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apisv1beta1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	"github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
-	ctllhv1beta1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta1"
+	ctllhv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta2"
 	"github.com/harvester/harvester/pkg/util"
 )
 
@@ -36,20 +36,24 @@ func Formatter(request *types.APIRequest, resource *types.RawResource) {
 		return
 	}
 
-	if resource.APIObject.Data().String("spec", "sourceType") == apisv1beta1.VirtualMachineImageSourceTypeUpload {
+	sourceTypeStr := resource.APIObject.Data().String("spec", "sourceType")
+	sourceType := apisv1beta1.VirtualMachineImageSourceType(sourceTypeStr)
+
+	if sourceType == apisv1beta1.VirtualMachineImageSourceTypeUpload {
 		resource.AddAction(request, actionUpload)
 	}
 }
 
-type ImageHandler struct {
+type Handler struct {
 	httpClient                  http.Client
 	Images                      v1beta1.VirtualMachineImageClient
 	ImageCache                  v1beta1.VirtualMachineImageCache
-	BackingImageDataSources     ctllhv1beta1.BackingImageDataSourceClient
-	BackingImageDataSourceCache ctllhv1beta1.BackingImageDataSourceCache
+	BackingImageDataSources     ctllhv1.BackingImageDataSourceClient
+	BackingImageDataSourceCache ctllhv1.BackingImageDataSourceCache
+	BackingImageCache           ctllhv1.BackingImageCache
 }
 
-func (h ImageHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+func (h Handler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if err := h.do(rw, req); err != nil {
 		status := http.StatusInternalServerError
 		if e, ok := err.(*apierror.APIError); ok {
@@ -62,8 +66,8 @@ func (h ImageHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	rw.WriteHeader(http.StatusOK)
 }
 
-func (h ImageHandler) do(rw http.ResponseWriter, req *http.Request) error {
-	vars := mux.Vars(req)
+func (h Handler) do(rw http.ResponseWriter, req *http.Request) error {
+	vars := util.EncodeVars(mux.Vars(req))
 	if req.Method == http.MethodGet {
 		return h.doGet(vars["link"], rw, req)
 	} else if req.Method == http.MethodPost {
@@ -73,7 +77,7 @@ func (h ImageHandler) do(rw http.ResponseWriter, req *http.Request) error {
 	return apierror.NewAPIError(validation.InvalidAction, fmt.Sprintf("Unsupported method %s", req.Method))
 }
 
-func (h ImageHandler) doGet(link string, rw http.ResponseWriter, req *http.Request) error {
+func (h Handler) doGet(link string, rw http.ResponseWriter, req *http.Request) error {
 	switch link {
 	case actionDownload:
 		return h.downloadImage(rw, req)
@@ -82,7 +86,7 @@ func (h ImageHandler) doGet(link string, rw http.ResponseWriter, req *http.Reque
 	}
 }
 
-func (h ImageHandler) doPost(action string, rw http.ResponseWriter, req *http.Request) error {
+func (h Handler) doPost(action string, rw http.ResponseWriter, req *http.Request) error {
 	switch action {
 	case actionUpload:
 		return h.uploadImage(rw, req)
@@ -91,31 +95,40 @@ func (h ImageHandler) doPost(action string, rw http.ResponseWriter, req *http.Re
 	}
 }
 
-func (h ImageHandler) downloadImage(rw http.ResponseWriter, req *http.Request) error {
-	vars := mux.Vars(req)
+func (h Handler) downloadImage(rw http.ResponseWriter, req *http.Request) error {
+	vars := util.EncodeVars(mux.Vars(req))
 	namespace := vars["namespace"]
 	name := vars["name"]
 	vmImage, err := h.Images.Get(namespace, name, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("Failed to get VMImage with name(%s), ns(%s), error: %w", name, namespace, err)
+		return fmt.Errorf("failed to get VMImage with name(%s), ns(%s), error: %w", name, namespace, err)
 	}
 
-	targetFileName := vmImage.Spec.DisplayName
-	bkimgName := fmt.Sprintf("%s-%s", namespace, name)
-	downloadUrl := fmt.Sprintf("%s/backingimages/%s/download", util.LonghornDefaultManagerURL, bkimgName)
-	downloadReq, err := http.NewRequestWithContext(req.Context(), http.MethodGet, downloadUrl, nil)
+	// Only forbid encrypted image. But, permit decrypted image.
+	if vmImage.Spec.SecurityParameters != nil && vmImage.Spec.SecurityParameters.CryptoOperation == apisv1beta1.VirtualMachineImageCryptoOperationTypeEncrypt {
+		return fmt.Errorf("encrypted image is not supported for download")
+	}
+
+	biName, err := util.GetBackingImageName(h.BackingImageCache, vmImage)
 	if err != nil {
-		return fmt.Errorf("Failed to create the download request with backing Image(%s): %w", bkimgName, err)
+		return fmt.Errorf("failed to get backing image name for VMImage %s/%s, error: %w", namespace, name, err)
+	}
+
+	targetFileName := fmt.Sprintf("%s.gz", vmImage.Spec.DisplayName)
+	downloadURL := fmt.Sprintf("%s/backingimages/%s/download", util.LonghornDefaultManagerURL, biName)
+	downloadReq, err := http.NewRequestWithContext(req.Context(), http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create the download request with backing Image(%s): %w", biName, err)
 	}
 
 	downloadResp, err := h.httpClient.Do(downloadReq)
 	if err != nil {
-		return fmt.Errorf("Failed to send the download request with backing Image(%s): %w", bkimgName, err)
+		return fmt.Errorf("failed to send the download request with backing Image(%s): %w", biName, err)
 	}
 	defer downloadResp.Body.Close()
 
 	if downloadResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Failed with unexpected http Status code %d.", downloadResp.StatusCode)
+		return fmt.Errorf("failed with unexpected http Status code %d", downloadResp.StatusCode)
 	}
 
 	rw.Header().Set("Content-Disposition", "attachment; filename="+targetFileName)
@@ -125,14 +138,14 @@ func (h ImageHandler) downloadImage(rw http.ResponseWriter, req *http.Request) e
 	}
 
 	if _, err := io.Copy(rw, downloadResp.Body); err != nil {
-		return fmt.Errorf("Failed to copy download content to target(%s), err: %w", targetFileName, err)
+		return fmt.Errorf("failed to copy download content to target(%s), err: %w", targetFileName, err)
 	}
 
 	return nil
 }
 
-func (h ImageHandler) uploadImage(rw http.ResponseWriter, req *http.Request) error {
-	vars := mux.Vars(req)
+func (h Handler) uploadImage(_ http.ResponseWriter, req *http.Request) error {
+	vars := util.EncodeVars(mux.Vars(req))
 	namespace := vars["namespace"]
 	name := vars["name"]
 	image, err := h.Images.Get(namespace, name, metav1.GetOptions{})
@@ -149,13 +162,17 @@ func (h ImageHandler) uploadImage(rw http.ResponseWriter, req *http.Request) err
 	}()
 
 	//Wait for backing image data source to be ready. Otherwise the upload request will fail.
-	dsName := fmt.Sprintf("%s-%s", namespace, name)
+	dsName, err := util.GetBackingImageDataSourceName(h.BackingImageCache, image)
+	if err != nil {
+		return fmt.Errorf("failed to get backing image name for VMImage %s/%s, error: %w", namespace, name, err)
+	}
+
 	if err := h.waitForBackingImageDataSourceReady(dsName); err != nil {
 		return err
 	}
 
-	uploadUrl := fmt.Sprintf("%s/backingimages/%s-%s", util.LonghornDefaultManagerURL, namespace, name)
-	uploadReq, err := http.NewRequestWithContext(req.Context(), http.MethodPost, uploadUrl, req.Body)
+	uploadURL := fmt.Sprintf("%s/backingimages/%s", util.LonghornDefaultManagerURL, dsName)
+	uploadReq, err := http.NewRequestWithContext(req.Context(), http.MethodPost, uploadURL, req.Body)
 	if err != nil {
 		return fmt.Errorf("failed to create the upload request: %w", err)
 	}
@@ -187,7 +204,7 @@ func (h ImageHandler) uploadImage(rw http.ResponseWriter, req *http.Request) err
 	return nil
 }
 
-func (h ImageHandler) waitForBackingImageDataSourceReady(name string) error {
+func (h Handler) waitForBackingImageDataSourceReady(name string) error {
 	retry := 30
 	for i := 0; i < retry; i++ {
 		ds, err := h.BackingImageDataSources.Get(util.LonghornSystemNamespaceName, name, metav1.GetOptions{})
@@ -195,10 +212,10 @@ func (h ImageHandler) waitForBackingImageDataSourceReady(name string) error {
 			return fmt.Errorf("failed waiting for backing image data source to be ready: %w", err)
 		}
 		if err == nil {
-			if ds.Status.CurrentState == lhv1beta1.BackingImageStatePending {
+			if ds.Status.CurrentState == lhv1beta2.BackingImageStatePending {
 				return nil
 			}
-			if ds.Status.CurrentState == lhv1beta1.BackingImageStateFailed {
+			if ds.Status.CurrentState == lhv1beta2.BackingImageStateFailed {
 				return errors.New(ds.Status.Message)
 			}
 		}
@@ -207,7 +224,7 @@ func (h ImageHandler) waitForBackingImageDataSourceReady(name string) error {
 	return errors.New("timeout waiting for backing image data source to be ready")
 }
 
-func (h ImageHandler) updateImportedConditionOnConflict(image *apisv1beta1.VirtualMachineImage,
+func (h Handler) updateImportedConditionOnConflict(image *apisv1beta1.VirtualMachineImage,
 	status, reason, message string) error {
 	retry := 3
 	for i := 0; i < retry; i++ {

@@ -12,7 +12,7 @@ import (
 	cniv1 "github.com/containernetworking/cni/pkg/types"
 	nadv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	ctlmgmtv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
-	v1 "github.com/rancher/wrangler/pkg/generated/controllers/apps/v1"
+	v1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/apps/v1"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,8 +22,9 @@ import (
 	"github.com/harvester/harvester/pkg/config"
 	ctlharvesterv1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	ctlcniv1 "github.com/harvester/harvester/pkg/generated/controllers/k8s.cni.cncf.io/v1"
-	ctllonghornv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta1"
+	ctllhv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta2"
 	ctlmonitoringv1 "github.com/harvester/harvester/pkg/generated/controllers/monitoring.coreos.com/v1"
+	whereaboutscniv1 "github.com/harvester/harvester/pkg/generated/controllers/whereabouts.cni.cncf.io/v1alpha1"
 	"github.com/harvester/harvester/pkg/settings"
 	"github.com/harvester/harvester/pkg/util"
 )
@@ -36,6 +37,8 @@ const (
 	HashStorageNetworkAnnotation    = StorageNetworkAnnotation + "/hash"
 	NadStorageNetworkAnnotation     = StorageNetworkAnnotation + "/net-attach-def"
 	OldNadStorageNetworkAnnotation  = StorageNetworkAnnotation + "/old-net-attach-def"
+
+	HashStorageNetworkLabel = HashStorageNetworkAnnotation
 
 	StorageNetworkNetAttachDefPrefix    = "storagenetwork-"
 	StorageNetworkNetAttachDefNamespace = "harvester-system"
@@ -53,20 +56,9 @@ const (
 	MsgStopPod               = "Stopping Pods"
 	MsgWaitForVolumes        = "Waiting for all volumes detached: %s"
 	MsgUpdateLonghornSetting = "Update Longhorn setting"
+	MsgIPAssignmentFailure   = "IP allocation failure for Longhorn Pods"
 
 	longhornStorageNetworkName = "storage-network"
-
-	// Rancher monitoring
-	CattleMonitoringSystemNamespace = "cattle-monitoring-system"
-	RancherMonitoringPrometheus     = "rancher-monitoring-prometheus"
-	RancherMonitoringAlertmanager   = "rancher-monitoring-alertmanager"
-	FleetLocalNamespace             = "fleet-local"
-	RancherMonitoring               = "rancher-monitoring"
-	RancherMonitoringGrafana        = "rancher-monitoring-grafana"
-
-	// VM import controller
-	HarvesterSystemNamespace    = "harvester-system"
-	HarvesterVMImportController = "harvester-vm-import-controller"
 )
 
 type Config struct {
@@ -107,9 +99,10 @@ func NewBridgeConfig() *BridgeConfig {
 type Handler struct {
 	ctx                               context.Context
 	settings                          ctlharvesterv1.SettingClient
-	longhornSettings                  ctllonghornv1.SettingClient
-	longhornSettingCache              ctllonghornv1.SettingCache
-	longhornVolumeCache               ctllonghornv1.VolumeCache
+	longhornSettings                  ctllhv1.SettingClient
+	longhornSettingCache              ctllhv1.SettingCache
+	longhornVolumeCache               ctllhv1.VolumeCache
+	longhornNodeCache                 ctllhv1.NodeCache
 	prometheus                        ctlmonitoringv1.PrometheusClient
 	prometheusCache                   ctlmonitoringv1.PrometheusCache
 	alertmanager                      ctlmonitoringv1.AlertmanagerClient
@@ -120,18 +113,22 @@ type Handler struct {
 	managedChartCache                 ctlmgmtv3.ManagedChartCache
 	networkAttachmentDefinitions      ctlcniv1.NetworkAttachmentDefinitionClient
 	networkAttachmentDefinitionsCache ctlcniv1.NetworkAttachmentDefinitionCache
+	whereaboutsCNIIPPoolCache         whereaboutscniv1.IPPoolCache
+	settingsController                ctlharvesterv1.SettingController
 }
 
 // register the setting controller and reconsile longhorn setting when storage network changed
-func Register(ctx context.Context, management *config.Management, opts config.Options) error {
+func Register(ctx context.Context, management *config.Management, _ config.Options) error {
 	settings := management.HarvesterFactory.Harvesterhci().V1beta1().Setting()
-	longhornSettings := management.LonghornFactory.Longhorn().V1beta1().Setting()
-	longhornVolumes := management.LonghornFactory.Longhorn().V1beta1().Volume()
+	longhornSettings := management.LonghornFactory.Longhorn().V1beta2().Setting()
+	longhornVolumes := management.LonghornFactory.Longhorn().V1beta2().Volume()
+	longhornNodes := management.LonghornFactory.Longhorn().V1beta2().Node()
 	prometheus := management.MonitoringFactory.Monitoring().V1().Prometheus()
 	alertmanager := management.MonitoringFactory.Monitoring().V1().Alertmanager()
 	deployments := management.AppsFactory.Apps().V1().Deployment()
 	managedCharts := management.RancherManagementFactory.Management().V3().ManagedChart()
 	networkAttachmentDefinitions := management.CniFactory.K8s().V1().NetworkAttachmentDefinition()
+	whereaboutsCNI := management.WhereaboutsCNIFactory.Whereabouts().V1alpha1()
 
 	controller := &Handler{
 		ctx:                               ctx,
@@ -139,6 +136,7 @@ func Register(ctx context.Context, management *config.Management, opts config.Op
 		longhornSettings:                  longhornSettings,
 		longhornSettingCache:              longhornSettings.Cache(),
 		longhornVolumeCache:               longhornVolumes.Cache(),
+		longhornNodeCache:                 longhornNodes.Cache(),
 		prometheus:                        prometheus,
 		prometheusCache:                   prometheus.Cache(),
 		alertmanager:                      alertmanager,
@@ -149,6 +147,8 @@ func Register(ctx context.Context, management *config.Management, opts config.Op
 		managedChartCache:                 managedCharts.Cache(),
 		networkAttachmentDefinitions:      networkAttachmentDefinitions,
 		networkAttachmentDefinitionsCache: networkAttachmentDefinitions.Cache(),
+		whereaboutsCNIIPPoolCache:         whereaboutsCNI.IPPool().Cache(),
+		settingsController:                settings,
 	}
 
 	settings.OnChange(ctx, ControllerName, controller.OnStorageNetworkChange)
@@ -178,7 +178,7 @@ func (h *Handler) setConfiguredCondition(setting *harvesterv1.Setting, finish bo
 }
 
 // webhook needs check if VMs are off
-func (h *Handler) OnStorageNetworkChange(key string, setting *harvesterv1.Setting) (*harvesterv1.Setting, error) {
+func (h *Handler) OnStorageNetworkChange(_ string, setting *harvesterv1.Setting) (*harvesterv1.Setting, error) {
 	if setting == nil || setting.DeletionTimestamp != nil || setting.Name != settings.StorageNetworkName {
 		return setting, nil
 	}
@@ -276,12 +276,12 @@ func (h *Handler) setNadAnnotations(setting *harvesterv1.Setting, newNad string)
 	return setting
 }
 
-func (h *Handler) createNad(setting *harvesterv1.Setting) (string, error) {
+func (h *Handler) createNad(setting *harvesterv1.Setting) (*nadv1.NetworkAttachmentDefinition, error) {
 	var config Config
 	bridgeConfig := NewBridgeConfig()
 
 	if err := json.Unmarshal([]byte(setting.Value), &config); err != nil {
-		return "", fmt.Errorf("parsing value error %v", err)
+		return nil, fmt.Errorf("parsing value error %v", err)
 	}
 
 	bridgeConfig.Bridge = config.ClusterNetwork + BridgeSuffix
@@ -298,7 +298,7 @@ func (h *Handler) createNad(setting *harvesterv1.Setting) (string, error) {
 
 	nadConfig, err := json.Marshal(bridgeConfig)
 	if err != nil {
-		return "", fmt.Errorf("output json error %v", err)
+		return nil, fmt.Errorf("output json error %v", err)
 	}
 
 	nad := nadv1.NetworkAttachmentDefinition{
@@ -310,34 +310,62 @@ func (h *Handler) createNad(setting *harvesterv1.Setting) (string, error) {
 	nad.Annotations = map[string]string{
 		StorageNetworkAnnotation: "true",
 	}
+	nad.Labels = map[string]string{
+		HashStorageNetworkLabel: h.sha1(setting.Value),
+	}
 	nad.Spec.Config = string(nadConfig)
 
 	// create nad
 	var nadResult *nadv1.NetworkAttachmentDefinition
 	if nadResult, err = h.networkAttachmentDefinitions.Create(&nad); err != nil {
-		return "", fmt.Errorf("create net-attach-def failed %v", err)
+		return nil, fmt.Errorf("create net-attach-def failed %v", err)
 	}
 
-	return fmt.Sprintf("%s/%s", nadResult.Namespace, nadResult.Name), nil
+	return nadResult, nil
+}
+
+func (h *Handler) findOrCreateNad(setting *harvesterv1.Setting) (*nadv1.NetworkAttachmentDefinition, error) {
+	nads, err := h.networkAttachmentDefinitions.List(StorageNetworkNetAttachDefNamespace, metav1.ListOptions{
+		LabelSelector: labels.Set{
+			HashStorageNetworkLabel: h.sha1(setting.Value),
+		}.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(nads.Items) == 0 {
+		return h.createNad(setting)
+	}
+
+	if len(nads.Items) > 1 {
+		logrus.WithFields(logrus.Fields{
+			"num_of_nad":          len(nads.Items),
+			"storage_network_nad": nads.Items[0].Name,
+		}).Info("storage network: found more than one match nad")
+	}
+
+	return &nads.Items[0], nil
 }
 
 func (h *Handler) checkValueIsChanged(setting *harvesterv1.Setting) (*harvesterv1.Setting, error) {
 	var updatedSetting *harvesterv1.Setting
 	var err error
-	nadName := ""
+	nadAnnotation := ""
 
 	if h.checkIsSameHashValue(setting) {
 		return setting, nil
 	}
 
 	if setting.Value != "" {
-		nadName, err = h.createNad(setting)
+		nad, err := h.findOrCreateNad(setting)
 		if err != nil {
 			return setting, err
 		}
+		nadAnnotation = fmt.Sprintf("%s/%s", nad.Namespace, nad.Name)
 	}
 
-	setting = h.setNadAnnotations(setting, nadName)
+	setting = h.setNadAnnotations(setting, nadAnnotation)
 	setting = h.setHashAnnotations(setting)
 
 	if updatedSetting, err = h.setConfiguredCondition(setting, false, ReasonInProgress, "create NAD"); err != nil {
@@ -379,6 +407,46 @@ func (h *Handler) removeOldNad(setting *harvesterv1.Setting) error {
 	return nil
 }
 
+func (h *Handler) validateIPAddressesAllocations(setting *harvesterv1.Setting) error {
+	if setting.Value == "" {
+		return nil
+	}
+
+	lhnodes, err := h.longhornNodeCache.List(metav1.NamespaceAll, labels.Everything())
+	if err != nil {
+		return fmt.Errorf("failed to list longhorn node cache %v", err)
+	}
+
+	MinAllocatableIPAddrs := 0
+	nodeNum := 1
+	// Formula - https://docs.harvesterhci.io/v1.4/advanced/storagenetwork/
+	//Number of Images to download/upload and pod count during upgrade is dynamic, so skipped in the formula calculated.
+	for _, lhNode := range lhnodes {
+		MinAllocatableIPAddrs = MinAllocatableIPAddrs + nodeNum + len(lhNode.Spec.Disks)
+	}
+
+	var config Config
+
+	if err := json.Unmarshal([]byte(setting.Value), &config); err != nil {
+		return fmt.Errorf("parsing value error %v", err)
+	}
+
+	ipprefix := strings.Split(config.Range, "/")
+	ippoolName := ipprefix[0] + "-" + ipprefix[1]
+
+	ippool, err := h.whereaboutsCNIIPPoolCache.Get(util.KubeSystemNamespace, ippoolName)
+	if err != nil {
+		return fmt.Errorf("wherabouts IPPool not found for pool %s error %v", ippoolName, err)
+	}
+
+	if len(ippool.Spec.Allocations) >= MinAllocatableIPAddrs {
+		return nil
+	}
+
+	return fmt.Errorf("whereabouts cni IP allocation failure for IPPool %s retrying again... required %d allocated %d",
+		ippoolName, MinAllocatableIPAddrs, len(ippool.Spec.Allocations))
+}
+
 func (h *Handler) handleLonghornSettingPostConfig(setting *harvesterv1.Setting) (*harvesterv1.Setting, error) {
 	// check if we need to restart monitoring pods
 	if err := h.checkPodStatusAndStart(); err != nil {
@@ -391,6 +459,16 @@ func (h *Handler) handleLonghornSettingPostConfig(setting *harvesterv1.Setting) 
 	settingCopy := setting.DeepCopy()
 	if err := h.removeOldNad(settingCopy); err != nil {
 		return setting, fmt.Errorf("remove old nad error %v", err)
+	}
+
+	err := h.validateIPAddressesAllocations(setting)
+	if err != nil {
+		setting, err := h.setConfiguredCondition(setting, false, ReasonInProgress, MsgIPAssignmentFailure)
+		if err != nil {
+			return setting, fmt.Errorf("update status error %v", err)
+		}
+		h.settingsController.Enqueue(setting.Name)
+		return setting, err
 	}
 
 	updatedSetting, err := h.setConfiguredCondition(settingCopy, true, ReasonCompleted, "")
@@ -424,7 +502,7 @@ func (h *Handler) checkLonghornVolumeDetached() error {
 
 func (h *Handler) checkPrometheusStatusAndStart() error {
 	// check prometheus cattle-monitoring-system/rancher-monitoring-prometheus replica
-	prometheus, err := h.prometheusCache.Get(CattleMonitoringSystemNamespace, RancherMonitoringPrometheus)
+	prometheus, err := h.prometheusCache.Get(util.CattleMonitoringSystemNamespace, util.RancherMonitoringPrometheus)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logrus.Infof("prometheus not found. skip")
@@ -438,9 +516,9 @@ func (h *Handler) checkPrometheusStatusAndStart() error {
 		logrus.Infof("current prometheus replicas: %v", *prometheus.Spec.Replicas)
 		logrus.Infof("start prometheus")
 		prometheusCopy := prometheus.DeepCopy()
-		replicas, err := strconv.Atoi(replicasStr)
+		replicas, err := strconv.ParseInt(replicasStr, 10, 32)
 		if err != nil {
-			return fmt.Errorf("strconv atoi error %v", err)
+			return fmt.Errorf("strconv ParseInt error %v", err)
 		}
 		*prometheusCopy.Spec.Replicas = int32(replicas)
 		delete(prometheusCopy.Annotations, ReplicaStorageNetworkAnnotation)
@@ -456,7 +534,7 @@ func (h *Handler) checkPrometheusStatusAndStart() error {
 
 func (h *Handler) checkAlertmanagerStatusAndStart() error {
 	// check alertmanager cattle-monitoring-system/rancher-monitoring-alertmanager replica
-	alertmanager, err := h.alertmanagerCache.Get(CattleMonitoringSystemNamespace, RancherMonitoringAlertmanager)
+	alertmanager, err := h.alertmanagerCache.Get(util.CattleMonitoringSystemNamespace, util.RancherMonitoringAlertmanager)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logrus.Infof("Alertmanager not found. skip")
@@ -470,9 +548,9 @@ func (h *Handler) checkAlertmanagerStatusAndStart() error {
 		logrus.Infof("current alertmanager replicas: %v", *alertmanager.Spec.Replicas)
 		logrus.Infof("start alertmanager")
 		alertmanagerCopy := alertmanager.DeepCopy()
-		replicas, err := strconv.Atoi(replicasStr)
+		replicas, err := strconv.ParseInt(replicasStr, 10, 32)
 		if err != nil {
-			return fmt.Errorf("strconv atoi error %v", err)
+			return fmt.Errorf("strconv ParseInt error %v", err)
 		}
 		*alertmanagerCopy.Spec.Replicas = int32(replicas)
 		delete(alertmanagerCopy.Annotations, ReplicaStorageNetworkAnnotation)
@@ -488,7 +566,7 @@ func (h *Handler) checkAlertmanagerStatusAndStart() error {
 
 func (h *Handler) checkGrafanaStatusAndStart() error {
 	// check deployment cattle-monitoring-system/rancher-monitoring-grafana replica
-	grafana, err := h.deploymentCache.Get(CattleMonitoringSystemNamespace, RancherMonitoringGrafana)
+	grafana, err := h.deploymentCache.Get(util.CattleMonitoringSystemNamespace, util.RancherMonitoringGrafana)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logrus.Infof("grafana not found. skip")
@@ -502,9 +580,9 @@ func (h *Handler) checkGrafanaStatusAndStart() error {
 		logrus.Infof("current Grafana replicas: %v", *grafana.Spec.Replicas)
 		logrus.Infof("start grafana")
 		grafanaCopy := grafana.DeepCopy()
-		replicas, err := strconv.Atoi(replicasStr)
+		replicas, err := strconv.ParseInt(replicasStr, 10, 32)
 		if err != nil {
-			return fmt.Errorf("strconv atoi error %v", err)
+			return fmt.Errorf("strconv ParseInt error %v", err)
 		}
 		*grafanaCopy.Spec.Replicas = int32(replicas)
 		delete(grafanaCopy.Annotations, ReplicaStorageNetworkAnnotation)
@@ -520,7 +598,7 @@ func (h *Handler) checkGrafanaStatusAndStart() error {
 
 func (h *Handler) checkRancherMonitoringStatusAndStart() error {
 	// check managedchart fleet-local/rancher-monitoring paused
-	monitoring, err := h.managedChartCache.Get(FleetLocalNamespace, RancherMonitoring)
+	monitoring, err := h.managedChartCache.Get(util.FleetLocalNamespaceName, util.RancherMonitoring)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logrus.Infof("rancher monitoring not found. skip")
@@ -548,7 +626,7 @@ func (h *Handler) checkRancherMonitoringStatusAndStart() error {
 
 func (h *Handler) checkVMImportControllerStatusAndStart() error {
 	// check deployment harvester-system/harvester-harvester-vm-import-controller replica
-	vmImportControllerDeploy, err := h.deploymentCache.Get(HarvesterSystemNamespace, HarvesterVMImportController)
+	vmImportControllerDeploy, err := h.deploymentCache.Get(util.HarvesterSystemNamespaceName, util.HarvesterVMImportController)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logrus.Infof("VM import controller not found. skip")
@@ -562,9 +640,9 @@ func (h *Handler) checkVMImportControllerStatusAndStart() error {
 	if replicasStr, ok := vmImportControllerDeploy.Annotations[ReplicaStorageNetworkAnnotation]; ok {
 		logrus.Infof("start vm import controller")
 		vmImportControllerDeployCopy := vmImportControllerDeploy.DeepCopy()
-		replicas, err := strconv.Atoi(replicasStr)
+		replicas, err := strconv.ParseInt(replicasStr, 10, 32)
 		if err != nil {
-			return fmt.Errorf("strconv atoi error %v", err)
+			return fmt.Errorf("strconv ParseInt error %v", err)
 		}
 		*vmImportControllerDeployCopy.Spec.Replicas = int32(replicas)
 		delete(vmImportControllerDeployCopy.Annotations, ReplicaStorageNetworkAnnotation)
@@ -601,7 +679,7 @@ func (h *Handler) checkPodStatusAndStart() error {
 
 func (h *Handler) checkRancherMonitoringStatusAndStop() error {
 	// check managedchart fleet-local/rancher-monitoring paused
-	monitoring, err := h.managedChartCache.Get(FleetLocalNamespace, RancherMonitoring)
+	monitoring, err := h.managedChartCache.Get(util.FleetLocalNamespaceName, util.RancherMonitoring)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logrus.Infof("rancher monitoring not found. skip")
@@ -629,7 +707,7 @@ func (h *Handler) checkRancherMonitoringStatusAndStop() error {
 
 func (h *Handler) checkPrometheusStatusAndStop() error {
 	// check prometheus cattle-monitoring-system/rancher-monitoring-prometheus replica
-	prometheus, err := h.prometheusCache.Get(CattleMonitoringSystemNamespace, RancherMonitoringPrometheus)
+	prometheus, err := h.prometheusCache.Get(util.CattleMonitoringSystemNamespace, util.RancherMonitoringPrometheus)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logrus.Infof("prometheus not found. skip")
@@ -656,7 +734,7 @@ func (h *Handler) checkPrometheusStatusAndStop() error {
 
 func (h *Handler) checkAltermanagerStatusAndStop() error {
 	// check alertmanager cattle-monitoring-system/rancher-monitoring-alertmanager replica
-	alertmanager, err := h.alertmanagerCache.Get(CattleMonitoringSystemNamespace, RancherMonitoringAlertmanager)
+	alertmanager, err := h.alertmanagerCache.Get(util.CattleMonitoringSystemNamespace, util.RancherMonitoringAlertmanager)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logrus.Infof("Alertmanager not found. skip")
@@ -684,7 +762,7 @@ func (h *Handler) checkAltermanagerStatusAndStop() error {
 
 func (h *Handler) checkGrafanaStatusAndStop() error {
 	// check deployment cattle-monitoring-system/rancher-monitoring-grafana replica
-	grafana, err := h.deploymentCache.Get(CattleMonitoringSystemNamespace, RancherMonitoringGrafana)
+	grafana, err := h.deploymentCache.Get(util.CattleMonitoringSystemNamespace, util.RancherMonitoringGrafana)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logrus.Infof("grafana no found. skip")
@@ -712,7 +790,7 @@ func (h *Handler) checkGrafanaStatusAndStop() error {
 
 func (h *Handler) checkVMImportControllerStatusAndStop() error {
 	// check deployment harvester-system/harvester-harvester-vm-import-controller replica
-	vmimportcontroller, err := h.deploymentCache.Get(HarvesterSystemNamespace, HarvesterVMImportController)
+	vmimportcontroller, err := h.deploymentCache.Get(util.HarvesterSystemNamespaceName, util.HarvesterVMImportController)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			logrus.Infof("VM import controller no found. skip")

@@ -1,6 +1,6 @@
 package vm
 
-import "github.com/rancher/wrangler/pkg/condition"
+import "github.com/rancher/wrangler/v3/pkg/condition"
 
 var (
 	vmReady   condition.Cond = "Ready"
@@ -27,6 +27,7 @@ type MigrateInput struct {
 type CreateTemplateInput struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
+	WithData    bool   `json:"withData"`
 }
 
 type AddVolumeInput struct {
@@ -40,4 +41,12 @@ type RemoveVolumeInput struct {
 
 type CloneInput struct {
 	TargetVM string `json:"targetVm"`
+}
+
+type FindMigratableNodesOutput struct {
+	Nodes []string `json:"nodes"`
+}
+
+type UpdateResourceQuotaInput struct {
+	TotalSnapshotSizeQuota string `json:"totalSnapshotSizeQuota"`
 }

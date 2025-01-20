@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -11,14 +12,17 @@ import (
 	"github.com/robfig/cron"
 	"github.com/sirupsen/logrus"
 
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/longhorn/longhorn-manager/csi/crypto"
 	"github.com/longhorn/longhorn-manager/types"
 	"github.com/longhorn/longhorn-manager/util"
 
@@ -28,8 +32,6 @@ import (
 const (
 	// NameMaximumLength restricted the length due to Kubernetes name limitation
 	NameMaximumLength = 40
-
-	MaxRecurringJobRetain = 50
 )
 
 var (
@@ -42,7 +44,7 @@ var (
 )
 
 func (s *DataStore) UpdateCustomizedSettings(defaultImages map[types.SettingName]string) error {
-	defaultSettingCM, err := s.GetConfigMap(s.namespace, types.DefaultDefaultSettingConfigMapName)
+	defaultSettingCM, err := s.GetConfigMapRO(s.namespace, types.DefaultDefaultSettingConfigMapName)
 	if err != nil {
 		return err
 	}
@@ -52,7 +54,7 @@ func (s *DataStore) UpdateCustomizedSettings(defaultImages map[types.SettingName
 		return err
 	}
 
-	availableCustomizedDefaultSettings := s.filterCustomizedDefaultSettings(customizedDefaultSettings)
+	availableCustomizedDefaultSettings := s.filterCustomizedDefaultSettings(customizedDefaultSettings, defaultSettingCM.ResourceVersion)
 
 	if err := s.applyCustomizedDefaultSettingsToDefinitions(availableCustomizedDefaultSettings); err != nil {
 		return err
@@ -71,8 +73,7 @@ func (s *DataStore) UpdateCustomizedSettings(defaultImages map[types.SettingName
 
 func (s *DataStore) createNonExistingSettingCRsWithDefaultSetting(configMapResourceVersion string) error {
 	for _, sName := range types.SettingNameList {
-		_, err := s.GetSettingExact(sName)
-		if err != nil && apierrors.IsNotFound(err) {
+		if _, err := s.GetSettingExactRO(sName); err != nil && apierrors.IsNotFound(err) {
 			definition, ok := types.GetSettingDefinition(sName)
 			if !ok {
 				return fmt.Errorf("BUG: setting %v is not defined", sName)
@@ -95,17 +96,47 @@ func (s *DataStore) createNonExistingSettingCRsWithDefaultSetting(configMapResou
 	return nil
 }
 
-func (s *DataStore) filterCustomizedDefaultSettings(customizedDefaultSettings map[string]string) map[string]string {
+func (s *DataStore) filterCustomizedDefaultSettings(customizedDefaultSettings map[string]string, defaultSettingCMResourceVersion string) map[string]string {
 	availableCustomizedDefaultSettings := make(map[string]string)
 
 	for name, value := range customizedDefaultSettings {
-		if err := s.ValidateSetting(string(name), value); err == nil {
-			availableCustomizedDefaultSettings[name] = value
-		} else {
-			logrus.WithError(err).Errorf("invalid customized default setting %v with value %v, will continue applying other customized settings", name, value)
+		if !s.shouldApplyCustomizedSettingValue(types.SettingName(name), value, defaultSettingCMResourceVersion) {
+			continue
 		}
+
+		if err := s.ValidateSetting(string(name), value); err != nil {
+			logrus.WithError(err).Warnf("Invalid customized default setting %v with value %v, will continue applying other customized settings", name, value)
+			continue
+		}
+
+		availableCustomizedDefaultSettings[name] = value
 	}
 	return availableCustomizedDefaultSettings
+}
+
+func (s *DataStore) shouldApplyCustomizedSettingValue(name types.SettingName, value string, defaultSettingCMResourceVersion string) bool {
+	setting, err := s.GetSettingExactRO(name)
+	if err != nil {
+		if !ErrorIsNotFound(err) {
+			logrus.WithError(err).Errorf("failed to get customized default setting %v value", name)
+			return false
+		}
+		return true
+	}
+
+	configMapResourceVersion := ""
+	if setting.Annotations != nil {
+		configMapResourceVersion = setting.Annotations[types.GetLonghornLabelKey(types.ConfigMapResourceVersionKey)]
+	}
+
+	// Also check the setting definition.
+	definition, ok := types.GetSettingDefinition(name)
+	if !ok {
+		logrus.Errorf("customized default setting %v is not defined", name)
+		return true
+	}
+
+	return (setting.Value != value || configMapResourceVersion != defaultSettingCMResourceVersion || definition.Default != value)
 }
 
 func (s *DataStore) syncSettingsWithDefaultImages(defaultImages map[types.SettingName]string) error {
@@ -142,8 +173,14 @@ func (s *DataStore) createOrUpdateSetting(name types.SettingName, value, default
 		setting.Annotations = map[string]string{}
 	}
 
+	if existingSettingCMResourceVersion, isExist := setting.Annotations[types.GetLonghornLabelKey(types.ConfigMapResourceVersionKey)]; isExist {
+		if existingSettingCMResourceVersion == defaultSettingCMResourceVersion && setting.Value == value {
+			return nil
+		}
+	}
 	setting.Annotations[types.GetLonghornLabelKey(types.ConfigMapResourceVersionKey)] = defaultSettingCMResourceVersion
 	setting.Value = value
+
 	_, err = s.UpdateSetting(setting)
 	return err
 }
@@ -169,16 +206,6 @@ func (s *DataStore) applyCustomizedDefaultSettingsToDefinitions(customizedDefaul
 
 func (s *DataStore) syncSettingCRsWithCustomizedDefaultSettings(customizedDefaultSettings map[string]string, defaultSettingCMResourceVersion string) error {
 	for _, sName := range types.SettingNameList {
-		configMapResourceVersion := ""
-		if s, err := s.GetSettingExact(sName); err != nil {
-			if !apierrors.IsNotFound(err) {
-				return err
-			}
-		} else {
-			if s.Annotations != nil {
-				configMapResourceVersion = s.Annotations[types.GetLonghornLabelKey(types.ConfigMapResourceVersionKey)]
-			}
-		}
 
 		definition, ok := types.GetSettingDefinition(sName)
 		if !ok {
@@ -190,13 +217,12 @@ func (s *DataStore) syncSettingCRsWithCustomizedDefaultSettings(customizedDefaul
 			continue
 		}
 
-		if configMapResourceVersion != defaultSettingCMResourceVersion {
-			if definition.Required && value == "" {
-				continue
-			}
-			if err := s.createOrUpdateSetting(sName, value, defaultSettingCMResourceVersion); err != nil {
-				return err
-			}
+		if definition.Required && value == "" {
+			continue
+		}
+
+		if err := s.createOrUpdateSetting(sName, value, defaultSettingCMResourceVersion); err != nil {
+			return err
 		}
 	}
 
@@ -212,7 +238,30 @@ func (s *DataStore) CreateSetting(setting *longhorn.Setting) (*longhorn.Setting,
 
 // UpdateSetting updates the given Longhorn Settings and verifies update
 func (s *DataStore) UpdateSetting(setting *longhorn.Setting) (*longhorn.Setting, error) {
+	if setting.Annotations == nil {
+		setting.Annotations = make(map[string]string)
+	}
+	setting.Annotations[types.GetLonghornLabelKey(types.UpdateSettingFromLonghorn)] = ""
 	obj, err := s.lhClient.LonghornV1beta2().Settings(s.namespace).Update(context.TODO(), setting, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	delete(obj.Annotations, types.GetLonghornLabelKey(types.UpdateSettingFromLonghorn))
+	obj, err = s.lhClient.LonghornV1beta2().Settings(s.namespace).Update(context.TODO(), obj, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	verifyUpdate(setting.Name, obj, func(name string) (runtime.Object, error) {
+		return s.getSettingRO(name)
+	})
+	return obj, nil
+}
+
+// UpdateSettingStatus updates Longhorn Setting status and verifies update
+func (s *DataStore) UpdateSettingStatus(setting *longhorn.Setting) (*longhorn.Setting, error) {
+	obj, err := s.lhClient.LonghornV1beta2().Settings(s.namespace).UpdateStatus(context.TODO(), setting, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +274,7 @@ func (s *DataStore) UpdateSetting(setting *longhorn.Setting) (*longhorn.Setting,
 // ValidateSetting checks the given setting value types and condition
 func (s *DataStore) ValidateSetting(name, value string) (err error) {
 	defer func() {
-		err = errors.Wrapf(err, "fail to set the setting %v with invalid value %v", name, value)
+		err = errors.Wrapf(err, "failed to set the setting %v with invalid value %v", name, value)
 	}()
 	sName := types.SettingName(name)
 
@@ -262,6 +311,12 @@ func (s *DataStore) ValidateSetting(name, value string) (err error) {
 			types.AWSSecretKey,
 			types.AWSEndPoint,
 			types.AWSCert,
+			types.CIFSUsername,
+			types.CIFSPassword,
+			types.AZBlobAccountName,
+			types.AZBlobAccountKey,
+			types.AZBlobEndpoint,
+			types.AZBlobCert,
 			types.HTTPSProxy,
 			types.HTTPProxy,
 			types.NOProxy,
@@ -270,28 +325,18 @@ func (s *DataStore) ValidateSetting(name, value string) (err error) {
 		for _, checkKey := range checkKeyList {
 			if value, ok := secret.Data[checkKey]; ok {
 				if strings.TrimSpace(string(value)) != string(value) {
-					return fmt.Errorf("there is space or new line in %s", checkKey)
+					switch {
+					case strings.TrimLeft(string(value), " ") != string(value):
+						return fmt.Errorf("invalid leading white space in %s", checkKey)
+					case strings.TrimRight(string(value), " ") != string(value):
+						return fmt.Errorf("invalid trailing white space in %s", checkKey)
+					case strings.TrimLeft(string(value), "\n") != string(value):
+						return fmt.Errorf("invalid leading new line in %s", checkKey)
+					case strings.TrimRight(string(value), "\n") != string(value):
+						return fmt.Errorf("invalid trailing new line in %s", checkKey)
+					}
+					return fmt.Errorf("invalid white space or new line in %s", checkKey)
 				}
-			}
-		}
-	case types.SettingNameTaintToleration:
-		list, err := s.ListVolumesRO()
-		if err != nil {
-			return errors.Wrapf(err, "failed to list volumes before modifying toleration setting")
-		}
-		for _, v := range list {
-			if v.Status.State != longhorn.VolumeStateDetached {
-				return fmt.Errorf("cannot modify toleration setting before all volumes are detached")
-			}
-		}
-	case types.SettingNameSystemManagedComponentsNodeSelector:
-		list, err := s.ListVolumesRO()
-		if err != nil {
-			return errors.Wrapf(err, "failed to list volumes before modifying node selector for managed components setting")
-		}
-		for _, v := range list {
-			if v.Status.State != longhorn.VolumeStateDetached {
-				return fmt.Errorf("cannot modify node selector for managed components setting before all volumes are detached")
 			}
 		}
 	case types.SettingNamePriorityClass:
@@ -300,70 +345,236 @@ func (s *DataStore) ValidateSetting(name, value string) (err error) {
 				return errors.Wrapf(err, "failed to get priority class %v before modifying priority class setting", value)
 			}
 		}
-		list, err := s.ListVolumesRO()
-		if err != nil {
-			return errors.Wrapf(err, "failed to list volumes before modifying priority class setting")
-		}
-		for _, v := range list {
-			if v.Status.State != longhorn.VolumeStateDetached {
-				return fmt.Errorf("cannot modify priority class setting before all volumes are detached")
-			}
-		}
-	case types.SettingNameGuaranteedEngineManagerCPU:
-		fallthrough
-	case types.SettingNameGuaranteedReplicaManagerCPU:
-		guaranteedEngineManagerCPU, err := s.GetSetting(types.SettingNameGuaranteedEngineManagerCPU)
+	case types.SettingNameGuaranteedInstanceManagerCPU, types.SettingNameV2DataEngineGuaranteedInstanceManagerCPU:
+		guaranteedInstanceManagerCPU, err := s.GetSettingWithAutoFillingRO(sName)
 		if err != nil {
 			return err
 		}
-		if sName == types.SettingNameGuaranteedEngineManagerCPU {
-			guaranteedEngineManagerCPU.Value = value
-		}
-		guaranteedReplicaManagerCPU, err := s.GetSetting(types.SettingNameGuaranteedReplicaManagerCPU)
-		if err != nil {
+		guaranteedInstanceManagerCPU.Value = value
+		if err := types.ValidateCPUReservationValues(sName, guaranteedInstanceManagerCPU.Value); err != nil {
 			return err
 		}
-		if sName == types.SettingNameGuaranteedReplicaManagerCPU {
-			guaranteedReplicaManagerCPU.Value = value
-		}
-		if err := types.ValidateCPUReservationValues(guaranteedEngineManagerCPU.Value, guaranteedReplicaManagerCPU.Value); err != nil {
-			return err
-		}
-	case types.SettingNameStorageNetwork:
-		volumesDetached, err := s.AreAllVolumesDetached()
+	case types.SettingNameV1DataEngine:
+		old, err := s.GetSettingWithAutoFillingRO(types.SettingNameV1DataEngine)
 		if err != nil {
-			return errors.Wrapf(err, "failed to check volume detachment for %v setting update", types.SettingNameStorageNetwork)
+			return err
 		}
 
-		if !volumesDetached {
-			return errors.Errorf("cannot apply %v setting to Longhorn workloads when there are attached volumes", types.SettingNameStorageNetwork)
+		if old.Value != value {
+			dataEngineEnabled, err := strconv.ParseBool(value)
+			if err != nil {
+				return err
+			}
+
+			_, err = s.ValidateV1DataEngineEnabled(dataEngineEnabled)
+			if err != nil {
+				return err
+			}
+		}
+
+	case types.SettingNameV2DataEngine:
+		old, err := s.GetSettingWithAutoFillingRO(types.SettingNameV2DataEngine)
+		if err != nil {
+			return err
+		}
+
+		if old.Value != value {
+			dataEngineEnabled, err := strconv.ParseBool(value)
+			if err != nil {
+				return err
+			}
+
+			_, err = s.ValidateV2DataEngineEnabled(dataEngineEnabled)
+			if err != nil {
+				return err
+			}
+		}
+
+	case types.SettingNameAutoCleanupSystemGeneratedSnapshot:
+		disablePurgeValue, err := s.GetSettingAsBool(types.SettingNameDisableSnapshotPurge)
+		if err != nil {
+			return err
+		}
+		if value == "true" && disablePurgeValue {
+			return errors.Errorf("cannot set %v setting to true when %v setting is true", name, types.SettingNameDisableSnapshotPurge)
+		}
+	case types.SettingNameDisableSnapshotPurge:
+		autoCleanupValue, err := s.GetSettingAsBool(types.SettingNameAutoCleanupSystemGeneratedSnapshot)
+		if err != nil {
+			return err
+		}
+		if value == "true" && autoCleanupValue {
+			return errors.Errorf("cannot set %v setting to true when %v setting is true", name, types.SettingNameAutoCleanupSystemGeneratedSnapshot)
+		}
+	case types.SettingNameSnapshotMaxCount:
+		v, err := strconv.Atoi(value)
+		if err != nil {
+			return err
+		}
+		if v < 2 || v > 250 {
+			return fmt.Errorf("%s should be between 2 and 250", name)
+		}
+	case types.SettingNameDefaultLonghornStaticStorageClass:
+		definition, ok := types.GetSettingDefinition(types.SettingNameDefaultLonghornStaticStorageClass)
+		if !ok {
+			return fmt.Errorf("setting %v is not found", types.SettingNameDefaultLonghornStaticStorageClass)
+		}
+
+		if value == definition.Default {
+			return nil
+		}
+
+		_, err := s.GetStorageClassRO(value)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return errors.Wrapf(err, "cannot use a storage class %v that does not exist to set the setting %v", value, types.SettingNameDefaultLonghornStaticStorageClass)
+			}
+			return errors.Wrapf(err, "failed to get the storage class %v for setting %v", value, types.SettingNameDefaultLonghornStaticStorageClass)
 		}
 	}
 	return nil
 }
 
-func (s *DataStore) AreAllVolumesDetached() (bool, error) {
-	image, err := s.GetSettingValueExisted(types.SettingNameDefaultInstanceManagerImage)
-	if err != nil {
-		return false, err
-	}
-
-	nodes, err := s.ListNodes()
-	if err != nil {
-		return false, err
-	}
-
-	for node := range nodes {
-		engineIMs, err := s.ListInstanceManagersBySelector(node, image, longhorn.InstanceManagerTypeEngine)
+func (s *DataStore) ValidateV1DataEngineEnabled(dataEngineEnabled bool) (ims []*longhorn.InstanceManager, err error) {
+	if !dataEngineEnabled {
+		allVolumesDetached, _ims, err := s.AreAllVolumesDetached(longhorn.DataEngineTypeV1)
 		if err != nil {
-			if ErrorIsNotFound(err) {
-				return true, nil
+			return nil, errors.Wrapf(err, "failed to check volume detachment for %v setting update", types.SettingNameV1DataEngine)
+		}
+		ims = _ims
+
+		if !allVolumesDetached {
+			return nil, &types.ErrorInvalidState{Reason: fmt.Sprintf("cannot apply %v setting to Longhorn workloads when there are attached v1 volumes", types.SettingNameV1DataEngine)}
+		}
+	}
+
+	return ims, nil
+}
+
+func (s *DataStore) ValidateV2DataEngineEnabled(dataEngineEnabled bool) (ims []*longhorn.InstanceManager, err error) {
+	if !dataEngineEnabled {
+		allVolumesDetached, _ims, err := s.AreAllVolumesDetached(longhorn.DataEngineTypeV2)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to check volume detachment for %v setting update", types.SettingNameV2DataEngine)
+		}
+		ims = _ims
+
+		if !allVolumesDetached {
+			return nil, &types.ErrorInvalidState{Reason: fmt.Sprintf("cannot apply %v setting to Longhorn workloads when there are attached v2 volumes", types.SettingNameV2DataEngine)}
+		}
+	}
+
+	// Check if there is enough hugepages-2Mi capacity for all nodes
+	hugepageRequestedInMiB, err := s.GetSettingWithAutoFillingRO(types.SettingNameV2DataEngineHugepageLimit)
+	if err != nil {
+		return nil, err
+	}
+
+	{
+		hugepageRequested := resource.MustParse(hugepageRequestedInMiB.Value + "Mi")
+
+		_ims, err := s.ListInstanceManagersRO()
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to list instance managers for %v setting update", types.SettingNameV2DataEngine)
+		}
+
+		for _, im := range _ims {
+			node, err := s.GetKubernetesNodeRO(im.Spec.NodeID)
+			if err != nil {
+				if !apierrors.IsNotFound(err) {
+					return nil, errors.Wrapf(err, "failed to get Kubernetes node %v for %v setting update", im.Spec.NodeID, types.SettingNameV2DataEngine)
+				}
+
+				continue
 			}
+
+			if val, ok := node.Labels[types.NodeDisableV2DataEngineLabelKey]; ok && val == types.NodeDisableV2DataEngineLabelKeyTrue {
+				// V2 data engine is disabled on this node, don't worry about hugepages
+				continue
+			}
+
+			if dataEngineEnabled {
+				capacity, ok := node.Status.Capacity["hugepages-2Mi"]
+				if !ok {
+					return nil, errors.Errorf("failed to get hugepages-2Mi capacity for node %v", node.Name)
+				}
+
+				hugepageCapacity := resource.MustParse(capacity.String())
+
+				if hugepageCapacity.Cmp(hugepageRequested) < 0 {
+					return nil, errors.Errorf("not enough hugepages-2Mi capacity for node %v, requested %v, capacity %v", node.Name, hugepageRequested.String(), hugepageCapacity.String())
+				}
+			}
+		}
+	}
+
+	return
+}
+
+func (s *DataStore) AreAllRWXVolumesDetached() (bool, error) {
+	volumes, err := s.ListVolumesRO()
+	if err != nil {
+		return false, err
+	}
+	for _, volume := range volumes {
+		if volume.Spec.AccessMode != longhorn.AccessModeReadWriteMany {
+			continue
+		}
+
+		volumeAttachment, err := s.GetLHVolumeAttachmentByVolumeName(volume.Name)
+		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}
 
-		for _, engineIM := range engineIMs {
-			if len(engineIM.Status.Instances) > 0 {
+		if volumeAttachment != nil && len(volumeAttachment.Spec.AttachmentTickets) > 0 {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func (s *DataStore) AreAllVolumesDetached(dataEngine longhorn.DataEngineType) (bool, []*longhorn.InstanceManager, error) {
+	var ims []*longhorn.InstanceManager
+
+	nodes, err := s.ListNodes()
+	if err != nil {
+		return false, ims, err
+	}
+
+	for node := range nodes {
+		engineInstanceManagers, err := s.ListInstanceManagersBySelectorRO(node, "", longhorn.InstanceManagerTypeEngine, dataEngine)
+		if err != nil && !ErrorIsNotFound(err) {
+			return false, ims, err
+		}
+
+		aioInstanceManagers, err := s.ListInstanceManagersBySelectorRO(node, "", longhorn.InstanceManagerTypeAllInOne, dataEngine)
+		if err != nil && !ErrorIsNotFound(err) {
+			return false, ims, err
+		}
+
+		imMap := types.ConsolidateInstanceManagers(engineInstanceManagers, aioInstanceManagers)
+		for _, instanceManager := range imMap {
+			if len(instanceManager.Status.InstanceEngines)+len(instanceManager.Status.Instances) > 0 { // nolint: staticcheck
+				return false, ims, err
+			}
+
+			ims = append(ims, instanceManager)
+		}
+	}
+
+	return true, ims, err
+}
+
+func (s *DataStore) AreAllDisksRemovedByDiskType(diskType longhorn.DiskType) (bool, error) {
+	nodes, err := s.ListNodesRO()
+	if err != nil {
+		return false, err
+	}
+
+	for _, node := range nodes {
+		for _, disk := range node.Spec.Disks {
+			if disk.Type == diskType {
 				return false, nil
 			}
 		}
@@ -372,28 +583,29 @@ func (s *DataStore) AreAllVolumesDetached() (bool, error) {
 	return true, nil
 }
 
-func (s *DataStore) getSettingRO(name string) (*longhorn.Setting, error) {
-	return s.sLister.Settings(s.namespace).Get(name)
-}
-
-// GetSettingExact returns the Setting for the given name and namespace
-func (s *DataStore) GetSettingExact(sName types.SettingName) (*longhorn.Setting, error) {
-	resultRO, err := s.getSettingRO(string(sName))
+func (s *DataStore) AreAllVolumesDetachedState() (bool, error) {
+	list, err := s.ListVolumesRO()
 	if err != nil {
-		return nil, err
+		return false, errors.Wrapf(err, "failed to list volumes")
 	}
-
-	return resultRO.DeepCopy(), nil
+	for _, v := range list {
+		if v.Status.State != longhorn.VolumeStateDetached {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
-// GetSetting will automatically fill the non-existing setting if it's a valid
-// setting name.
-// The function will not return nil for *longhorn.Setting when error is nil
-func (s *DataStore) GetSetting(sName types.SettingName) (*longhorn.Setting, error) {
+func (s *DataStore) getSettingRO(name string) (*longhorn.Setting, error) {
+	return s.settingLister.Settings(s.namespace).Get(name)
+}
+
+func (s *DataStore) GetSettingWithAutoFillingRO(sName types.SettingName) (*longhorn.Setting, error) {
 	definition, ok := types.GetSettingDefinition(sName)
 	if !ok {
 		return nil, fmt.Errorf("setting %v is not supported", sName)
 	}
+
 	resultRO, err := s.getSettingRO(string(sName))
 	if err != nil {
 		if !ErrorIsNotFound(err) {
@@ -406,13 +618,52 @@ func (s *DataStore) GetSetting(sName types.SettingName) (*longhorn.Setting, erro
 			Value: definition.Default,
 		}
 	}
+
+	return resultRO, nil
+}
+
+// GetSettingExact returns the Setting for the given name and namespace
+func (s *DataStore) GetSettingExact(sName types.SettingName) (*longhorn.Setting, error) {
+	resultRO, err := s.getSettingRO(string(sName))
+	if err != nil {
+		return nil, err
+	}
+
+	return resultRO.DeepCopy(), nil
+}
+
+func (s *DataStore) GetSettingExactRO(sName types.SettingName) (*longhorn.Setting, error) {
+	resultRO, err := s.getSettingRO(string(sName))
+	if err != nil {
+		return nil, err
+	}
+
+	return resultRO, nil
+}
+
+func (s *DataStore) GetSettingApplied(sName types.SettingName) (bool, error) {
+	resultRO, err := s.getSettingRO(string(sName))
+	if err != nil {
+		return false, err
+	}
+	return resultRO.Status.Applied, nil
+}
+
+// GetSetting will automatically fill the non-existing setting if it's a valid
+// setting name.
+// The function will not return nil for *longhorn.Setting when error is nil
+func (s *DataStore) GetSetting(sName types.SettingName) (*longhorn.Setting, error) {
+	resultRO, err := s.GetSettingWithAutoFillingRO(sName)
+	if err != nil {
+		return nil, err
+	}
 	return resultRO.DeepCopy(), nil
 }
 
 // GetSettingValueExisted returns the value of the given setting name.
 // Returns error if the setting does not exist or value is empty
 func (s *DataStore) GetSettingValueExisted(sName types.SettingName) (string, error) {
-	setting, err := s.GetSetting(sName)
+	setting, err := s.GetSettingWithAutoFillingRO(sName)
 	if err != nil {
 		return "", err
 	}
@@ -427,7 +678,7 @@ func (s *DataStore) GetSettingValueExisted(sName types.SettingName) (string, err
 func (s *DataStore) ListSettings() (map[types.SettingName]*longhorn.Setting, error) {
 	itemMap := make(map[types.SettingName]*longhorn.Setting)
 
-	list, err := s.sLister.Settings(s.namespace).List(labels.Everything())
+	list, err := s.settingLister.Settings(s.namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +686,7 @@ func (s *DataStore) ListSettings() (map[types.SettingName]*longhorn.Setting, err
 	for _, itemRO := range list {
 		// Cannot use cached object from lister
 		settingField := types.SettingName(itemRO.Name)
-		// Ignore the items that we don't recongize
+		// Ignore the items that we don't recognize
 		if _, ok := types.GetSettingDefinition(settingField); ok {
 			itemMap[settingField] = itemRO.DeepCopy()
 		}
@@ -458,6 +709,63 @@ func (s *DataStore) ListSettings() (map[types.SettingName]*longhorn.Setting, err
 	return itemMap, nil
 }
 
+// GetAutoBalancedReplicasSetting retrieves the replica auto-balance setting for
+// a Longhorn Volume.
+//
+// This function prioritized the replica auto-balance setting in the Volume spec (`volume.Spec.ReplicaAutoBalance`).
+// If not defined or set to `Ignored`, the global setting will be used.
+//
+// Parameters:
+//   - volume: The Longhorn Volume object.
+//   - logger: The logger to use.
+//
+// Returns:
+// - longhorn.ReplicaAutoBalance: The auto-balance setting value for the Volume.
+func (s *DataStore) GetAutoBalancedReplicasSetting(volume *longhorn.Volume, logger *logrus.Entry) longhorn.ReplicaAutoBalance {
+	var setting longhorn.ReplicaAutoBalance
+
+	volumeSetting := volume.Spec.ReplicaAutoBalance
+	if volumeSetting != longhorn.ReplicaAutoBalanceIgnored {
+		setting = volumeSetting
+	}
+
+	var err error
+	if setting == "" {
+		globalSetting, _ := s.GetSettingValueExisted(types.SettingNameReplicaAutoBalance)
+
+		if globalSetting == string(longhorn.ReplicaAutoBalanceIgnored) {
+			globalSetting = string(longhorn.ReplicaAutoBalanceDisabled)
+		}
+
+		setting = longhorn.ReplicaAutoBalance(globalSetting)
+	}
+
+	err = types.ValidateReplicaAutoBalance(longhorn.ReplicaAutoBalance(setting))
+	if err != nil {
+		setting = longhorn.ReplicaAutoBalanceDisabled
+		logger.WithError(err).Warnf("replica auto-balance is disabled")
+	}
+	return setting
+}
+
+func (s *DataStore) GetEncryptionSecret(secretNamespace, secretName string) (map[string]string, error) {
+	secret, err := s.GetSecretRO(secretNamespace, secretName)
+	if err != nil {
+		return nil, err
+	}
+	credentialSecret := make(map[string]string)
+	if secret.Data == nil {
+		return credentialSecret, nil
+	}
+	credentialSecret[types.CryptoKeyProvider] = string(secret.Data[types.CryptoKeyProvider])
+	credentialSecret[types.CryptoKeyValue] = string(secret.Data[types.CryptoKeyValue])
+	credentialSecret[types.CryptoKeyCipher] = string(secret.Data[types.CryptoKeyCipher])
+	credentialSecret[types.CryptoKeyHash] = string(secret.Data[types.CryptoKeyHash])
+	credentialSecret[types.CryptoKeySize] = string(secret.Data[types.CryptoKeySize])
+	credentialSecret[types.CryptoPBKDF] = string(secret.Data[types.CryptoPBKDF])
+	return credentialSecret, nil
+}
+
 // GetCredentialFromSecret gets the Secret of the given name and namespace
 // Returns a new credential object or error
 func (s *DataStore) GetCredentialFromSecret(secretName string) (map[string]string, error) {
@@ -474,6 +782,12 @@ func (s *DataStore) GetCredentialFromSecret(secretName string) (map[string]strin
 	credentialSecret[types.AWSSecretKey] = string(secret.Data[types.AWSSecretKey])
 	credentialSecret[types.AWSEndPoint] = string(secret.Data[types.AWSEndPoint])
 	credentialSecret[types.AWSCert] = string(secret.Data[types.AWSCert])
+	credentialSecret[types.CIFSUsername] = string(secret.Data[types.CIFSUsername])
+	credentialSecret[types.CIFSPassword] = string(secret.Data[types.CIFSPassword])
+	credentialSecret[types.AZBlobAccountName] = string(secret.Data[types.AZBlobAccountName])
+	credentialSecret[types.AZBlobAccountKey] = string(secret.Data[types.AZBlobAccountKey])
+	credentialSecret[types.AZBlobEndpoint] = string(secret.Data[types.AZBlobEndpoint])
+	credentialSecret[types.AZBlobCert] = string(secret.Data[types.AZBlobCert])
 	credentialSecret[types.HTTPSProxy] = string(secret.Data[types.HTTPSProxy])
 	credentialSecret[types.HTTPProxy] = string(secret.Data[types.HTTPProxy])
 	credentialSecret[types.NOProxy] = string(secret.Data[types.NOProxy])
@@ -489,6 +803,11 @@ func CheckVolume(v *longhorn.Volume) error {
 	if v.Name == "" || size == 0 || v.Spec.NumberOfReplicas == 0 {
 		return fmt.Errorf("BUG: missing required field %+v", v)
 	}
+
+	if v.Spec.Encrypted && size <= crypto.Luks2MinimalVolumeSize {
+		return fmt.Errorf("invalid volume size %v, need to be bigger than 16MiB, default LUKS2 header size for encryption", v.Spec.Size)
+	}
+
 	errs := validation.IsDNS1123Label(v.Name)
 	if len(errs) != 0 {
 		return fmt.Errorf("invalid volume name: %+v", errs)
@@ -496,34 +815,6 @@ func CheckVolume(v *longhorn.Volume) error {
 	if len(v.Name) > NameMaximumLength {
 		return fmt.Errorf("volume name is too long %v, must be less than %v characters",
 			v.Name, NameMaximumLength)
-	}
-	return nil
-}
-
-func tagVolumeLabel(volumeName string, obj runtime.Object) error {
-	metadata, err := meta.Accessor(obj)
-	if err != nil {
-		return err
-	}
-
-	labels := metadata.GetLabels()
-	if labels == nil {
-		labels = map[string]string{}
-	}
-
-	for k, v := range types.GetVolumeLabels(volumeName) {
-		labels[k] = v
-	}
-	metadata.SetLabels(labels)
-	return nil
-}
-
-func fixupMetadata(volumeName string, obj runtime.Object) error {
-	if err := tagVolumeLabel(volumeName, obj); err != nil {
-		return err
-	}
-	if err := util.AddFinalizer(longhornFinalizerKey, obj); err != nil {
-		return err
 	}
 	return nil
 }
@@ -571,9 +862,6 @@ func GetOwnerReferencesForRecurringJob(recurringJob *longhorn.RecurringJob) []me
 
 // CreateVolume creates a Longhorn Volume resource and verifies creation
 func (s *DataStore) CreateVolume(v *longhorn.Volume) (*longhorn.Volume, error) {
-	if err := fixupMetadata(v.Name, v); err != nil {
-		return nil, err
-	}
 	if err := FixupRecurringJob(v); err != nil {
 		return nil, err
 	}
@@ -602,9 +890,6 @@ func (s *DataStore) CreateVolume(v *longhorn.Volume) (*longhorn.Volume, error) {
 
 // UpdateVolume updates Longhorn Volume and verifies update
 func (s *DataStore) UpdateVolume(v *longhorn.Volume) (*longhorn.Volume, error) {
-	if err := fixupMetadata(v.Name, v); err != nil {
-		return nil, err
-	}
 	if err := FixupRecurringJob(v); err != nil {
 		return nil, err
 	}
@@ -658,12 +943,12 @@ func (s *DataStore) RemoveFinalizerForVolume(obj *longhorn.Volume) error {
 }
 
 func (s *DataStore) GetVolumeRO(name string) (*longhorn.Volume, error) {
-	return s.vLister.Volumes(s.namespace).Get(name)
+	return s.volumeLister.Volumes(s.namespace).Get(name)
 }
 
 // GetVolume returns a new volume object for the given namespace and name
 func (s *DataStore) GetVolume(name string) (*longhorn.Volume, error) {
-	resultRO, err := s.vLister.Volumes(s.namespace).Get(name)
+	resultRO, err := s.volumeLister.Volumes(s.namespace).Get(name)
 	if err != nil {
 		return nil, err
 	}
@@ -673,7 +958,7 @@ func (s *DataStore) GetVolume(name string) (*longhorn.Volume, error) {
 
 // ListVolumesRO returns a list of all Volumes for the given namespace
 func (s *DataStore) ListVolumesRO() ([]*longhorn.Volume, error) {
-	return s.vLister.Volumes(s.namespace).List(labels.Everything())
+	return s.volumeLister.Volumes(s.namespace).List(labels.Everything())
 }
 
 // ListVolumesROWithBackupVolumeName returns a single object contains all volumes
@@ -683,12 +968,12 @@ func (s *DataStore) ListVolumesROWithBackupVolumeName(backupVolumeName string) (
 	if err != nil {
 		return nil, err
 	}
-	return s.vLister.Volumes(s.namespace).List(selector)
+	return s.volumeLister.Volumes(s.namespace).List(selector)
 }
 
 // ListVolumesBySelectorRO returns a list of all Volumes for the given namespace
 func (s *DataStore) ListVolumesBySelectorRO(selector labels.Selector) ([]*longhorn.Volume, error) {
-	return s.vLister.Volumes(s.namespace).List(selector)
+	return s.volumeLister.Volumes(s.namespace).List(selector)
 }
 
 // ListVolumes returns an object contains all Volume
@@ -705,6 +990,17 @@ func (s *DataStore) ListVolumes() (map[string]*longhorn.Volume, error) {
 		itemMap[itemRO.Name] = itemRO.DeepCopy()
 	}
 	return itemMap, nil
+}
+
+func (s *DataStore) IsRegularRWXVolume(volumeName string) (bool, error) {
+	v, err := s.GetVolumeRO(volumeName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return v.Spec.AccessMode == longhorn.AccessModeReadWriteMany && !v.Spec.Migratable, nil
 }
 
 func MarshalLabelToVolumeRecurringJob(labels map[string]string) map[string]*longhorn.VolumeRecurringJob {
@@ -730,27 +1026,32 @@ func MarshalLabelToVolumeRecurringJob(labels map[string]string) map[string]*long
 	return jobMapVolumeJob
 }
 
-func (s *DataStore) DeleteVolumeRecurringJob(name string, isGroup bool, v *longhorn.Volume) (volume *longhorn.Volume, err error) {
-	vName := v.Name
-	defer func() {
-		err = errors.Wrapf(err, "failed to delete volume recurring jobs for %v", vName)
-	}()
-
-	key := ""
-	if isGroup {
-		key = types.GetRecurringJobLabelKey(types.LonghornLabelRecurringJobGroup, name)
-	} else {
-		key = types.GetRecurringJobLabelKey(types.LonghornLabelRecurringJob, name)
-	}
-	if _, exist := v.Labels[key]; exist {
-		delete(v.Labels, key)
-		v, err = s.UpdateVolume(v)
+// AddRecurringJobLabelToVolume adds a recurring job label to the given volume.
+func (s *DataStore) AddRecurringJobLabelToVolume(volume *longhorn.Volume, labelKey string) (*longhorn.Volume, error) {
+	var err error
+	if _, exist := volume.Labels[labelKey]; !exist {
+		volume.Labels[labelKey] = types.LonghornLabelValueEnabled
+		volume, err = s.UpdateVolume(volume)
 		if err != nil {
 			return nil, err
 		}
-		logrus.Debugf("Updated volume %v labels to %+v", v.Name, v.Labels)
+		logrus.Infof("Added volume %v recurring job label %v", volume.Name, labelKey)
 	}
-	return v, nil
+	return volume, nil
+}
+
+// RemoveRecurringJobLabelFromVolume removes a recurring job label from the given volume.
+func (s *DataStore) RemoveRecurringJobLabelFromVolume(volume *longhorn.Volume, labelKey string) (*longhorn.Volume, error) {
+	var err error
+	if _, exist := volume.Labels[labelKey]; exist {
+		delete(volume.Labels, labelKey)
+		volume, err = s.UpdateVolume(volume)
+		if err != nil {
+			return nil, err
+		}
+		logrus.Infof("Removed volume %v recurring job label %v", volume.Name, labelKey)
+	}
+	return volume, nil
 }
 
 // ListDRVolumesRO returns a single object contains all DR Volumes
@@ -770,9 +1071,9 @@ func (s *DataStore) ListDRVolumesRO() (map[string]*longhorn.Volume, error) {
 	return itemMap, nil
 }
 
-// ListDRVolumesROWithBackupVolumeName returns a single object contains the DR volumes
+// ListDRVolumesWithBackupVolumeNameRO returns a single object contains the DR volumes
 // matches to the backup volume name
-func (s *DataStore) ListDRVolumesROWithBackupVolumeName(backupVolumeName string) (map[string]*longhorn.Volume, error) {
+func (s *DataStore) ListDRVolumesWithBackupVolumeNameRO(backupVolumeName string) (map[string]*longhorn.Volume, error) {
 	itemMap := make(map[string]*longhorn.Volume)
 
 	list, err := s.ListVolumesROWithBackupVolumeName(backupVolumeName)
@@ -804,6 +1105,80 @@ func (s *DataStore) ListVolumesByLabelSelector(selector labels.Selector) (map[st
 	return itemMap, nil
 }
 
+// ListVolumesFollowsGlobalSettingsRO returns an object contains all Volumes
+// that don't apply specific spec and follow the global settings
+func (s *DataStore) ListVolumesFollowsGlobalSettingsRO(followedSettingNames map[string]bool) (map[string]*longhorn.Volume, error) {
+	itemMap := make(map[string]*longhorn.Volume)
+
+	followedGlobalSettingsLabels := map[string]string{}
+	for sName := range followedSettingNames {
+		if types.SettingsRelatedToVolume[sName] != types.LonghornLabelValueIgnored {
+			continue
+		}
+		followedGlobalSettingsLabels[types.GetVolumeSettingLabelKey(sName)] = types.LonghornLabelValueIgnored
+	}
+	selectors, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
+		MatchLabels: followedGlobalSettingsLabels,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := s.ListVolumesBySelectorRO(selectors)
+	if err != nil {
+		return nil, err
+	}
+	for _, itemRO := range list {
+		itemMap[itemRO.Name] = itemRO
+	}
+
+	return itemMap, nil
+}
+
+// ListVolumesByBackupVolumeRO returns an object contains all Volumes with the specified backup-volume label
+func (s *DataStore) ListVolumesByBackupVolumeRO(backupVolumeName string) (map[string]*longhorn.Volume, error) {
+	itemMap := make(map[string]*longhorn.Volume)
+
+	labels := map[string]string{
+		types.LonghornLabelBackupVolume: backupVolumeName,
+	}
+
+	selectors, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
+		MatchLabels: labels,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	list, err := s.ListVolumesBySelectorRO(selectors)
+	if err != nil {
+		return nil, err
+	}
+	for _, itemRO := range list {
+		itemMap[itemRO.Name] = itemRO
+	}
+
+	return itemMap, nil
+}
+
+// GetLabelsForVolumesFollowsGlobalSettings returns a label map in which
+// contains all global settings the volume follows
+func GetLabelsForVolumesFollowsGlobalSettings(volume *longhorn.Volume) map[string]string {
+	followedGlobalSettingsLabels := map[string]string{}
+	// The items here should match types.SettingsRelatedToVolume
+	if volume.Spec.ReplicaAutoBalance == longhorn.ReplicaAutoBalanceIgnored {
+		followedGlobalSettingsLabels[types.GetVolumeSettingLabelKey(string(types.SettingNameReplicaAutoBalance))] = types.LonghornLabelValueIgnored
+	}
+	if volume.Spec.SnapshotDataIntegrity == longhorn.SnapshotDataIntegrityIgnored {
+		followedGlobalSettingsLabels[types.GetVolumeSettingLabelKey(string(types.SettingNameSnapshotDataIntegrity))] = types.LonghornLabelValueIgnored
+	}
+	if volume.Spec.UnmapMarkSnapChainRemoved == longhorn.UnmapMarkSnapChainRemovedIgnored {
+		followedGlobalSettingsLabels[types.GetVolumeSettingLabelKey(string(types.SettingNameRemoveSnapshotsDuringFilesystemTrim))] = types.LonghornLabelValueIgnored
+	}
+
+	return followedGlobalSettingsLabels
+}
+
 func checkEngine(engine *longhorn.Engine) error {
 	if engine.Name == "" || engine.Spec.VolumeName == "" {
 		return fmt.Errorf("BUG: missing required field %+v", engine)
@@ -826,7 +1201,12 @@ func GetCurrentEngineAndExtras(v *longhorn.Volume, es map[string]*longhorn.Engin
 	if currentEngine == nil {
 		logrus.Warnf("failed to directly pick up the current one from multiple engines for volume %v, fall back to detect the new current engine, "+
 			"current node %v, desire node %v", v.Name, v.Status.CurrentNodeID, v.Spec.NodeID)
-		return GetNewCurrentEngineAndExtras(v, es)
+		newCurrentEngine, extras, err := GetNewCurrentEngineAndExtras(v, es)
+		if err != nil {
+			return nil, nil, err
+		}
+		newCurrentEngine.Spec.Active = true
+		return newCurrentEngine, extras, nil
 	}
 	return
 }
@@ -839,16 +1219,40 @@ func GetNewCurrentEngineAndExtras(v *longhorn.Volume, es map[string]*longhorn.En
 		if e.Spec.Active {
 			oldEngineName = e.Name
 		}
+		if e.DeletionTimestamp != nil {
+			continue // We cannot use a deleted engine.
+		}
 		if (v.Spec.NodeID != "" && v.Spec.NodeID == e.Spec.NodeID) ||
-			(v.Status.CurrentNodeID != "" && v.Status.CurrentNodeID == e.Spec.NodeID) ||
-			(v.Status.PendingNodeID != "" && v.Status.PendingNodeID == e.Spec.NodeID) {
+			(v.Status.CurrentNodeID != "" && v.Status.CurrentNodeID == e.Spec.NodeID) {
 			if currentEngine != nil {
 				return nil, nil, fmt.Errorf("BUG: found the second new active engine %v besides %v", e.Name, currentEngine.Name)
 			}
 			currentEngine = e
-			currentEngine.Spec.Active = true
 		} else {
 			extras = append(extras, e)
+		}
+	}
+
+	// Corner case:
+	// During a migration confirmation, we make the following requests to the API server:
+	// 1. Delete the active engine (guaranteed to succeed or we don't do anything else).
+	// 2. Switch the new current replicas to active (might fail, preventing everything below).
+	// 3. Set the new current engine to active (might fail, preventing everything below).
+	// 4. Set the volume.Status.CurrentNodeID (might fail).
+	// So we might delete the active engine, fail to set the new current engine to active, and fail to set the
+	// volume.Spec.CurrentNodeID. Then, the volume attachment controller might try to do a full detachment, setting
+	// volume.Spec.NodeID == "". At this point, there is no engine that can ever be considered active again by the rules
+	// above, but we want to use the new current engine. It's engine.Spec.NodeID ==
+	// volume.Status.CurrentMigrationNodeID.
+	if currentEngine == nil {
+		extrasCopy := extras
+		extras = []*longhorn.Engine{}
+		for _, e := range extrasCopy {
+			if e.Spec.NodeID != "" && e.Spec.NodeID == v.Status.CurrentMigrationNodeID {
+				currentEngine = e
+			} else {
+				extras = append(extras, e)
+			}
 		}
 	}
 
@@ -877,7 +1281,7 @@ func (s *DataStore) PickVolumeCurrentEngine(v *longhorn.Volume, es map[string]*l
 
 // GetVolumeCurrentEngine returns the Engine for a volume with the given namespace
 func (s *DataStore) GetVolumeCurrentEngine(volumeName string) (*longhorn.Engine, error) {
-	es, err := s.ListVolumeEngines(volumeName)
+	es, err := s.ListVolumeEnginesRO(volumeName)
 	if err != nil {
 		return nil, err
 	}
@@ -885,7 +1289,11 @@ func (s *DataStore) GetVolumeCurrentEngine(volumeName string) (*longhorn.Engine,
 	if err != nil {
 		return nil, err
 	}
-	return s.PickVolumeCurrentEngine(v, es)
+	e, err := s.PickVolumeCurrentEngine(v, es)
+	if err != nil {
+		return nil, err
+	}
+	return e.DeepCopy(), nil
 }
 
 // CreateEngine creates a Longhorn Engine resource and verifies creation
@@ -893,10 +1301,7 @@ func (s *DataStore) CreateEngine(e *longhorn.Engine) (*longhorn.Engine, error) {
 	if err := checkEngine(e); err != nil {
 		return nil, err
 	}
-	if err := fixupMetadata(e.Spec.VolumeName, e); err != nil {
-		return nil, err
-	}
-	if err := tagNodeLabel(e.Spec.NodeID, e); err != nil {
+	if err := labelNode(e.Spec.NodeID, e); err != nil {
 		return nil, err
 	}
 
@@ -927,10 +1332,7 @@ func (s *DataStore) UpdateEngine(e *longhorn.Engine) (*longhorn.Engine, error) {
 	if err := checkEngine(e); err != nil {
 		return nil, err
 	}
-	if err := fixupMetadata(e.Spec.VolumeName, e); err != nil {
-		return nil, err
-	}
-	if err := tagNodeLabel(e.Spec.NodeID, e); err != nil {
+	if err := labelNode(e.Spec.NodeID, e); err != nil {
 		return nil, err
 	}
 
@@ -983,7 +1385,7 @@ func (s *DataStore) RemoveFinalizerForEngine(obj *longhorn.Engine) error {
 }
 
 func (s *DataStore) GetEngineRO(name string) (*longhorn.Engine, error) {
-	return s.eLister.Engines(s.namespace).Get(name)
+	return s.engineLister.Engines(s.namespace).Get(name)
 }
 
 // GetEngine returns the Engine for the given name and namespace
@@ -998,7 +1400,7 @@ func (s *DataStore) GetEngine(name string) (*longhorn.Engine, error) {
 }
 
 func (s *DataStore) listEngines(selector labels.Selector) (map[string]*longhorn.Engine, error) {
-	list, err := s.eLister.Engines(s.namespace).List(selector)
+	list, err := s.engineLister.Engines(s.namespace).List(selector)
 	if err != nil {
 		return nil, err
 	}
@@ -1017,7 +1419,7 @@ func (s *DataStore) ListEngines() (map[string]*longhorn.Engine, error) {
 
 // ListEnginesRO returns a list of all Engine for the given namespace
 func (s *DataStore) ListEnginesRO() ([]*longhorn.Engine, error) {
-	return s.eLister.Engines(s.namespace).List(labels.Everything())
+	return s.engineLister.Engines(s.namespace).List(labels.Everything())
 }
 
 // ListVolumeEngines returns an object contains all Engines with the given
@@ -1028,6 +1430,25 @@ func (s *DataStore) ListVolumeEngines(volumeName string) (map[string]*longhorn.E
 		return nil, err
 	}
 	return s.listEngines(selector)
+}
+
+func (s *DataStore) ListVolumeEnginesRO(volumeName string) (map[string]*longhorn.Engine, error) {
+	selector, err := getVolumeSelector(volumeName)
+	if err != nil {
+		return nil, err
+	}
+
+	engineList, err := s.engineLister.Engines(s.namespace).List(selector)
+	if err != nil {
+		return nil, err
+	}
+
+	engineMap := make(map[string]*longhorn.Engine, len(engineList))
+	for _, e := range engineList {
+		engineMap[e.Name] = e
+	}
+
+	return engineMap, nil
 }
 
 func checkReplica(r *longhorn.Replica) error {
@@ -1048,16 +1469,13 @@ func (s *DataStore) CreateReplica(r *longhorn.Replica) (*longhorn.Replica, error
 	if err := checkReplica(r); err != nil {
 		return nil, err
 	}
-	if err := fixupMetadata(r.Spec.VolumeName, r); err != nil {
+	if err := labelNode(r.Spec.NodeID, r); err != nil {
 		return nil, err
 	}
-	if err := tagNodeLabel(r.Spec.NodeID, r); err != nil {
+	if err := labelDiskUUID(r.Spec.DiskID, r); err != nil {
 		return nil, err
 	}
-	if err := tagDiskUUIDLabel(r.Spec.DiskID, r); err != nil {
-		return nil, err
-	}
-	if err := tagBackingImageLabel(r.Spec.BackingImage, r); err != nil {
+	if err := labelBackingImage(r.Spec.BackingImage, r); err != nil {
 		return nil, err
 	}
 
@@ -1070,7 +1488,7 @@ func (s *DataStore) CreateReplica(r *longhorn.Replica) (*longhorn.Replica, error
 	}
 
 	obj, err := verifyCreation(ret.Name, "replica", func(name string) (runtime.Object, error) {
-		return s.getReplicaRO(name)
+		return s.GetReplicaRO(name)
 	})
 	if err != nil {
 		return nil, err
@@ -1088,16 +1506,13 @@ func (s *DataStore) UpdateReplica(r *longhorn.Replica) (*longhorn.Replica, error
 	if err := checkReplica(r); err != nil {
 		return nil, err
 	}
-	if err := fixupMetadata(r.Spec.VolumeName, r); err != nil {
+	if err := labelNode(r.Spec.NodeID, r); err != nil {
 		return nil, err
 	}
-	if err := tagNodeLabel(r.Spec.NodeID, r); err != nil {
+	if err := labelDiskUUID(r.Spec.DiskID, r); err != nil {
 		return nil, err
 	}
-	if err := tagDiskUUIDLabel(r.Spec.DiskID, r); err != nil {
-		return nil, err
-	}
-	if err := tagBackingImageLabel(r.Spec.BackingImage, r); err != nil {
+	if err := labelBackingImage(r.Spec.BackingImage, r); err != nil {
 		return nil, err
 	}
 
@@ -1106,7 +1521,7 @@ func (s *DataStore) UpdateReplica(r *longhorn.Replica) (*longhorn.Replica, error
 		return nil, err
 	}
 	verifyUpdate(r.Name, obj, func(name string) (runtime.Object, error) {
-		return s.getReplicaRO(name)
+		return s.GetReplicaRO(name)
 	})
 	return obj, nil
 }
@@ -1122,7 +1537,7 @@ func (s *DataStore) UpdateReplicaStatus(r *longhorn.Replica) (*longhorn.Replica,
 		return nil, err
 	}
 	verifyUpdate(r.Name, obj, func(name string) (runtime.Object, error) {
-		return s.getReplicaRO(name)
+		return s.GetReplicaRO(name)
 	})
 	return obj, nil
 }
@@ -1156,7 +1571,7 @@ func (s *DataStore) RemoveFinalizerForReplica(obj *longhorn.Replica) error {
 // GetReplica gets Replica for the given name and namespace and returns
 // a new Replica object
 func (s *DataStore) GetReplica(name string) (*longhorn.Replica, error) {
-	resultRO, err := s.getReplicaRO(name)
+	resultRO, err := s.GetReplicaRO(name)
 	if err != nil {
 		return nil, err
 	}
@@ -1164,12 +1579,12 @@ func (s *DataStore) GetReplica(name string) (*longhorn.Replica, error) {
 	return resultRO.DeepCopy(), nil
 }
 
-func (s *DataStore) getReplicaRO(name string) (*longhorn.Replica, error) {
-	return s.rLister.Replicas(s.namespace).Get(name)
+func (s *DataStore) GetReplicaRO(name string) (*longhorn.Replica, error) {
+	return s.replicaLister.Replicas(s.namespace).Get(name)
 }
 
 func (s *DataStore) listReplicas(selector labels.Selector) (map[string]*longhorn.Replica, error) {
-	list, err := s.rLister.Replicas(s.namespace).List(selector)
+	list, err := s.replicaLister.Replicas(s.namespace).List(selector)
 	if err != nil {
 		return nil, err
 	}
@@ -1189,7 +1604,7 @@ func (s *DataStore) ListReplicas() (map[string]*longhorn.Replica, error) {
 
 // ListReplicasRO returns a list of all replicas for the given namespace
 func (s *DataStore) ListReplicasRO() ([]*longhorn.Replica, error) {
-	return s.rLister.Replicas(s.namespace).List(labels.Everything())
+	return s.replicaLister.Replicas(s.namespace).List(labels.Everything())
 }
 
 // ListVolumeReplicas returns an object contains all Replica with the given
@@ -1200,6 +1615,61 @@ func (s *DataStore) ListVolumeReplicas(volumeName string) (map[string]*longhorn.
 		return nil, err
 	}
 	return s.listReplicas(selector)
+}
+
+func (s *DataStore) ListVolumeReplicasRO(volumeName string) (map[string]*longhorn.Replica, error) {
+	selector, err := getVolumeSelector(volumeName)
+	if err != nil {
+		return nil, err
+	}
+
+	rList, err := s.replicaLister.Replicas(s.namespace).List(selector)
+	if err != nil {
+		return nil, err
+	}
+
+	rMap := make(map[string]*longhorn.Replica, len(rList))
+	for _, rRO := range rList {
+		rMap[rRO.Name] = rRO
+	}
+
+	return rMap, nil
+}
+
+// ListVolumeReplicasROMapByNode returns a map of read-only replicas grouped by
+// the node ID for the given volume.
+// The function organizes the replicas into a map where the keys is the node ID,
+// and the values are maps of replica names to the replica objects.
+// If successful, the function returns the map of replicas by node. Otherwise,
+// an error is returned.
+func (s *DataStore) ListVolumeReplicasROMapByNode(volumeName string) (map[string]map[string]*longhorn.Replica, error) {
+	// Get volume selector
+	selector, err := getVolumeSelector(volumeName)
+	if err != nil {
+		return nil, err
+	}
+
+	// List replicas based on the volume selector
+	replicaList, err := s.replicaLister.Replicas(s.namespace).List(selector)
+	if err != nil {
+		return nil, err
+	}
+
+	// Organize the replicas by node
+	replicaMapByNode := make(map[string]map[string]*longhorn.Replica)
+	for _, replica := range replicaList {
+		nodeID := replica.Spec.NodeID
+
+		// Create the map if it doesn't exist for the current replica's node
+		if _, exists := replicaMapByNode[nodeID]; !exists {
+			replicaMapByNode[nodeID] = make(map[string]*longhorn.Replica)
+		}
+
+		// Add the replica to the map
+		replicaMapByNode[nodeID][replica.Name] = replica
+	}
+
+	return replicaMapByNode, nil
 }
 
 // ReplicaAddressToReplicaName will directly return the address if the format
@@ -1233,6 +1703,80 @@ func IsAvailableHealthyReplica(r *longhorn.Replica) bool {
 	return true
 }
 
+func (s *DataStore) ListVolumePDBProtectedHealthyReplicasRO(volumeName string) (map[string]*longhorn.Replica, error) {
+	pdbProtectedHealthyReplicas := map[string]*longhorn.Replica{}
+	replicas, err := s.ListVolumeReplicasRO(volumeName)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, replica := range replicas {
+		if replica.Spec.HealthyAt == "" || replica.Spec.FailedAt != "" {
+			continue
+		}
+
+		unschedulable, err := s.IsKubeNodeUnschedulable(replica.Spec.NodeID)
+		if err != nil {
+			return map[string]*longhorn.Replica{}, err
+		}
+		if unschedulable {
+			continue
+		}
+
+		instanceManager, err := s.getRunningReplicaInstanceManagerRO(replica)
+		if err != nil {
+			return map[string]*longhorn.Replica{}, err
+		}
+		if instanceManager == nil {
+			continue
+		}
+
+		pdb, err := s.GetPDBRO(types.GetPDBName(instanceManager))
+		if err != nil && !ErrorIsNotFound(err) {
+			return map[string]*longhorn.Replica{}, err
+		}
+		if pdb != nil {
+			pdbProtectedHealthyReplicas[replica.Name] = replica
+		}
+	}
+
+	return pdbProtectedHealthyReplicas, nil
+}
+
+func (s *DataStore) getRunningReplicaInstanceManagerRO(r *longhorn.Replica) (im *longhorn.InstanceManager, err error) {
+	if r.Status.InstanceManagerName == "" {
+		im, err = s.GetInstanceManagerByInstanceRO(r)
+		if err != nil && !types.ErrorIsNotFound(err) {
+			return nil, err
+		}
+	} else {
+		im, err = s.GetInstanceManagerRO(r.Status.InstanceManagerName)
+		if err != nil && !ErrorIsNotFound(err) {
+			return nil, err
+		}
+	}
+	if im == nil || im.Status.CurrentState != longhorn.InstanceManagerStateRunning {
+		return nil, nil
+	}
+	return im, nil
+}
+
+// IsReplicaRebuildingFailed returns true if the rebuilding replica failed not caused by network issues.
+func IsReplicaRebuildingFailed(reusableFailedReplica *longhorn.Replica) bool {
+	replicaRebuildFailedCondition := types.GetCondition(reusableFailedReplica.Status.Conditions, longhorn.ReplicaConditionTypeRebuildFailed)
+
+	if replicaRebuildFailedCondition.Status != longhorn.ConditionStatusTrue {
+		return true
+	}
+
+	switch replicaRebuildFailedCondition.Reason {
+	case longhorn.ReplicaConditionReasonRebuildFailedDisconnection, longhorn.NodeConditionReasonManagerPodDown, longhorn.NodeConditionReasonKubernetesNodeGone, longhorn.NodeConditionReasonKubernetesNodeNotReady:
+		return false
+	default:
+		return true
+	}
+}
+
 // GetOwnerReferencesForEngineImage returns OwnerReference for the given
 // Longhorn EngineImage name and UID
 func GetOwnerReferencesForEngineImage(ei *longhorn.EngineImage) []metav1.OwnerReference {
@@ -1260,7 +1804,7 @@ func (s *DataStore) CreateEngineImage(img *longhorn.EngineImage) (*longhorn.Engi
 	}
 
 	obj, err := verifyCreation(ret.Name, "engine image", func(name string) (runtime.Object, error) {
-		return s.getEngineImageRO(name)
+		return s.GetEngineImageRO(name)
 	})
 	if err != nil {
 		return nil, err
@@ -1275,16 +1819,12 @@ func (s *DataStore) CreateEngineImage(img *longhorn.EngineImage) (*longhorn.Engi
 
 // UpdateEngineImage updates Longhorn EngineImage and verifies update
 func (s *DataStore) UpdateEngineImage(img *longhorn.EngineImage) (*longhorn.EngineImage, error) {
-	if err := util.AddFinalizer(longhornFinalizerKey, img); err != nil {
-		return nil, err
-	}
-
 	obj, err := s.lhClient.LonghornV1beta2().EngineImages(s.namespace).Update(context.TODO(), img, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
 	}
 	verifyUpdate(img.Name, obj, func(name string) (runtime.Object, error) {
-		return s.getEngineImageRO(name)
+		return s.GetEngineImageRO(name)
 	})
 	return obj, nil
 }
@@ -1297,7 +1837,7 @@ func (s *DataStore) UpdateEngineImageStatus(img *longhorn.EngineImage) (*longhor
 		return nil, err
 	}
 	verifyUpdate(img.Name, obj, func(name string) (runtime.Object, error) {
-		return s.getEngineImageRO(name)
+		return s.GetEngineImageRO(name)
 	})
 	return obj, nil
 }
@@ -1329,14 +1869,14 @@ func (s *DataStore) RemoveFinalizerForEngineImage(obj *longhorn.EngineImage) err
 	return nil
 }
 
-func (s *DataStore) getEngineImageRO(name string) (*longhorn.EngineImage, error) {
-	return s.iLister.EngineImages(s.namespace).Get(name)
+func (s *DataStore) GetEngineImageRO(name string) (*longhorn.EngineImage, error) {
+	return s.engineImageLister.EngineImages(s.namespace).Get(name)
 }
 
 // GetEngineImage returns a new EngineImage object for the given name and
 // namespace
 func (s *DataStore) GetEngineImage(name string) (*longhorn.EngineImage, error) {
-	resultRO, err := s.getEngineImageRO(name)
+	resultRO, err := s.GetEngineImageRO(name)
 	if err != nil {
 		return nil, err
 	}
@@ -1344,11 +1884,26 @@ func (s *DataStore) GetEngineImage(name string) (*longhorn.EngineImage, error) {
 	return resultRO.DeepCopy(), nil
 }
 
+func (s *DataStore) GetEngineImageByImage(image string) (*longhorn.EngineImage, error) {
+	engineImages, err := s.ListEngineImages()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, ei := range engineImages {
+		if ei.Spec.Image == image {
+			return ei, nil
+		}
+	}
+
+	return nil, errors.Errorf("cannot find engine image by %v", image)
+}
+
 // ListEngineImages returns object includes all EngineImage in namespace
 func (s *DataStore) ListEngineImages() (map[string]*longhorn.EngineImage, error) {
 	itemMap := map[string]*longhorn.EngineImage{}
 
-	list, err := s.iLister.EngineImages(s.namespace).List(labels.Everything())
+	list, err := s.engineImageLister.EngineImages(s.namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -1360,60 +1915,111 @@ func (s *DataStore) ListEngineImages() (map[string]*longhorn.EngineImage, error)
 	return itemMap, nil
 }
 
+func (s *DataStore) CheckDataEngineImageCompatiblityByImage(image string, dataEngine longhorn.DataEngineType) error {
+	if types.IsDataEngineV2(dataEngine) {
+		return nil
+	}
+
+	engineImage, err := s.GetEngineImageByImage(image)
+	if err != nil {
+		return err
+	}
+
+	if engineImage.Status.Incompatible {
+		return errors.Errorf("engine image %v is incompatible", engineImage.Name)
+	}
+
+	return nil
+}
+
 // CheckEngineImageReadiness return true if the engine IMAGE is deployed on all nodes in the NODES list
 func (s *DataStore) CheckEngineImageReadiness(image string, nodes ...string) (isReady bool, err error) {
-	if len(nodes) == 0 || (len(nodes) == 1 && nodes[0] == "") {
+	if len(nodes) == 0 {
 		return false, nil
 	}
-	ei, err := s.GetEngineImage(types.GetEngineImageChecksumName(image))
-	if err != nil {
-		return false, fmt.Errorf("unable to get engine image %v: %v", image, err)
-	}
-	if ei.Status.State != longhorn.EngineImageStateDeployed && ei.Status.State != longhorn.EngineImageStateDeploying {
+	if len(nodes) == 1 && nodes[0] == "" {
 		return false, nil
 	}
-	nodesHaveEngineImage, err := s.ListNodesWithEngineImage(ei)
+	ei, err := s.GetEngineImageRO(types.GetEngineImageChecksumName(image))
 	if err != nil {
-		return false, errors.Wrapf(err, "failed CheckEngineImageReadiness for nodes %v", nodes)
+		return false, errors.Wrapf(err, "failed to get engine image %v", image)
+	}
+	if ei.Status.State != longhorn.EngineImageStateDeployed &&
+		ei.Status.State != longhorn.EngineImageStateDeploying {
+		logrus.Warnf("CheckEngineImageReadiness: engine image %v is in state %v", image, ei.Status.State)
+		return false, nil
+	}
+	nodesHaveEngineImage, err := s.ListNodesContainingEngineImageRO(ei)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to list nodes containing engine image %v", image)
 	}
 	undeployedNodes := []string{}
 	for _, node := range nodes {
+		if node == "" {
+			continue
+		}
 		if _, ok := nodesHaveEngineImage[node]; !ok {
 			undeployedNodes = append(undeployedNodes, node)
 		}
 	}
 	if len(undeployedNodes) > 0 {
-		logrus.Debugf("CheckEngineImageReadiness: nodes %v don't have the engine image %v", undeployedNodes, image)
+		logrus.Infof("CheckEngineImageReadiness: nodes %v don't have the engine image %v", undeployedNodes, image)
 		return false, nil
 	}
 	return true, nil
 }
 
-// CheckEngineImageReadyOnAtLeastOneVolumeReplica checks if the IMAGE is deployed on the NODEID and on at least one of the the volume's replicas
-func (s *DataStore) CheckEngineImageReadyOnAtLeastOneVolumeReplica(image, volumeName, nodeID string) (bool, error) {
-	replicas, err := s.ListVolumeReplicas(volumeName)
+func (s *DataStore) CheckDataEngineImageReadiness(image string, dataEngine longhorn.DataEngineType, nodes ...string) (isReady bool, err error) {
+	if types.IsDataEngineV2(dataEngine) {
+		if len(nodes) == 0 {
+			return false, nil
+		}
+		if len(nodes) == 1 && nodes[0] == "" {
+			return false, nil
+		}
+		return true, nil
+	}
+	// For data engine v1, we need to check the engine image readiness
+	return s.CheckEngineImageReadiness(image, nodes...)
+}
+
+// CheckDataEngineImageReadyOnAtLeastOneVolumeReplica checks if the IMAGE is deployed on the NODEID and on at least one of the the volume's replicas
+func (s *DataStore) CheckDataEngineImageReadyOnAtLeastOneVolumeReplica(image, volumeName, nodeID string, dataLocality longhorn.DataLocality, dataEngine longhorn.DataEngineType) (bool, error) {
+	isReady, err := s.CheckDataEngineImageReadiness(image, dataEngine, nodeID)
 	if err != nil {
-		return false, fmt.Errorf("cannot get replicas for volume %v: %w", volumeName, err)
+		return false, errors.Wrapf(err, "failed to check data engine image readiness of node %v", nodeID)
 	}
 
-	isReady, err := s.CheckEngineImageReadiness(image, nodeID)
-	if nodeID != "" && !isReady {
-		return isReady, err
+	if !isReady || dataLocality == longhorn.DataLocalityStrictLocal {
+		return isReady, nil
 	}
+
+	replicas, err := s.ListVolumeReplicas(volumeName)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to get replicas for volume %v", volumeName)
+	}
+
+	hasScheduledReplica := false
 	for _, r := range replicas {
-		isReady, err := s.CheckEngineImageReadiness(image, r.Spec.NodeID)
+		isReady, err := s.CheckDataEngineImageReadiness(image, r.Spec.DataEngine, r.Spec.NodeID)
 		if err != nil || isReady {
 			return isReady, err
 		}
+		if r.Spec.NodeID != "" {
+			hasScheduledReplica = true
+		}
+	}
+	if !hasScheduledReplica {
+		return false, errors.Errorf("volume %v has no scheduled replicas", volumeName)
 	}
 	return false, nil
 }
 
-// CheckEngineImageReadyOnAllVolumeReplicas checks if the IMAGE is deployed on the NODEID as well as all the volume's replicas
-func (s *DataStore) CheckEngineImageReadyOnAllVolumeReplicas(image, volumeName, nodeID string) (bool, error) {
+// CheckImageReadyOnAllVolumeReplicas checks if the IMAGE is deployed on the NODEID as well as all the volume's replicas
+func (s *DataStore) CheckImageReadyOnAllVolumeReplicas(image, volumeName, nodeID string, dataEngine longhorn.DataEngineType) (bool, error) {
 	replicas, err := s.ListVolumeReplicas(volumeName)
 	if err != nil {
-		return false, fmt.Errorf("cannot get replicas for volume %v: %w", volumeName, err)
+		return false, errors.Wrapf(err, "failed to get replicas for volume %v", volumeName)
 	}
 	nodes := []string{}
 	if nodeID != "" {
@@ -1424,7 +2030,7 @@ func (s *DataStore) CheckEngineImageReadyOnAllVolumeReplicas(image, volumeName, 
 			nodes = append(nodes, r.Spec.NodeID)
 		}
 	}
-	return s.CheckEngineImageReadiness(image, nodes...)
+	return s.CheckDataEngineImageReadiness(image, dataEngine, nodes...)
 }
 
 // CreateBackingImage creates a Longhorn BackingImage resource and verifies
@@ -1439,7 +2045,7 @@ func (s *DataStore) CreateBackingImage(backingImage *longhorn.BackingImage) (*lo
 	}
 
 	obj, err := verifyCreation(ret.Name, "backing image", func(name string) (runtime.Object, error) {
-		return s.getBackingImageRO(name)
+		return s.GetBackingImageRO(name)
 	})
 	if err != nil {
 		return nil, err
@@ -1454,15 +2060,12 @@ func (s *DataStore) CreateBackingImage(backingImage *longhorn.BackingImage) (*lo
 
 // UpdateBackingImage updates Longhorn BackingImage and verifies update
 func (s *DataStore) UpdateBackingImage(backingImage *longhorn.BackingImage) (*longhorn.BackingImage, error) {
-	if err := util.AddFinalizer(longhornFinalizerKey, backingImage); err != nil {
-		return nil, err
-	}
 	obj, err := s.lhClient.LonghornV1beta2().BackingImages(s.namespace).Update(context.TODO(), backingImage, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
 	}
 	verifyUpdate(backingImage.Name, obj, func(name string) (runtime.Object, error) {
-		return s.getBackingImageRO(name)
+		return s.GetBackingImageRO(name)
 	})
 	return obj, nil
 }
@@ -1475,7 +2078,7 @@ func (s *DataStore) UpdateBackingImageStatus(backingImage *longhorn.BackingImage
 		return nil, err
 	}
 	verifyUpdate(backingImage.Name, obj, func(name string) (runtime.Object, error) {
-		return s.getBackingImageRO(name)
+		return s.GetBackingImageRO(name)
 	})
 	return obj, nil
 }
@@ -1507,14 +2110,14 @@ func (s *DataStore) RemoveFinalizerForBackingImage(obj *longhorn.BackingImage) e
 	return nil
 }
 
-func (s *DataStore) getBackingImageRO(name string) (*longhorn.BackingImage, error) {
-	return s.biLister.BackingImages(s.namespace).Get(name)
+func (s *DataStore) GetBackingImageRO(name string) (*longhorn.BackingImage, error) {
+	return s.backingImageLister.BackingImages(s.namespace).Get(name)
 }
 
 // GetBackingImage returns a new BackingImage object for the given name and
 // namespace
 func (s *DataStore) GetBackingImage(name string) (*longhorn.BackingImage, error) {
-	resultRO, err := s.getBackingImageRO(name)
+	resultRO, err := s.GetBackingImageRO(name)
 	if err != nil {
 		return nil, err
 	}
@@ -1526,7 +2129,7 @@ func (s *DataStore) GetBackingImage(name string) (*longhorn.BackingImage, error)
 func (s *DataStore) ListBackingImages() (map[string]*longhorn.BackingImage, error) {
 	itemMap := map[string]*longhorn.BackingImage{}
 
-	list, err := s.biLister.BackingImages(s.namespace).List(labels.Everything())
+	list, err := s.backingImageLister.BackingImages(s.namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -1536,6 +2139,11 @@ func (s *DataStore) ListBackingImages() (map[string]*longhorn.BackingImage, erro
 		itemMap[itemRO.Name] = itemRO.DeepCopy()
 	}
 	return itemMap, nil
+}
+
+// ListBackingImagesRO returns object includes all BackingImage in namespace
+func (s *DataStore) ListBackingImagesRO() ([]*longhorn.BackingImage, error) {
+	return s.backingImageLister.BackingImages(s.namespace).List(labels.Everything())
 }
 
 // GetOwnerReferencesForBackingImage returns OwnerReference for the given
@@ -1561,10 +2169,10 @@ func (s *DataStore) CreateBackingImageManager(backingImageManager *longhorn.Back
 	if err := initBackingImageManager(backingImageManager); err != nil {
 		return nil, err
 	}
-	if err := tagLonghornNodeLabel(backingImageManager.Spec.NodeID, backingImageManager); err != nil {
+	if err := labelLonghornNode(backingImageManager.Spec.NodeID, backingImageManager); err != nil {
 		return nil, err
 	}
-	if err := tagLonghornDiskUUIDLabel(backingImageManager.Spec.DiskUUID, backingImageManager); err != nil {
+	if err := labelLonghornDiskUUID(backingImageManager.Spec.DiskUUID, backingImageManager); err != nil {
 		return nil, err
 	}
 
@@ -1577,7 +2185,7 @@ func (s *DataStore) CreateBackingImageManager(backingImageManager *longhorn.Back
 	}
 
 	obj, err := verifyCreation(ret.Name, "backing image manager", func(name string) (runtime.Object, error) {
-		return s.getBackingImageManagerRO(name)
+		return s.GetBackingImageManagerRO(name)
 	})
 	if err != nil {
 		return nil, err
@@ -1599,13 +2207,10 @@ func initBackingImageManager(backingImageManager *longhorn.BackingImageManager) 
 
 // UpdateBackingImageManager updates Longhorn BackingImageManager and verifies update
 func (s *DataStore) UpdateBackingImageManager(backingImageManager *longhorn.BackingImageManager) (*longhorn.BackingImageManager, error) {
-	if err := util.AddFinalizer(longhornFinalizerKey, backingImageManager); err != nil {
+	if err := labelLonghornNode(backingImageManager.Spec.NodeID, backingImageManager); err != nil {
 		return nil, err
 	}
-	if err := tagLonghornNodeLabel(backingImageManager.Spec.NodeID, backingImageManager); err != nil {
-		return nil, err
-	}
-	if err := tagLonghornDiskUUIDLabel(backingImageManager.Spec.DiskUUID, backingImageManager); err != nil {
+	if err := labelLonghornDiskUUID(backingImageManager.Spec.DiskUUID, backingImageManager); err != nil {
 		return nil, err
 	}
 
@@ -1614,7 +2219,7 @@ func (s *DataStore) UpdateBackingImageManager(backingImageManager *longhorn.Back
 		return nil, err
 	}
 	verifyUpdate(backingImageManager.Name, obj, func(name string) (runtime.Object, error) {
-		return s.getBackingImageManagerRO(name)
+		return s.GetBackingImageManagerRO(name)
 	})
 	return obj, nil
 }
@@ -1627,7 +2232,7 @@ func (s *DataStore) UpdateBackingImageManagerStatus(backingImageManager *longhor
 		return nil, err
 	}
 	verifyUpdate(backingImageManager.Name, obj, func(name string) (runtime.Object, error) {
-		return s.getBackingImageManagerRO(name)
+		return s.GetBackingImageManagerRO(name)
 	})
 	return obj, nil
 }
@@ -1658,14 +2263,14 @@ func (s *DataStore) RemoveFinalizerForBackingImageManager(obj *longhorn.BackingI
 	return nil
 }
 
-func (s *DataStore) getBackingImageManagerRO(name string) (*longhorn.BackingImageManager, error) {
-	return s.bimLister.BackingImageManagers(s.namespace).Get(name)
+func (s *DataStore) GetBackingImageManagerRO(name string) (*longhorn.BackingImageManager, error) {
+	return s.backingImageManagerLister.BackingImageManagers(s.namespace).Get(name)
 }
 
 // GetBackingImageManager returns a new BackingImageManager object for the given name and
 // namespace
 func (s *DataStore) GetBackingImageManager(name string) (*longhorn.BackingImageManager, error) {
-	resultRO, err := s.getBackingImageManagerRO(name)
+	resultRO, err := s.GetBackingImageManagerRO(name)
 	if err != nil {
 		return nil, err
 	}
@@ -1673,10 +2278,14 @@ func (s *DataStore) GetBackingImageManager(name string) (*longhorn.BackingImageM
 	return resultRO.DeepCopy(), nil
 }
 
+func (s *DataStore) ListBackingImageManagersRO() ([]*longhorn.BackingImageManager, error) {
+	return s.listBackingImageManagersRO(labels.Everything())
+}
+
 func (s *DataStore) listBackingImageManagers(selector labels.Selector) (map[string]*longhorn.BackingImageManager, error) {
 	itemMap := map[string]*longhorn.BackingImageManager{}
 
-	list, err := s.bimLister.BackingImageManagers(s.namespace).List(selector)
+	list, err := s.listBackingImageManagersRO(selector)
 	if err != nil {
 		return nil, err
 	}
@@ -1687,6 +2296,10 @@ func (s *DataStore) listBackingImageManagers(selector labels.Selector) (map[stri
 	return itemMap, nil
 }
 
+func (s *DataStore) listBackingImageManagersRO(selector labels.Selector) ([]*longhorn.BackingImageManager, error) {
+	return s.backingImageManagerLister.BackingImageManagers(s.namespace).List(selector)
+}
+
 // ListBackingImageManagers returns object includes all BackingImageManager in namespace
 func (s *DataStore) ListBackingImageManagers() (map[string]*longhorn.BackingImageManager, error) {
 	return s.listBackingImageManagers(labels.Everything())
@@ -1695,11 +2308,19 @@ func (s *DataStore) ListBackingImageManagers() (map[string]*longhorn.BackingImag
 // ListBackingImageManagersByNode gets a list of BackingImageManager
 // on a specific node with the given namespace.
 func (s *DataStore) ListBackingImageManagersByNode(nodeName string) (map[string]*longhorn.BackingImageManager, error) {
-	nodeSelector, err := getNodeSelector(nodeName)
+	nodeSelector, err := getLonghornNodeSelector(nodeName)
 	if err != nil {
 		return nil, err
 	}
 	return s.listBackingImageManagers(nodeSelector)
+}
+
+func (s *DataStore) ListBackingImageManagersByNodeRO(nodeName string) ([]*longhorn.BackingImageManager, error) {
+	nodeSelector, err := getLonghornNodeSelector(nodeName)
+	if err != nil {
+		return nil, err
+	}
+	return s.listBackingImageManagersRO(nodeSelector)
 }
 
 // ListBackingImageManagersByDiskUUID gets a list of BackingImageManager
@@ -1714,29 +2335,6 @@ func (s *DataStore) ListBackingImageManagersByDiskUUID(diskUUID string) (map[str
 		return nil, err
 	}
 	return s.listBackingImageManagers(diskSelector)
-}
-
-// ListDefaultBackingImageManagers gets a list of BackingImageManager
-// using default image with the given namespace.
-func (s *DataStore) ListDefaultBackingImageManagers() (map[string]*longhorn.BackingImageManager, error) {
-	defaultImage, err := s.GetSettingValueExisted(types.SettingNameDefaultBackingImageManagerImage)
-	if err != nil {
-		return nil, err
-	}
-
-	itemMap := map[string]*longhorn.BackingImageManager{}
-	list, err := s.bimLister.BackingImageManagers(s.namespace).List(labels.Everything())
-	if err != nil {
-		return nil, err
-	}
-	for _, itemRO := range list {
-		if itemRO.Spec.Image != defaultImage {
-			continue
-		}
-		// Cannot use cached object from lister
-		itemMap[itemRO.Name] = itemRO.DeepCopy()
-	}
-	return itemMap, nil
 }
 
 // GetOwnerReferencesForBackingImageManager returns OwnerReference for the given
@@ -1762,9 +2360,6 @@ func GetOwnerReferencesForBackingImageManager(backingImageManager *longhorn.Back
 // creation
 func (s *DataStore) CreateBackingImageDataSource(backingImageDataSource *longhorn.BackingImageDataSource) (*longhorn.BackingImageDataSource, error) {
 	if err := initBackingImageDataSource(backingImageDataSource); err != nil {
-		return nil, err
-	}
-	if err := util.AddFinalizer(longhornFinalizerKey, backingImageDataSource); err != nil {
 		return nil, err
 	}
 	ret, err := s.lhClient.LonghornV1beta2().BackingImageDataSources(s.namespace).Create(context.TODO(), backingImageDataSource, metav1.CreateOptions{})
@@ -1798,10 +2393,6 @@ func initBackingImageDataSource(backingImageDataSource *longhorn.BackingImageDat
 
 // UpdateBackingImageDataSource updates Longhorn BackingImageDataSource and verifies update
 func (s *DataStore) UpdateBackingImageDataSource(backingImageDataSource *longhorn.BackingImageDataSource) (*longhorn.BackingImageDataSource, error) {
-	if err := util.AddFinalizer(longhornFinalizerKey, backingImageDataSource); err != nil {
-		return nil, err
-	}
-
 	obj, err := s.lhClient.LonghornV1beta2().BackingImageDataSources(s.namespace).Update(context.TODO(), backingImageDataSource, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
@@ -1853,7 +2444,7 @@ func (s *DataStore) RemoveFinalizerForBackingImageDataSource(obj *longhorn.Backi
 }
 
 func (s *DataStore) getBackingImageDataSourceRO(name string) (*longhorn.BackingImageDataSource, error) {
-	return s.bidsLister.BackingImageDataSources(s.namespace).Get(name)
+	return s.backingImageDataSourceLister.BackingImageDataSources(s.namespace).Get(name)
 }
 
 // GetBackingImageDataSource returns a new BackingImageDataSource object for the given name and
@@ -1911,7 +2502,7 @@ func (s *DataStore) ListBackingImageDataSourcesByNode(nodeName string) (map[stri
 func (s *DataStore) listBackingImageDataSources(selector labels.Selector) (map[string]*longhorn.BackingImageDataSource, error) {
 	itemMap := map[string]*longhorn.BackingImageDataSource{}
 
-	list, err := s.bidsLister.BackingImageDataSources(s.namespace).List(selector)
+	list, err := s.backingImageDataSourceLister.BackingImageDataSources(s.namespace).List(selector)
 	if err != nil {
 		return nil, err
 	}
@@ -1976,12 +2567,11 @@ func (s *DataStore) CreateDefaultNode(name string) (*longhorn.Node, error) {
 			Name: name,
 		},
 		Spec: longhorn.NodeSpec{
-			Name:                     name,
-			AllowScheduling:          true,
-			EvictionRequested:        false,
-			Tags:                     []string{},
-			EngineManagerCPURequest:  0,
-			ReplicaManagerCPURequest: 0,
+			Name:                      name,
+			AllowScheduling:           true,
+			EvictionRequested:         false,
+			Tags:                      []string{},
+			InstanceManagerCPURequest: 0,
 		},
 	}
 
@@ -1995,18 +2585,40 @@ func (s *DataStore) CreateDefaultNode(name string) (*longhorn.Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		disks, err := types.CreateDefaultDisk(dataPath)
+		storageReservedPercentageForDefaultDisk, err := s.GetSettingAsInt(types.SettingNameStorageReservedPercentageForDefaultDisk)
 		if err != nil {
 			return nil, err
 		}
-		node.Spec.Disks = disks
+
+		if s.needDefaultDiskCreation(dataPath) {
+			disks, err := types.CreateDefaultDisk(dataPath, storageReservedPercentageForDefaultDisk)
+			if err != nil {
+				return nil, err
+			}
+			node.Spec.Disks = disks
+		}
 	}
 
 	return s.CreateNode(node)
 }
 
+func (s *DataStore) needDefaultDiskCreation(dataPath string) bool {
+	v2DataEngineEnabled, err := s.GetSettingAsBool(types.SettingNameV2DataEngine)
+	if err != nil {
+		logrus.WithError(err).Errorf("Failed to get setting %v", types.SettingNameV2DataEngine)
+		return false
+	}
+
+	if v2DataEngineEnabled {
+		return true
+	}
+
+	// Do not create default block-type disk if v2 data engine is disabled
+	return !types.IsPotentialBlockDisk(dataPath)
+}
+
 func (s *DataStore) GetNodeRO(name string) (*longhorn.Node, error) {
-	return s.nLister.Nodes(s.namespace).Get(name)
+	return s.nodeLister.Nodes(s.namespace).Get(name)
 }
 
 // GetNode gets Longhorn Node for the given name and namespace
@@ -2023,7 +2635,16 @@ func (s *DataStore) GetNode(name string) (*longhorn.Node, error) {
 // GetReadyDiskNode find the corresponding ready Longhorn Node for a given disk
 // Returns a Node object and the disk name
 func (s *DataStore) GetReadyDiskNode(diskUUID string) (*longhorn.Node, string, error) {
-	nodes, err := s.ListReadyNodes()
+	node, diskName, err := s.GetReadyDiskNodeRO(diskUUID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return node.DeepCopy(), diskName, nil
+}
+
+func (s *DataStore) GetReadyDiskNodeRO(diskUUID string) (*longhorn.Node, string, error) {
+	nodes, err := s.ListReadyNodesRO()
 	if err != nil {
 		return nil, "", err
 	}
@@ -2046,7 +2667,7 @@ func (s *DataStore) GetReadyDiskNode(diskUUID string) (*longhorn.Node, string, e
 // GetReadyDisk find disk name by the given nodeName and diskUUD
 // Returns a disk name
 func (s *DataStore) GetReadyDisk(nodeName string, diskUUID string) (string, error) {
-	node, err := s.GetNode(nodeName)
+	node, err := s.GetNodeRO(nodeName)
 	if err != nil {
 		return "", err
 	}
@@ -2109,20 +2730,24 @@ func (s *DataStore) ListNodes() (map[string]*longhorn.Node, error) {
 // the list contains direct references to the internal cache objects and should not be mutated.
 // Consider using this function when you can guarantee read only access and don't want the overhead of deep copies
 func (s *DataStore) ListNodesRO() ([]*longhorn.Node, error) {
-	return s.nLister.Nodes(s.namespace).List(labels.Everything())
+	return s.nodeLister.Nodes(s.namespace).List(labels.Everything())
 }
 
-func (s *DataStore) ListNodesWithEngineImage(ei *longhorn.EngineImage) (map[string]*longhorn.Node, error) {
-	nodes, err := s.ListNodes()
+func (s *DataStore) ListNodesContainingEngineImageRO(ei *longhorn.EngineImage) (map[string]*longhorn.Node, error) {
+	nodeList, err := s.ListNodesRO()
 	if err != nil {
 		return nil, err
 	}
-	for nodeID := range nodes {
-		if !ei.Status.NodeDeploymentMap[nodeID] {
-			delete(nodes, nodeID)
+
+	nodeMap := make(map[string]*longhorn.Node)
+	for _, node := range nodeList {
+		if !ei.Status.NodeDeploymentMap[node.Name] {
+			continue
 		}
+		nodeMap[node.Name] = node
 	}
-	return nodes, nil
+
+	return nodeMap, nil
 }
 
 // filterNodes returns only the nodes where the passed predicate returns true
@@ -2144,11 +2769,24 @@ func filterReadyNodes(nodes map[string]*longhorn.Node) map[string]*longhorn.Node
 	})
 }
 
-// filterSchedulableNodes returns only the nodes that are ready
+// filterSchedulableNodes returns only the nodes that are ready and have at least one schedulable disk
 func filterSchedulableNodes(nodes map[string]*longhorn.Node) map[string]*longhorn.Node {
 	return filterNodes(nodes, func(node *longhorn.Node) bool {
 		nodeSchedulableCondition := types.GetCondition(node.Status.Conditions, longhorn.NodeConditionTypeSchedulable)
-		return nodeSchedulableCondition.Status == longhorn.ConditionStatusTrue
+		if nodeSchedulableCondition.Status != longhorn.ConditionStatusTrue {
+			return false
+		}
+
+		for _, disk := range node.Spec.Disks {
+			if disk.EvictionRequested {
+				continue
+			}
+
+			if disk.AllowScheduling {
+				return true
+			}
+		}
+		return false
 	})
 }
 
@@ -2161,24 +2799,38 @@ func (s *DataStore) ListReadyNodes() (map[string]*longhorn.Node, error) {
 	return readyNodes, nil
 }
 
-func (s *DataStore) ListReadyAndSchedulableNodes() (map[string]*longhorn.Node, error) {
-	nodes, err := s.ListNodes()
+func (s *DataStore) ListReadyNodesRO() (map[string]*longhorn.Node, error) {
+	nodeList, err := s.ListNodesRO()
 	if err != nil {
 		return nil, err
 	}
-	return filterSchedulableNodes(filterReadyNodes(nodes)), nil
+
+	nodeMap := make(map[string]*longhorn.Node, len(nodeList))
+	for _, node := range nodeList {
+		nodeMap[node.Name] = node
+	}
+	readyNodes := filterReadyNodes(nodeMap)
+	return readyNodes, nil
 }
 
-// ListReadyNodesWithEngineImage returns list of ready nodes that have the corresponding engine image deploying or deployed
-func (s *DataStore) ListReadyNodesWithEngineImage(image string) (map[string]*longhorn.Node, error) {
-	ei, err := s.GetEngineImage(types.GetEngineImageChecksumName(image))
+func (s *DataStore) ListReadyAndSchedulableNodesRO() (map[string]*longhorn.Node, error) {
+	nodes, err := s.ListReadyNodesRO()
 	if err != nil {
-		return nil, fmt.Errorf("unable to get engine image %v: %v", image, err)
+		return nil, err
+	}
+
+	return filterSchedulableNodes(nodes), nil
+}
+
+func (s *DataStore) ListReadyNodesContainingEngineImageRO(image string) (map[string]*longhorn.Node, error) {
+	ei, err := s.GetEngineImageRO(types.GetEngineImageChecksumName(image))
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get engine image %v", image)
 	}
 	if ei.Status.State != longhorn.EngineImageStateDeployed && ei.Status.State != longhorn.EngineImageStateDeploying {
 		return map[string]*longhorn.Node{}, nil
 	}
-	nodes, err := s.ListNodesWithEngineImage(ei)
+	nodes, err := s.ListNodesContainingEngineImageRO(ei)
 	if err != nil {
 		return nil, err
 	}
@@ -2186,40 +2838,65 @@ func (s *DataStore) ListReadyNodesWithEngineImage(image string) (map[string]*lon
 	return readyNodes, nil
 }
 
-// ListReadyNodesWithReadyEngineImage returns list of ready nodes that have the corresponding engine image deployed
-func (s *DataStore) ListReadyNodesWithReadyEngineImage(image string) (map[string]*longhorn.Node, error) {
-	ei, err := s.GetEngineImage(types.GetEngineImageChecksumName(image))
+// GetReadyNodeDiskForBackingImage a list of all Node the in the given namespace and
+// returns the first Node && the first Disk of the Node marked with condition ready and allow scheduling
+func (s *DataStore) GetReadyNodeDiskForBackingImage(backingImage *longhorn.BackingImage) (*longhorn.Node, string, error) {
+	logrus.Info("Preparing to find a random ready node disk")
+	nodes, err := s.ListNodesRO()
 	if err != nil {
-		return nil, fmt.Errorf("unable to get engine image %v: %v", image, err)
-	}
-	if ei.Status.State != longhorn.EngineImageStateDeployed {
-		return map[string]*longhorn.Node{}, nil
-	}
-	nodes, err := s.ListNodesWithEngineImage(ei)
-	if err != nil {
-		return nil, err
-	}
-	readyNodes := filterReadyNodes(nodes)
-	return readyNodes, nil
-}
-
-// GetRandomReadyNode gets a list of all Node in the given namespace and
-// returns the first Node marked with condition ready and allow scheduling
-func (s *DataStore) GetRandomReadyNode() (*longhorn.Node, error) {
-	logrus.Debugf("Prepare to find a random ready node")
-	nodesRO, err := s.ListNodesRO()
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to get random ready node")
+		return nil, "", errors.Wrapf(err, "failed to get random ready node disk")
 	}
 
-	for _, node := range nodesRO {
-		readyCondition := types.GetCondition(node.Status.Conditions, longhorn.NodeConditionTypeReady)
-		if readyCondition.Status == longhorn.ConditionStatusTrue && node.Spec.AllowScheduling {
-			return node.DeepCopy(), nil
+	allowEmptyNodeSelectorVolume, err := s.GetSettingAsBool(types.SettingNameAllowEmptyNodeSelectorVolume)
+	if err != nil {
+		return nil, "", errors.Wrapf(err, "failed to get %v setting", types.SettingNameAllowEmptyNodeSelectorVolume)
+	}
+
+	allowEmptyDiskSelectorVolume, err := s.GetSettingAsBool(types.SettingNameAllowEmptyDiskSelectorVolume)
+	if err != nil {
+		return nil, "", errors.Wrapf(err, "failed to get %v setting", types.SettingNameAllowEmptyDiskSelectorVolume)
+	}
+
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	r.Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+	for _, node := range nodes {
+		if !types.IsSelectorsInTags(node.Spec.Tags, backingImage.Spec.NodeSelector, allowEmptyNodeSelectorVolume) {
+			continue
+		}
+
+		if !node.Spec.AllowScheduling {
+			continue
+		}
+		if types.GetCondition(node.Status.Conditions, longhorn.NodeConditionTypeSchedulable).Status != longhorn.ConditionStatusTrue {
+			continue
+		}
+		for diskName, diskStatus := range node.Status.DiskStatus {
+			diskSpec, exists := node.Spec.Disks[diskName]
+			if !exists {
+				continue
+			}
+			if !types.IsSelectorsInTags(diskSpec.Tags, backingImage.Spec.DiskSelector, allowEmptyDiskSelectorVolume) {
+				continue
+			}
+			if _, exists := backingImage.Spec.DiskFileSpecMap[diskStatus.DiskUUID]; exists {
+				continue
+			}
+			// TODO: Jack add block type disk for spdk version BackingImage
+			if diskSpec.Type != longhorn.DiskTypeFilesystem {
+				continue
+			}
+			if !diskSpec.AllowScheduling {
+				continue
+			}
+			if types.GetCondition(diskStatus.Conditions, longhorn.DiskConditionTypeSchedulable).Status != longhorn.ConditionStatusTrue {
+				continue
+			}
+
+			return node.DeepCopy(), diskName, nil
 		}
 	}
 
-	return nil, fmt.Errorf("unable to get a ready node")
+	return nil, "", fmt.Errorf("unable to get a ready node disk")
 }
 
 // RemoveFinalizerForNode will result in deletion if DeletionTimestamp was set
@@ -2285,6 +2962,71 @@ func (s *DataStore) IsNodeDownOrDeleted(name string) (bool, error) {
 	return false, nil
 }
 
+// IsNodeDelinquent checks an early-warning condition of Lease expiration
+// that is of interest to share-manager types.
+func (s *DataStore) IsNodeDelinquent(nodeName string, volumeName string) (bool, error) {
+	if nodeName == "" || volumeName == "" {
+		return false, nil
+	}
+
+	isRWX, err := s.IsRegularRWXVolume(volumeName)
+	if err != nil {
+		return false, err
+	}
+	if !isRWX {
+		return false, nil
+	}
+
+	isDelinquent, delinquentNode, err := s.IsRWXVolumeDelinquent(volumeName)
+	if err != nil {
+		return false, err
+	}
+	return isDelinquent && delinquentNode == nodeName, nil
+}
+
+// IsNodeDownOrDeletedOrDelinquent gets Node for the given name and checks
+// if the Node condition is gone or not ready or, if we are asking on behalf
+// of an RWX-related resource, delinquent for that resource's volume.
+func (s *DataStore) IsNodeDownOrDeletedOrDelinquent(nodeName string, volumeName string) (bool, error) {
+	if nodeName == "" {
+		return false, errors.New("no node name provided to check node down or deleted or delinquent")
+	}
+	node, err := s.GetNodeRO(nodeName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	cond := types.GetCondition(node.Status.Conditions, longhorn.NodeConditionTypeReady)
+	if cond.Status == longhorn.ConditionStatusFalse &&
+		(cond.Reason == string(longhorn.NodeConditionReasonKubernetesNodeGone) ||
+			cond.Reason == string(longhorn.NodeConditionReasonKubernetesNodeNotReady)) {
+		return true, nil
+	}
+
+	return s.IsNodeDelinquent(nodeName, volumeName)
+}
+
+// IsNodeDeleted checks whether the node does not exist by passing in the node name
+func (s *DataStore) IsNodeDeleted(name string) (bool, error) {
+	if name == "" {
+		return false, errors.New("no node name provided to check node down or deleted")
+	}
+
+	node, err := s.GetNodeRO(name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+
+	cond := types.GetCondition(node.Status.Conditions, longhorn.NodeConditionTypeReady)
+
+	return cond.Status == longhorn.ConditionStatusFalse && cond.Reason == longhorn.NodeConditionReasonKubernetesNodeGone, nil
+}
+
 func (s *DataStore) IsNodeSchedulable(name string) bool {
 	node, err := s.GetNodeRO(name)
 	if err != nil {
@@ -2298,6 +3040,14 @@ func getNodeSelector(nodeName string) (labels.Selector, error) {
 	return metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
 		MatchLabels: map[string]string{
 			types.LonghornNodeKey: nodeName,
+		},
+	})
+}
+
+func getLonghornNodeSelector(nodeName string) (labels.Selector, error) {
+	return metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			types.GetLonghornLabelKey(types.LonghornLabelNode): nodeName,
 		},
 	})
 }
@@ -2338,7 +3088,7 @@ func (s *DataStore) ListReplicasByBackingImage(backingImageName string) ([]*long
 	if err != nil {
 		return nil, err
 	}
-	return s.rLister.Replicas(s.namespace).List(backingImageSelector)
+	return s.replicaLister.Replicas(s.namespace).List(backingImageSelector)
 }
 
 // ListReplicasByNodeRO returns a list of all Replicas on node Name for the given namespace,
@@ -2349,10 +3099,10 @@ func (s *DataStore) ListReplicasByNodeRO(name string) ([]*longhorn.Replica, erro
 	if err != nil {
 		return nil, err
 	}
-	return s.rLister.Replicas(s.namespace).List(nodeSelector)
+	return s.replicaLister.Replicas(s.namespace).List(nodeSelector)
 }
 
-func tagNodeLabel(nodeID string, obj runtime.Object) error {
+func labelNode(nodeID string, obj runtime.Object) error {
 	// fix longhornnode label for object
 	metadata, err := meta.Accessor(obj)
 	if err != nil {
@@ -2368,7 +3118,7 @@ func tagNodeLabel(nodeID string, obj runtime.Object) error {
 	return nil
 }
 
-func tagDiskUUIDLabel(diskUUID string, obj runtime.Object) error {
+func labelDiskUUID(diskUUID string, obj runtime.Object) error {
 	// fix longhorndiskuuid label for object
 	metadata, err := meta.Accessor(obj)
 	if err != nil {
@@ -2384,10 +3134,10 @@ func tagDiskUUIDLabel(diskUUID string, obj runtime.Object) error {
 	return nil
 }
 
-// tagLonghornNodeLabel fixes the new label `longhorn.io/node` for object.
-// It can replace func `tagNodeLabel` if the old label `longhornnode` is
+// labelLonghornNode fixes the new label `longhorn.io/node` for object.
+// It can replace func `labelNode` if the old label `longhornnode` is
 // deprecated.
-func tagLonghornNodeLabel(nodeID string, obj runtime.Object) error {
+func labelLonghornNode(nodeID string, obj runtime.Object) error {
 	metadata, err := meta.Accessor(obj)
 	if err != nil {
 		return err
@@ -2402,10 +3152,10 @@ func tagLonghornNodeLabel(nodeID string, obj runtime.Object) error {
 	return nil
 }
 
-// tagLonghornDiskUUIDLabel fixes the new label `longhorn.io/disk-uuid` for
-// object. It can replace func `tagDiskUUIDLabel` if the old label
+// labelLonghornDiskUUID fixes the new label `longhorn.io/disk-uuid` for
+// object. It can replace func `labelDiskUUID` if the old label
 // `longhorndiskuuid` is deprecated.
-func tagLonghornDiskUUIDLabel(diskUUID string, obj runtime.Object) error {
+func labelLonghornDiskUUID(diskUUID string, obj runtime.Object) error {
 	metadata, err := meta.Accessor(obj)
 	if err != nil {
 		return err
@@ -2420,7 +3170,7 @@ func tagLonghornDiskUUIDLabel(diskUUID string, obj runtime.Object) error {
 	return nil
 }
 
-func tagBackingImageLabel(backingImageName string, obj runtime.Object) error {
+func labelBackingImage(backingImageName string, obj runtime.Object) error {
 	// fix longhorn.io/backing-image label for object
 	metadata, err := meta.Accessor(obj)
 	if err != nil {
@@ -2436,7 +3186,7 @@ func tagBackingImageLabel(backingImageName string, obj runtime.Object) error {
 	return nil
 }
 
-func tagBackupVolumeLabel(backupVolumeName string, obj runtime.Object) error {
+func labelBackupVolume(backupVolumeName string, obj runtime.Object) error {
 	// fix longhorn.io/backup-volume label for object
 	metadata, err := meta.Accessor(obj)
 	if err != nil {
@@ -2452,14 +3202,129 @@ func tagBackupVolumeLabel(backupVolumeName string, obj runtime.Object) error {
 	return nil
 }
 
+// labelLonghornDeleteCustomResourceOnly labels the object with the label `longhorn.io/delete-custom-resource-only: true`
+func labelLonghornDeleteCustomResourceOnly(obj runtime.Object) error {
+	metadata, err := meta.Accessor(obj)
+	if err != nil {
+		return err
+	}
+
+	labels := metadata.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[types.GetLonghornLabelKey(types.DeleteCustomResourceOnly)] = "true"
+	metadata.SetLabels(labels)
+	return nil
+}
+
+// IsLabelLonghornDeleteCustomResourceOnlyExisting check if the object label `longhorn.io/delete-custom-resource-only` exists
+func IsLabelLonghornDeleteCustomResourceOnlyExisting(obj runtime.Object) (bool, error) {
+	metadata, err := meta.Accessor(obj)
+	if err != nil {
+		return false, err
+	}
+
+	labels := metadata.GetLabels()
+	if labels == nil {
+		return false, nil
+	}
+	_, ok := labels[types.GetLonghornLabelKey(types.DeleteCustomResourceOnly)]
+	return ok, nil
+}
+
+// AddBackupVolumeDeleteCustomResourceOnlyLabel adds the label `longhorn.io/delete-custom-resource-only: true` to the BackupVolume
+func AddBackupVolumeDeleteCustomResourceOnlyLabel(ds *DataStore, backupVolumeName string) error {
+	bv, err := ds.GetBackupVolume(backupVolumeName)
+	if err != nil {
+		return err
+	}
+	if exists, err := IsLabelLonghornDeleteCustomResourceOnlyExisting(bv); err != nil {
+		return err
+	} else if exists {
+		return nil
+	}
+	if err := labelLonghornDeleteCustomResourceOnly(bv); err != nil {
+		return err
+	}
+	if _, err = ds.UpdateBackupVolume(bv); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// AddBackupDeleteCustomResourceOnlyLabel adds the label `longhorn.io/delete-custom-resource-only: true` to the Backup
+func AddBackupDeleteCustomResourceOnlyLabel(ds *DataStore, backupName string) error {
+	backup, err := ds.GetBackup(backupName)
+	if err != nil {
+		return err
+	}
+	if exists, err := IsLabelLonghornDeleteCustomResourceOnlyExisting(backup); err != nil {
+		return err
+	} else if exists {
+		return nil
+	}
+	if err := labelLonghornDeleteCustomResourceOnly(backup); err != nil {
+		return err
+	}
+	if _, err = ds.UpdateBackup(backup); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// AddBackupBackingImageDeleteCustomResourceOnlyLabel adds the label `longhorn.io/delete-custom-resource-only: true` to the BackupBackingImage
+func AddBackupBackingImageDeleteCustomResourceOnlyLabel(ds *DataStore, backupBackingImageName string) error {
+	bbi, err := ds.GetBackupBackingImage(backupBackingImageName)
+	if err != nil {
+		return err
+	}
+	if exists, err := IsLabelLonghornDeleteCustomResourceOnlyExisting(bbi); err != nil {
+		return err
+	} else if exists {
+		return nil
+	}
+	if err := labelLonghornDeleteCustomResourceOnly(bbi); err != nil {
+		return err
+	}
+	if _, err = ds.UpdateBackupBackingImage(bbi); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// AddSystemBackupDeleteCustomResourceOnlyLabel adds the label `longhorn.io/delete-custom-resource-only: true` to the SystemBackup
+func AddSystemBackupDeleteCustomResourceOnlyLabel(ds *DataStore, systemBackupName string) error {
+	sb, err := ds.GetSystemBackup(systemBackupName)
+	if err != nil {
+		return err
+	}
+	if exists, err := IsLabelLonghornDeleteCustomResourceOnlyExisting(sb); err != nil {
+		return err
+	} else if exists {
+		return nil
+	}
+	if err := labelLonghornDeleteCustomResourceOnly(sb); err != nil {
+		return err
+	}
+	if _, err = ds.UpdateSystemBackup(sb); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func FixupRecurringJob(v *longhorn.Volume) error {
-	if err := tagRecurringJobDefaultLabel(v); err != nil {
+	if err := labelRecurringJobDefault(v); err != nil {
 		return err
 	}
 	return nil
 }
 
-func tagRecurringJobDefaultLabel(obj runtime.Object) error {
+func labelRecurringJobDefault(obj runtime.Object) error {
 	metadata, err := meta.Accessor(obj)
 	if err != nil {
 		return err
@@ -2513,7 +3378,7 @@ func (s *DataStore) GetSettingAsInt(settingName types.SettingName) (int64, error
 	if !ok {
 		return -1, fmt.Errorf("setting %v is not supported", settingName)
 	}
-	settings, err := s.GetSetting(settingName)
+	settings, err := s.GetSettingWithAutoFillingRO(settingName)
 	if err != nil {
 		return -1, err
 	}
@@ -2537,7 +3402,7 @@ func (s *DataStore) GetSettingAsBool(settingName types.SettingName) (bool, error
 	if !ok {
 		return false, fmt.Errorf("setting %v is not supported", settingName)
 	}
-	settings, err := s.GetSetting(settingName)
+	settings, err := s.GetSettingWithAutoFillingRO(settingName)
 	if err != nil {
 		return false, err
 	}
@@ -2557,7 +3422,7 @@ func (s *DataStore) GetSettingAsBool(settingName types.SettingName) (bool, error
 // GetSettingImagePullPolicy get the setting and return one of Kubernetes ImagePullPolicy definition
 // Returns error if the ImagePullPolicy is invalid
 func (s *DataStore) GetSettingImagePullPolicy() (corev1.PullPolicy, error) {
-	ipp, err := s.GetSetting(types.SettingNameSystemManagedPodsImagePullPolicy)
+	ipp, err := s.GetSettingWithAutoFillingRO(types.SettingNameSystemManagedPodsImagePullPolicy)
 	if err != nil {
 		return "", err
 	}
@@ -2573,7 +3438,7 @@ func (s *DataStore) GetSettingImagePullPolicy() (corev1.PullPolicy, error) {
 }
 
 func (s *DataStore) GetSettingTaintToleration() ([]corev1.Toleration, error) {
-	setting, err := s.GetSetting(types.SettingNameTaintToleration)
+	setting, err := s.GetSettingWithAutoFillingRO(types.SettingNameTaintToleration)
 	if err != nil {
 		return nil, err
 	}
@@ -2585,7 +3450,7 @@ func (s *DataStore) GetSettingTaintToleration() ([]corev1.Toleration, error) {
 }
 
 func (s *DataStore) GetSettingSystemManagedComponentsNodeSelector() (map[string]string, error) {
-	setting, err := s.GetSetting(types.SettingNameSystemManagedComponentsNodeSelector)
+	setting, err := s.GetSettingWithAutoFillingRO(types.SettingNameSystemManagedComponentsNodeSelector)
 	if err != nil {
 		return nil, err
 	}
@@ -2601,9 +3466,12 @@ func (s *DataStore) ResetMonitoringEngineStatus(e *longhorn.Engine) (*longhorn.E
 	e.Status.Endpoint = ""
 	e.Status.LastRestoredBackup = ""
 	e.Status.ReplicaModeMap = nil
+	e.Status.ReplicaTransitionTimeMap = nil
 	e.Status.RestoreStatus = nil
 	e.Status.PurgeStatus = nil
 	e.Status.RebuildStatus = nil
+	e.Status.LastExpansionFailedAt = ""
+	e.Status.LastExpansionError = ""
 	ret, err := s.UpdateEngineStatus(e)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to reset engine status for %v", e.Name)
@@ -2621,10 +3489,15 @@ func (s *DataStore) DeleteNode(name string) error {
 // Consider using this function when you can guarantee read only access and don't want the overhead of deep copies
 func (s *DataStore) ListEnginesByNodeRO(name string) ([]*longhorn.Engine, error) {
 	nodeSelector, err := getNodeSelector(name)
-	engineList, err := s.eLister.Engines(s.namespace).List(nodeSelector)
 	if err != nil {
 		return nil, err
 	}
+
+	engineList, err := s.engineLister.Engines(s.namespace).List(nodeSelector)
+	if err != nil {
+		return nil, err
+	}
+
 	return engineList, nil
 }
 
@@ -2680,7 +3553,7 @@ func (s *DataStore) DeleteInstanceManager(name string) error {
 }
 
 func (s *DataStore) GetInstanceManagerRO(name string) (*longhorn.InstanceManager, error) {
-	return s.imLister.InstanceManagers(s.namespace).Get(name)
+	return s.instanceManagerLister.InstanceManagers(s.namespace).Get(name)
 }
 
 // GetInstanceManager gets the InstanceManager for the given name and namespace.
@@ -2694,30 +3567,32 @@ func (s *DataStore) GetInstanceManager(name string) (*longhorn.InstanceManager, 
 	return resultRO.DeepCopy(), nil
 }
 
-// GetDefaultEngineInstanceManagerByNode returns the given node's engine InstanceManager
+// GetDefaultInstanceManagerByNodeRO returns the given node's engine InstanceManager
 // that is using the default instance manager image.
-func (s *DataStore) GetDefaultEngineInstanceManagerByNode(name string) (*longhorn.InstanceManager, error) {
+// The object is the direct reference to the internal cache object and should not be mutated.
+// Consider using this function when you can guarantee read only access and don't want the overhead of deep copy.
+func (s *DataStore) GetDefaultInstanceManagerByNodeRO(name string, dataEngine longhorn.DataEngineType) (*longhorn.InstanceManager, error) {
 	defaultInstanceManagerImage, err := s.GetSettingValueExisted(types.SettingNameDefaultInstanceManagerImage)
 	if err != nil {
 		return nil, err
 	}
 
-	engineIMs, err := s.ListInstanceManagersBySelector(name, defaultInstanceManagerImage, longhorn.InstanceManagerTypeEngine)
+	instanceManagers, err := s.ListInstanceManagersBySelectorRO(name, defaultInstanceManagerImage, longhorn.InstanceManagerTypeAllInOne, dataEngine)
 	if err != nil {
 		return nil, err
 	}
 
-	engineIM := &longhorn.InstanceManager{}
-	for _, im := range engineIMs {
-		engineIM = im
+	instanceManager := &longhorn.InstanceManager{}
+	for _, im := range instanceManagers {
+		instanceManager = im
 
-		if len(engineIMs) != 1 {
-			logrus.Warnf("Found more than 1 %v instance manager with %v on %v, use %v", longhorn.InstanceManagerTypeEngine, defaultInstanceManagerImage, name, engineIM.Name)
+		if len(instanceManagers) != 1 {
+			logrus.Debugf("Found more than 1 %v instance manager with %v on %v, use %v", longhorn.InstanceManagerTypeEngine, defaultInstanceManagerImage, name, instanceManager.Name)
 			break
 		}
 	}
 
-	return engineIM, nil
+	return instanceManager, nil
 }
 
 // CheckInstanceManagerType checks and returns InstanceManager labels type
@@ -2734,58 +3609,107 @@ func CheckInstanceManagerType(im *longhorn.InstanceManager) (longhorn.InstanceMa
 		return longhorn.InstanceManagerTypeEngine, nil
 	case string(longhorn.InstanceManagerTypeReplica):
 		return longhorn.InstanceManagerTypeReplica, nil
+	case string(longhorn.InstanceManagerTypeAllInOne):
+		return longhorn.InstanceManagerTypeAllInOne, nil
 	}
 
 	return longhorn.InstanceManagerType(""), fmt.Errorf("unknown type %v for instance manager %v", imType, im.Name)
 }
 
-// ListInstanceManagersBySelector gets a list of InstanceManager by labels for
-// the given namespace. Returns an object contains all InstanceManager
-func (s *DataStore) ListInstanceManagersBySelector(node, instanceManagerImage string, managerType longhorn.InstanceManagerType) (map[string]*longhorn.InstanceManager, error) {
-	itemMap := map[string]*longhorn.InstanceManager{}
+// CheckInstanceManagersReadiness checks if the InstanceManager is running on the
+// specified set of nodes.
+// There is one running instance manager for v2 data engine on each node, so the function
+// find one running instance manager instead.
+//
+// Parameters:
+//   - dataEngine: the data engine type.
+//   - nodes: the list of node names.
+//
+// Returns:
+// - Boolean indicating if all InstanceManagers are running on the nodes.
+// - Error for any errors encountered.
+func (s *DataStore) CheckInstanceManagersReadiness(dataEngine longhorn.DataEngineType, nodes ...string) (isReady bool, err error) {
+	for _, node := range nodes {
+		var instanceManager *longhorn.InstanceManager
 
+		if dataEngine == longhorn.DataEngineTypeV2 {
+			instanceManager, err = s.GetRunningInstanceManagerByNodeRO(node, dataEngine)
+		} else {
+			instanceManager, err = s.GetDefaultInstanceManagerByNodeRO(node, dataEngine)
+		}
+		if err != nil {
+			return false, err
+		}
+
+		isRunning := instanceManager.Status.CurrentState == longhorn.InstanceManagerStateRunning
+		notDeleted := instanceManager.DeletionTimestamp == nil
+		if !isRunning && notDeleted {
+			logrus.WithFields(
+				logrus.Fields{
+					"currentState":    instanceManager.Status.CurrentState,
+					"dataEngine":      dataEngine,
+					"instanceManager": instanceManager.Name,
+					"node":            node,
+				},
+			).Error("CheckInstanceManagersReadiness: instance manager is not running")
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// ListInstanceManagersBySelectorRO gets a list of InstanceManager by labels for
+// the given namespace,
+// the list contains direct references to the internal cache objects and should not be mutated.
+// Consider using this function when you can guarantee read only access and don't want the overhead of deep copies.
+func (s *DataStore) ListInstanceManagersBySelectorRO(node, imImage string, imType longhorn.InstanceManagerType, dataEngine longhorn.DataEngineType) (map[string]*longhorn.InstanceManager, error) {
 	selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
-		MatchLabels: types.GetInstanceManagerLabels(node, instanceManagerImage, managerType),
+		MatchLabels: types.GetInstanceManagerLabels(node, imImage, imType, dataEngine),
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	listRO, err := s.imLister.InstanceManagers(s.namespace).List(selector)
+	imList, err := s.instanceManagerLister.InstanceManagers(s.namespace).List(selector)
 	if err != nil {
 		return nil, err
 	}
-	for _, itemRO := range listRO {
-		// Cannot use cached object from lister
-		itemMap[itemRO.Name] = itemRO.DeepCopy()
+
+	imMap := make(map[string]*longhorn.InstanceManager, len(imList))
+	for _, imRO := range imList {
+		imMap[imRO.Name] = imRO
 	}
-	return itemMap, nil
+
+	return imMap, nil
 }
 
-// GetInstanceManagerByInstance gets a list of InstanceManager for the given
-// object. Returns error if more than one InstanceManager is found
+// GetInstanceManagerByInstance returns an InstanceManager for a given object,
+// or an error if more than one InstanceManager is found.
 func (s *DataStore) GetInstanceManagerByInstance(obj interface{}) (*longhorn.InstanceManager, error) {
-	var (
-		name, nodeID string
-		imType       longhorn.InstanceManagerType
-	)
-
-	image, err := s.GetSettingValueExisted(types.SettingNameDefaultInstanceManagerImage)
+	im, err := s.GetInstanceManagerByInstanceRO(obj)
 	if err != nil {
 		return nil, err
 	}
+	return im.DeepCopy(), nil
+}
 
-	switch obj.(type) {
+func (s *DataStore) GetInstanceManagerByInstanceRO(obj interface{}) (*longhorn.InstanceManager, error) {
+	var (
+		name       string // name of the object
+		nodeID     string
+		dataEngine longhorn.DataEngineType
+	)
+
+	switch obj := obj.(type) {
 	case *longhorn.Engine:
-		engine := obj.(*longhorn.Engine)
-		name = engine.Name
-		nodeID = engine.Spec.NodeID
-		imType = longhorn.InstanceManagerTypeEngine
+		name = obj.Name
+		nodeID = obj.Spec.NodeID
+		dataEngine = obj.Spec.DataEngine
 	case *longhorn.Replica:
-		replica := obj.(*longhorn.Replica)
-		name = replica.Name
-		nodeID = replica.Spec.NodeID
-		imType = longhorn.InstanceManagerTypeReplica
+		name = obj.Name
+		nodeID = obj.Spec.NodeID
+		dataEngine = obj.Spec.DataEngine
 	default:
 		return nil, fmt.Errorf("unknown type for GetInstanceManagerByInstance, %+v", obj)
 	}
@@ -2793,7 +3717,12 @@ func (s *DataStore) GetInstanceManagerByInstance(obj interface{}) (*longhorn.Ins
 		return nil, fmt.Errorf("invalid request for GetInstanceManagerByInstance: no NodeID specified for instance %v", name)
 	}
 
-	imMap, err := s.ListInstanceManagersBySelector(nodeID, image, imType)
+	image, err := s.GetSettingValueExisted(types.SettingNameDefaultInstanceManagerImage)
+	if err != nil {
+		return nil, err
+	}
+
+	imMap, err := s.ListInstanceManagersBySelectorRO(nodeID, image, longhorn.InstanceManagerTypeAllInOne, dataEngine)
 	if err != nil {
 		return nil, err
 	}
@@ -2803,12 +3732,11 @@ func (s *DataStore) GetInstanceManagerByInstance(obj interface{}) (*longhorn.Ins
 		}
 
 	}
-	return nil, fmt.Errorf("cannot find the only available instance manager for instance %v, node %v, instance manager image %v, type %v", name, nodeID, image, imType)
+	return nil, fmt.Errorf("cannot find the only available instance manager for instance %v, node %v, instance manager image %v, type %v", name, nodeID, image, longhorn.InstanceManagerTypeAllInOne)
 }
 
-// ListInstanceManagersByNode returns ListInstanceManagersBySelector
-func (s *DataStore) ListInstanceManagersByNode(node string, imType longhorn.InstanceManagerType) (map[string]*longhorn.InstanceManager, error) {
-	return s.ListInstanceManagersBySelector(node, "", imType)
+func (s *DataStore) ListInstanceManagersByNodeRO(node string, imType longhorn.InstanceManagerType, dataEngine longhorn.DataEngineType) (map[string]*longhorn.InstanceManager, error) {
+	return s.ListInstanceManagersBySelectorRO(node, "", imType, dataEngine)
 }
 
 // ListInstanceManagers gets a list of InstanceManagers for the given namespace.
@@ -2816,7 +3744,7 @@ func (s *DataStore) ListInstanceManagersByNode(node string, imType longhorn.Inst
 func (s *DataStore) ListInstanceManagers() (map[string]*longhorn.InstanceManager, error) {
 	itemMap := map[string]*longhorn.InstanceManager{}
 
-	list, err := s.imLister.InstanceManagers(s.namespace).List(labels.Everything())
+	list, err := s.instanceManagerLister.InstanceManagers(s.namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -2826,6 +3754,19 @@ func (s *DataStore) ListInstanceManagers() (map[string]*longhorn.InstanceManager
 		itemMap[itemRO.Name] = itemRO.DeepCopy()
 	}
 	return itemMap, nil
+}
+
+func (s *DataStore) ListInstanceManagersRO() (map[string]*longhorn.InstanceManager, error) {
+	imList, err := s.instanceManagerLister.InstanceManagers(s.namespace).List(labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+
+	imMap := make(map[string]*longhorn.InstanceManager, len(imList))
+	for _, imRO := range imList {
+		imMap[imRO.Name] = imRO
+	}
+	return imMap, nil
 }
 
 // UpdateInstanceManager updates Longhorn InstanceManager resource and verifies update
@@ -2870,7 +3811,7 @@ func verifyCreation(name, kind string, getMethod func(name string) (runtime.Obje
 		time.Sleep(VerificationRetryInterval)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("unable to verify the existence of newly created %s %s: %v", kind, name, err)
+		return nil, errors.Wrapf(err, "failed to verify the existence of newly created %s %s", kind, name)
 	}
 	return ret, nil
 }
@@ -2878,7 +3819,7 @@ func verifyCreation(name, kind string, getMethod func(name string) (runtime.Obje
 func verifyUpdate(name string, obj runtime.Object, getMethod func(name string) (runtime.Object, error)) {
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
-		logrus.Errorf("BUG: datastore: cannot verify update for %v (%+v) because cannot get accessor: %v", name, obj, err)
+		logrus.WithError(err).Errorf("BUG: datastore: cannot verify update for %v (%+v) because cannot get accessor", name, obj)
 		return
 	}
 	minimalResourceVersion := accessor.GetResourceVersion()
@@ -2886,12 +3827,12 @@ func verifyUpdate(name string, obj runtime.Object, getMethod func(name string) (
 	for i := 0; i < VerificationRetryCounts; i++ {
 		ret, err := getMethod(name)
 		if err != nil {
-			logrus.Errorf("datastore: failed to get updated object %v", name)
+			logrus.WithError(err).Errorf("datastore: failed to get updated object %v", name)
 			return
 		}
 		accessor, err := meta.Accessor(ret)
 		if err != nil {
-			logrus.Errorf("BUG: datastore: cannot verify update for %v because cannot get accessor for updated object: %v", name, err)
+			logrus.WithError(err).Errorf("BUG: datastore: cannot verify update for %v because cannot get accessor for updated object", name)
 			return
 		}
 		if resourceVersionAtLeast(accessor.GetResourceVersion(), minimalResourceVersion) {
@@ -2914,12 +3855,12 @@ func resourceVersionAtLeast(curr, min string) bool {
 	}
 	currVersion, err := strconv.ParseInt(curr, 10, 64)
 	if err != nil {
-		logrus.Errorf("datastore: failed to parse current resource version %v: %v", curr, err)
+		logrus.WithError(err).Errorf("datastore: failed to parse current resource version %v", curr)
 		return false
 	}
 	minVersion, err := strconv.ParseInt(min, 10, 64)
 	if err != nil {
-		logrus.Errorf("datastore: failed to parse minimal resource version %v: %v", min, err)
+		logrus.WithError(err).Errorf("datastore: failed to parse minimal resource version %v", min)
 		return false
 	}
 	return currVersion >= minVersion
@@ -2945,7 +3886,25 @@ func (s *DataStore) GetEngineImageCLIAPIVersion(imageName string) (int, error) {
 	if imageName == "" {
 		return -1, fmt.Errorf("cannot check the CLI API Version based on empty image name")
 	}
-	ei, err := s.GetEngineImage(types.GetEngineImageChecksumName(imageName))
+	ei, err := s.GetEngineImageRO(types.GetEngineImageChecksumName(imageName))
+	if err != nil {
+		return -1, errors.Wrapf(err, "failed to get engine image object based on image name %v", imageName)
+	}
+
+	return ei.Status.CLIAPIVersion, nil
+}
+
+// GetDataEngineImageCLIAPIVersion get engine or instance manager image for the given name and returns the CLIAPIVersion
+func (s *DataStore) GetDataEngineImageCLIAPIVersion(imageName string, dataEngine longhorn.DataEngineType) (int, error) {
+	if imageName == "" {
+		return -1, fmt.Errorf("cannot check the CLI API Version based on empty image name")
+	}
+
+	if types.IsDataEngineV2(dataEngine) {
+		return 0, nil
+	}
+
+	ei, err := s.GetEngineImageRO(types.GetEngineImageChecksumName(imageName))
 	if err != nil {
 		return -1, errors.Wrapf(err, "failed to get engine image object based on image name %v", imageName)
 	}
@@ -2993,10 +3952,6 @@ func (s *DataStore) CreateShareManager(sm *longhorn.ShareManager) (*longhorn.Sha
 
 // UpdateShareManager updates Longhorn ShareManager resource and verifies update
 func (s *DataStore) UpdateShareManager(sm *longhorn.ShareManager) (*longhorn.ShareManager, error) {
-	if err := util.AddFinalizer(longhornFinalizerKey, sm); err != nil {
-		return nil, err
-	}
-
 	obj, err := s.lhClient.LonghornV1beta2().ShareManagers(s.namespace).Update(context.TODO(), sm, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
@@ -3044,7 +3999,7 @@ func (s *DataStore) RemoveFinalizerForShareManager(obj *longhorn.ShareManager) e
 }
 
 func (s *DataStore) getShareManagerRO(name string) (*longhorn.ShareManager, error) {
-	return s.smLister.ShareManagers(s.namespace).Get(name)
+	return s.shareManagerLister.ShareManagers(s.namespace).Get(name)
 }
 
 // GetShareManager gets the ShareManager for the given name and namespace.
@@ -3061,7 +4016,7 @@ func (s *DataStore) GetShareManager(name string) (*longhorn.ShareManager, error)
 func (s *DataStore) ListShareManagers() (map[string]*longhorn.ShareManager, error) {
 	itemMap := map[string]*longhorn.ShareManager{}
 
-	list, err := s.smLister.ShareManagers(s.namespace).List(labels.Everything())
+	list, err := s.shareManagerLister.ShareManagers(s.namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -3071,6 +4026,10 @@ func (s *DataStore) ListShareManagers() (map[string]*longhorn.ShareManager, erro
 		itemMap[itemRO.Name] = itemRO.DeepCopy()
 	}
 	return itemMap, nil
+}
+
+func (s *DataStore) ListShareManagersRO() ([]*longhorn.ShareManager, error) {
+	return s.shareManagerLister.ShareManagers(s.namespace).List(labels.Everything())
 }
 
 // CreateBackupTarget creates a Longhorn BackupTargets CR and verifies creation
@@ -3098,7 +4057,7 @@ func (s *DataStore) CreateBackupTarget(backupTarget *longhorn.BackupTarget) (*lo
 
 // ListBackupTargets returns an object contains all backup targets in the cluster BackupTargets CR
 func (s *DataStore) ListBackupTargets() (map[string]*longhorn.BackupTarget, error) {
-	list, err := s.btLister.BackupTargets(s.namespace).List(labels.Everything())
+	list, err := s.backupTargetLister.BackupTargets(s.namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -3110,9 +4069,14 @@ func (s *DataStore) ListBackupTargets() (map[string]*longhorn.BackupTarget, erro
 	return itemMap, nil
 }
 
+// GetDefaultBackupTargetRO returns the BackupTarget for the default backup target
+func (s *DataStore) GetDefaultBackupTargetRO() (*longhorn.BackupTarget, error) {
+	return s.GetBackupTargetRO(types.DefaultBackupTargetName)
+}
+
 // GetBackupTargetRO returns the BackupTarget with the given backup target name in the cluster
 func (s *DataStore) GetBackupTargetRO(backupTargetName string) (*longhorn.BackupTarget, error) {
-	return s.btLister.BackupTargets(s.namespace).Get(backupTargetName)
+	return s.backupTargetLister.BackupTargets(s.namespace).Get(backupTargetName)
 }
 
 // GetBackupTarget returns a copy of BackupTarget with the given backup target name in the cluster
@@ -3179,7 +4143,7 @@ func (s *DataStore) CreateBackupVolume(backupVolume *longhorn.BackupVolume) (*lo
 
 // ListBackupVolumes returns an object contains all backup volumes in the cluster BackupVolumes CR
 func (s *DataStore) ListBackupVolumes() (map[string]*longhorn.BackupVolume, error) {
-	list, err := s.bvLister.BackupVolumes(s.namespace).List(labels.Everything())
+	list, err := s.backupVolumeLister.BackupVolumes(s.namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -3199,7 +4163,7 @@ func getBackupVolumeSelector(backupVolumeName string) (labels.Selector, error) {
 
 // GetBackupVolumeRO returns the BackupVolume with the given backup volume name in the cluster
 func (s *DataStore) GetBackupVolumeRO(backupVolumeName string) (*longhorn.BackupVolume, error) {
-	return s.bvLister.BackupVolumes(s.namespace).Get(backupVolumeName)
+	return s.backupVolumeLister.BackupVolumes(s.namespace).Get(backupVolumeName)
 }
 
 // GetBackupVolume returns a copy of BackupVolume with the given backup volume name in the cluster
@@ -3263,7 +4227,7 @@ func (s *DataStore) RemoveFinalizerForBackupVolume(backupVolume *longhorn.Backup
 
 // CreateBackup creates a Longhorn Backup CR and verifies creation
 func (s *DataStore) CreateBackup(backup *longhorn.Backup, backupVolumeName string) (*longhorn.Backup, error) {
-	if err := tagBackupVolumeLabel(backupVolumeName, backup); err != nil {
+	if err := labelBackupVolume(backupVolumeName, backup); err != nil {
 		return nil, err
 	}
 	ret, err := s.lhClient.LonghornV1beta2().Backups(s.namespace).Create(context.TODO(), backup, metav1.CreateOptions{})
@@ -3295,7 +4259,7 @@ func (s *DataStore) ListBackupsWithBackupVolumeName(backupVolumeName string) (ma
 		return nil, err
 	}
 
-	list, err := s.bLister.Backups(s.namespace).List(selector)
+	list, err := s.backupLister.Backups(s.namespace).List(selector)
 	if err != nil {
 		return nil, err
 	}
@@ -3309,12 +4273,12 @@ func (s *DataStore) ListBackupsWithBackupVolumeName(backupVolumeName string) (ma
 
 // ListBackupsRO returns a list of all Backups for the given namespace
 func (s *DataStore) ListBackupsRO() ([]*longhorn.Backup, error) {
-	return s.bLister.Backups(s.namespace).List(labels.Everything())
+	return s.backupLister.Backups(s.namespace).List(labels.Everything())
 }
 
 // ListBackups returns an object contains all backups in the cluster Backups CR
 func (s *DataStore) ListBackups() (map[string]*longhorn.Backup, error) {
-	list, err := s.bLister.Backups(s.namespace).List(labels.Everything())
+	list, err := s.backupLister.Backups(s.namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -3328,7 +4292,7 @@ func (s *DataStore) ListBackups() (map[string]*longhorn.Backup, error) {
 
 // GetBackupRO returns the Backup with the given backup name in the cluster
 func (s *DataStore) GetBackupRO(backupName string) (*longhorn.Backup, error) {
-	return s.bLister.Backups(s.namespace).Get(backupName)
+	return s.backupLister.Backups(s.namespace).Get(backupName)
 }
 
 // GetBackup returns a copy of Backup with the given backup name in the cluster
@@ -3420,7 +4384,7 @@ func (s *DataStore) CreateSnapshot(snapshot *longhorn.Snapshot) (*longhorn.Snaps
 
 // GetSnapshotRO returns the Snapshot with the given snapshot name in the cluster
 func (s *DataStore) GetSnapshotRO(snapName string) (*longhorn.Snapshot, error) {
-	return s.snapLister.Snapshots(s.namespace).Get(snapName)
+	return s.snapshotLister.Snapshots(s.namespace).Get(snapName)
 }
 
 // GetSnapshot returns a copy of Snapshot with the given snapshot name in the cluster
@@ -3466,7 +4430,7 @@ func (s *DataStore) RemoveFinalizerForSnapshot(snapshot *longhorn.Snapshot) erro
 }
 
 func (s *DataStore) ListSnapshotsRO(selector labels.Selector) (map[string]*longhorn.Snapshot, error) {
-	list, err := s.snapLister.Snapshots(s.namespace).List(selector)
+	list, err := s.snapshotLister.Snapshots(s.namespace).List(selector)
 	if err != nil {
 		return nil, err
 	}
@@ -3478,7 +4442,7 @@ func (s *DataStore) ListSnapshotsRO(selector labels.Selector) (map[string]*longh
 }
 
 func (s *DataStore) ListSnapshots() (map[string]*longhorn.Snapshot, error) {
-	list, err := s.snapLister.Snapshots(s.namespace).List(labels.Everything())
+	list, err := s.snapshotLister.Snapshots(s.namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -3531,7 +4495,7 @@ func (s *DataStore) CreateRecurringJob(recurringJob *longhorn.RecurringJob) (*lo
 func (s *DataStore) ListRecurringJobs() (map[string]*longhorn.RecurringJob, error) {
 	itemMap := map[string]*longhorn.RecurringJob{}
 
-	list, err := s.rjLister.RecurringJobs(s.namespace).List(labels.Everything())
+	list, err := s.recurringJobLister.RecurringJobs(s.namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -3543,22 +4507,38 @@ func (s *DataStore) ListRecurringJobs() (map[string]*longhorn.RecurringJob, erro
 	return itemMap, nil
 }
 
+// ListRecurringJobsRO returns a map of RecurringJobPolicies indexed by name
+func (s *DataStore) ListRecurringJobsRO() (map[string]*longhorn.RecurringJob, error) {
+	itemMap := map[string]*longhorn.RecurringJob{}
+
+	list, err := s.recurringJobLister.RecurringJobs(s.namespace).List(labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+
+	for _, itemRO := range list {
+		// Cannot use cached object from lister
+		itemMap[itemRO.Name] = itemRO
+	}
+	return itemMap, nil
+}
+
 func (s *DataStore) getRecurringJobRO(name string) (*longhorn.RecurringJob, error) {
-	return s.rjLister.RecurringJobs(s.namespace).Get(name)
+	return s.recurringJobLister.RecurringJobs(s.namespace).Get(name)
 }
 
 // GetRecurringJob gets the RecurringJob for the given name and namespace.
 // Returns a mutable RecurringJob object
 func (s *DataStore) GetRecurringJob(name string) (*longhorn.RecurringJob, error) {
-	result, err := s.getRecurringJob(name)
+	result, err := s.GetRecurringJobRO(name)
 	if err != nil {
 		return nil, err
 	}
 	return result.DeepCopy(), nil
 }
 
-func (s *DataStore) getRecurringJob(name string) (*longhorn.RecurringJob, error) {
-	return s.rjLister.RecurringJobs(s.namespace).Get(name)
+func (s *DataStore) GetRecurringJobRO(name string) (*longhorn.RecurringJob, error) {
+	return s.recurringJobLister.RecurringJobs(s.namespace).Get(name)
 }
 
 // UpdateRecurringJob updates Longhorn RecurringJob and verifies update
@@ -3568,7 +4548,7 @@ func (s *DataStore) UpdateRecurringJob(recurringJob *longhorn.RecurringJob) (*lo
 		return nil, err
 	}
 	verifyUpdate(recurringJob.Name, obj, func(name string) (runtime.Object, error) {
-		return s.getRecurringJob(name)
+		return s.GetRecurringJobRO(name)
 	})
 	return obj, nil
 }
@@ -3598,11 +4578,11 @@ func (s *DataStore) DeleteRecurringJob(name string) error {
 }
 
 func ValidateRecurringJob(job longhorn.RecurringJobSpec) error {
-	if job.Cron == "" || job.Task == "" || job.Name == "" || job.Retain == 0 {
+	if job.Cron == "" || job.Task == "" || job.Name == "" {
 		return fmt.Errorf("invalid job %+v", job)
 	}
-	if job.Task != longhorn.RecurringJobTypeBackup && job.Task != longhorn.RecurringJobTypeSnapshot {
-		return fmt.Errorf("recurring job type %v is not valid", job.Task)
+	if !isValidRecurringJobTask(job.Task) {
+		return fmt.Errorf("recurring job task %v is not valid", job.Task)
 	}
 	if job.Concurrency == 0 {
 		job.Concurrency = types.DefaultRecurringJobConcurrency
@@ -3614,7 +4594,7 @@ func ValidateRecurringJob(job longhorn.RecurringJobSpec) error {
 		return fmt.Errorf("job name %v must be %v characters or less", job.Name, NameMaximumLength)
 	}
 	for _, group := range job.Groups {
-		if !util.ValidateName(group) {
+		if !util.ValidateString(group) {
 			return fmt.Errorf("invalid group name %v", group)
 		}
 	}
@@ -3623,10 +4603,56 @@ func ValidateRecurringJob(job longhorn.RecurringJobSpec) error {
 			return err
 		}
 	}
+	if job.Parameters != nil {
+		if err := ValidateRecurringJobParameters(job.Task, job.Parameters); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func ValidateRecurringJobs(jobs []longhorn.RecurringJobSpec) error {
+func ValidateRecurringJobParameters(task longhorn.RecurringJobType, parameters map[string]string) (err error) {
+	switch task {
+	case longhorn.RecurringJobTypeBackup, longhorn.RecurringJobTypeBackupForceCreate:
+		for key, value := range parameters {
+			if err := validateRecurringJobBackupParameter(key, value); err != nil {
+				return errors.Wrapf(err, "failed to validate recurring job backup task parameters")
+			}
+		}
+	// we don't support any parameters for other tasks currently
+	default:
+		return nil
+	}
+
+	return nil
+}
+
+func validateRecurringJobBackupParameter(key, value string) error {
+	switch key {
+	case types.RecurringJobBackupParameterFullBackupInterval:
+		_, err := strconv.Atoi(value)
+		if err != nil {
+			return errors.Wrapf(err, "%v:%v is not number", key, value)
+		}
+	default:
+		return fmt.Errorf("%v:%v is not a valid parameter", key, value)
+	}
+
+	return nil
+}
+
+func isValidRecurringJobTask(task longhorn.RecurringJobType) bool {
+	return task == longhorn.RecurringJobTypeBackup ||
+		task == longhorn.RecurringJobTypeBackupForceCreate ||
+		task == longhorn.RecurringJobTypeFilesystemTrim ||
+		task == longhorn.RecurringJobTypeSnapshot ||
+		task == longhorn.RecurringJobTypeSnapshotForceCreate ||
+		task == longhorn.RecurringJobTypeSnapshotCleanup ||
+		task == longhorn.RecurringJobTypeSnapshotDelete
+}
+
+// ValidateRecurringJobs validates data and formats for recurring jobs
+func (s *DataStore) ValidateRecurringJobs(jobs []longhorn.RecurringJobSpec) error {
 	if jobs == nil {
 		return nil
 	}
@@ -3639,8 +4665,13 @@ func ValidateRecurringJobs(jobs []longhorn.RecurringJobSpec) error {
 		totalJobRetainCount += job.Retain
 	}
 
-	if totalJobRetainCount > MaxRecurringJobRetain {
-		return fmt.Errorf("job Can't retain more than %d snapshots", MaxRecurringJobRetain)
+	maxRecurringJobRetain, err := s.GetSettingAsInt(types.SettingNameRecurringJobMaxRetention)
+	if err != nil {
+		return err
+	}
+
+	if totalJobRetainCount > int(maxRecurringJobRetain) {
+		return fmt.Errorf("job Can't retain more than %d snapshots", maxRecurringJobRetain)
 	}
 	return nil
 }
@@ -3671,7 +4702,7 @@ func (s *DataStore) CreateOrphan(orphan *longhorn.Orphan) (*longhorn.Orphan, err
 
 // GetOrphanRO returns the Orphan with the given orphan name in the cluster
 func (s *DataStore) GetOrphanRO(orphanName string) (*longhorn.Orphan, error) {
-	return s.oLister.Orphans(s.namespace).Get(orphanName)
+	return s.orphanLister.Orphans(s.namespace).Get(orphanName)
 }
 
 // GetOrphan returns a copy of Orphan with the given orphan name in the cluster
@@ -3729,7 +4760,7 @@ func (s *DataStore) RemoveFinalizerForOrphan(orphan *longhorn.Orphan) error {
 }
 
 func (s *DataStore) listOrphans(selector labels.Selector) (map[string]*longhorn.Orphan, error) {
-	list, err := s.oLister.Orphans(s.namespace).List(selector)
+	list, err := s.orphanLister.Orphans(s.namespace).List(selector)
 	if err != nil {
 		return nil, err
 	}
@@ -3758,7 +4789,7 @@ func (s *DataStore) ListOrphansByNode(name string) (map[string]*longhorn.Orphan,
 
 // ListOrphansRO returns a list of all Orphans for the given namespace
 func (s *DataStore) ListOrphansRO() ([]*longhorn.Orphan, error) {
-	return s.oLister.Orphans(s.namespace).List(labels.Everything())
+	return s.orphanLister.Orphans(s.namespace).List(labels.Everything())
 }
 
 // ListOrphansByNodeRO returns a list of all Orphans on node Name for the given namespace,
@@ -3769,10 +4800,869 @@ func (s *DataStore) ListOrphansByNodeRO(name string) ([]*longhorn.Orphan, error)
 	if err != nil {
 		return nil, err
 	}
-	return s.oLister.Orphans(s.namespace).List(nodeSelector)
+	return s.orphanLister.Orphans(s.namespace).List(nodeSelector)
 }
 
 // DeleteOrphan won't result in immediately deletion since finalizer was set by default
 func (s *DataStore) DeleteOrphan(orphanName string) error {
 	return s.lhClient.LonghornV1beta2().Orphans(s.namespace).Delete(context.TODO(), orphanName, metav1.DeleteOptions{})
+}
+
+// GetOwnerReferencesForSupportBundle returns a list contains single OwnerReference for the
+// given SupportBundle object
+func GetOwnerReferencesForSupportBundle(supportBundle *longhorn.SupportBundle) []metav1.OwnerReference {
+	return []metav1.OwnerReference{
+		{
+			APIVersion: longhorn.SchemeGroupVersion.String(),
+			Kind:       types.LonghornKindSupportBundle,
+			Name:       supportBundle.Name,
+			UID:        supportBundle.UID,
+		},
+	}
+}
+
+// GetSupportBundleRO returns the SupportBundle with the given name
+func (s *DataStore) GetSupportBundleRO(name string) (*longhorn.SupportBundle, error) {
+	return s.supportBundleLister.SupportBundles(s.namespace).Get(name)
+}
+
+// GetSupportBundle returns a copy of SupportBundle with the given name
+func (s *DataStore) GetSupportBundle(name string) (*longhorn.SupportBundle, error) {
+	resultRO, err := s.GetSupportBundleRO(name)
+	if err != nil {
+		return nil, err
+	}
+	// Cannot use cached object from lister
+	return resultRO.DeepCopy(), nil
+}
+
+// CreateLHVolumeAttachment creates a Longhorn volume attachment resource and verifies creation
+func (s *DataStore) CreateLHVolumeAttachment(va *longhorn.VolumeAttachment) (*longhorn.VolumeAttachment, error) {
+	ret, err := s.lhClient.LonghornV1beta2().VolumeAttachments(s.namespace).Create(context.TODO(), va, metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if SkipListerCheck {
+		return ret, nil
+	}
+
+	obj, err := verifyCreation(ret.Name, "Longhorn VolumeAttachment", func(name string) (runtime.Object, error) {
+		return s.GetLHVolumeAttachmentRO(name)
+	})
+	if err != nil {
+		return nil, err
+	}
+	ret, ok := obj.(*longhorn.VolumeAttachment)
+	if !ok {
+		return nil, fmt.Errorf("BUG: datastore: verifyCreation returned wrong type for Longhorn VolumeAttachment")
+	}
+
+	return ret.DeepCopy(), nil
+}
+
+// GetLHVolumeAttachmentRO returns the VolumeAttachment with the given name in the cluster
+func (s *DataStore) GetLHVolumeAttachmentRO(name string) (*longhorn.VolumeAttachment, error) {
+	return s.lhVolumeAttachmentLister.VolumeAttachments(s.namespace).Get(name)
+}
+
+// GetLHVolumeAttachment returns a copy of VolumeAttachment with the given name in the cluster
+func (s *DataStore) GetLHVolumeAttachment(name string) (*longhorn.VolumeAttachment, error) {
+	resultRO, err := s.GetLHVolumeAttachmentRO(name)
+	if err != nil {
+		return nil, err
+	}
+	// Cannot use cached object from lister
+	return resultRO.DeepCopy(), nil
+}
+
+func (s *DataStore) GetLHVolumeAttachmentByVolumeName(volName string) (*longhorn.VolumeAttachment, error) {
+	vaName := types.GetLHVolumeAttachmentNameFromVolumeName(volName)
+	return s.GetLHVolumeAttachment(vaName)
+}
+
+// ListSupportBundles returns an object contains all SupportBundles
+func (s *DataStore) ListSupportBundles() (map[string]*longhorn.SupportBundle, error) {
+	itemMap := make(map[string]*longhorn.SupportBundle)
+
+	list, err := s.ListSupportBundlesRO()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, itemRO := range list {
+		// Cannot use cached object from lister
+		itemMap[itemRO.Name] = itemRO.DeepCopy()
+	}
+	return itemMap, nil
+}
+
+// ListSupportBundlesRO returns a list of all SupportBundles for the given namespace.
+// Consider using this function when you can guarantee read only access and don't want the overhead of deep copies
+func (s *DataStore) ListSupportBundlesRO() ([]*longhorn.SupportBundle, error) {
+	return s.supportBundleLister.SupportBundles(s.namespace).List(labels.Everything())
+}
+
+// RemoveFinalizerForSupportBundle will result in deletion if DeletionTimestamp was set
+func (s *DataStore) RemoveFinalizerForSupportBundle(supportBundle *longhorn.SupportBundle) (err error) {
+	if !util.FinalizerExists(longhornFinalizerKey, supportBundle) {
+		// finalizer already removed
+		return nil
+	}
+
+	if err = util.RemoveFinalizer(longhornFinalizerKey, supportBundle); err != nil {
+		return err
+	}
+
+	supportBundle, err = s.lhClient.LonghornV1beta2().SupportBundles(s.namespace).Update(context.TODO(), supportBundle, metav1.UpdateOptions{})
+	if err != nil {
+		// workaround `StorageError: invalid object, Code: 4` due to empty object
+		if supportBundle.DeletionTimestamp != nil {
+			return nil
+		}
+		return errors.Wrapf(err, "unable to remove finalizer for SupportBundle %s", supportBundle.Name)
+	}
+	return nil
+}
+
+// UpdateSupportBundleStatus updates the given Longhorn SupportBundle status and verifies update
+func (s *DataStore) UpdateSupportBundleStatus(supportBundle *longhorn.SupportBundle) (*longhorn.SupportBundle, error) {
+	obj, err := s.lhClient.LonghornV1beta2().SupportBundles(s.namespace).UpdateStatus(context.TODO(), supportBundle, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	verifyUpdate(supportBundle.Name, obj, func(name string) (runtime.Object, error) {
+		return s.GetSupportBundleRO(name)
+	})
+	return obj, nil
+}
+
+// CreateSupportBundle creates a Longhorn SupportBundle resource and verifies creation
+func (s *DataStore) CreateSupportBundle(supportBundle *longhorn.SupportBundle) (*longhorn.SupportBundle, error) {
+	ret, err := s.lhClient.LonghornV1beta2().SupportBundles(s.namespace).Create(context.TODO(), supportBundle, metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if SkipListerCheck {
+		return ret, nil
+	}
+
+	obj, err := verifyCreation(ret.Name, "support bundle", func(name string) (runtime.Object, error) {
+		return s.GetSupportBundleRO(name)
+	})
+	if err != nil {
+		return nil, err
+	}
+	ret, ok := obj.(*longhorn.SupportBundle)
+	if !ok {
+		return nil, fmt.Errorf("BUG: datastore: verifyCreation returned wrong type for support bundle")
+	}
+
+	return ret.DeepCopy(), nil
+}
+
+// DeleteSupportBundle won't result in immediately deletion since finalizer was
+// set by default
+func (s *DataStore) DeleteSupportBundle(name string) error {
+	return s.lhClient.LonghornV1beta2().SupportBundles(s.namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
+}
+
+// CreateSystemBackup creates a Longhorn SystemBackup and verifies creation
+func (s *DataStore) CreateSystemBackup(systemBackup *longhorn.SystemBackup) (*longhorn.SystemBackup, error) {
+	ret, err := s.lhClient.LonghornV1beta2().SystemBackups(s.namespace).Create(context.TODO(), systemBackup, metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	if SkipListerCheck {
+		return ret, nil
+	}
+
+	obj, err := verifyCreation(ret.Name, "system backup", func(name string) (runtime.Object, error) {
+		return s.GetSystemBackupRO(name)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ret, ok := obj.(*longhorn.SystemBackup)
+	if !ok {
+		return nil, errors.Errorf("BUG: datastore: verifyCreation returned wrong type for SystemBackup")
+	}
+	return ret.DeepCopy(), nil
+}
+
+// DeleteSystemBackup won't result in immediately deletion since finalizer was set by default
+func (s *DataStore) DeleteSystemBackup(name string) error {
+	return s.lhClient.LonghornV1beta2().SystemBackups(s.namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
+}
+
+// RemoveFinalizerForSystemBackup results in deletion if DeletionTimestamp was set
+func (s *DataStore) RemoveFinalizerForSystemBackup(obj *longhorn.SystemBackup) error {
+	if !util.FinalizerExists(longhornFinalizerKey, obj) {
+		// finalizer already removed
+		return nil
+	}
+
+	if err := util.RemoveFinalizer(longhornFinalizerKey, obj); err != nil {
+		return err
+	}
+
+	_, err := s.lhClient.LonghornV1beta2().SystemBackups(s.namespace).Update(context.TODO(), obj, metav1.UpdateOptions{})
+	if err != nil {
+		// workaround `StorageError: invalid object, Code: 4` due to empty object
+		if obj.DeletionTimestamp != nil {
+			return nil
+		}
+		return errors.Wrapf(err, "unable to remove finalizer for SystemBackup %v", obj.Name)
+	}
+	return nil
+}
+
+// UpdateSystemBackup updates Longhorn SystemBackup and verifies update
+func (s *DataStore) UpdateSystemBackup(systemBackup *longhorn.SystemBackup) (*longhorn.SystemBackup, error) {
+	obj, err := s.lhClient.LonghornV1beta2().SystemBackups(s.namespace).Update(context.TODO(), systemBackup, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	verifyUpdate(systemBackup.Name, obj, func(name string) (runtime.Object, error) {
+		return s.GetSystemBackupRO(name)
+	})
+	return obj, nil
+}
+
+// UpdateSystemBackupStatus updates Longhorn SystemBackup status and verifies update
+func (s *DataStore) UpdateSystemBackupStatus(systemBackup *longhorn.SystemBackup) (*longhorn.SystemBackup, error) {
+	obj, err := s.lhClient.LonghornV1beta2().SystemBackups(s.namespace).UpdateStatus(context.TODO(), systemBackup, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	verifyUpdate(systemBackup.Name, obj, func(name string) (runtime.Object, error) {
+		return s.GetSystemBackupRO(name)
+	})
+	return obj, nil
+}
+
+// GetSystemBackup returns a copy of SystemBackup with the given name
+func (s *DataStore) GetSystemBackup(name string) (*longhorn.SystemBackup, error) {
+	resultRO, err := s.GetSystemBackupRO(name)
+	if err != nil {
+		return nil, err
+	}
+	// Cannot use cached object from lister
+	return resultRO.DeepCopy(), nil
+}
+
+// GetSystemBackupRO returns the SystemBackup with the given name
+func (s *DataStore) GetSystemBackupRO(name string) (*longhorn.SystemBackup, error) {
+	return s.systemBackupLister.SystemBackups(s.namespace).Get(name)
+}
+
+// ListSystemBackups returns a copy of the object contains all SystemBackups
+func (s *DataStore) ListSystemBackups() (map[string]*longhorn.SystemBackup, error) {
+	list, err := s.ListSystemBackupsRO()
+	if err != nil {
+		return nil, err
+	}
+
+	itemMap := map[string]*longhorn.SystemBackup{}
+	for _, itemRO := range list {
+		itemMap[itemRO.Name] = itemRO.DeepCopy()
+	}
+	return itemMap, nil
+}
+
+// ListSystemBackupsRO returns an object contains all SystemBackups
+func (s *DataStore) ListSystemBackupsRO() ([]*longhorn.SystemBackup, error) {
+	return s.systemBackupLister.SystemBackups(s.namespace).List(labels.Everything())
+}
+
+func LabelSystemBackupVersion(version string, obj runtime.Object) error {
+	metadata, err := meta.Accessor(obj)
+	if err != nil {
+		return err
+	}
+
+	labels := metadata.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[types.GetVersionLabelKey()] = version
+	metadata.SetLabels(labels)
+	return nil
+}
+
+// CreateSystemRestore creates a Longhorn SystemRestore resource and verifies creation
+func (s *DataStore) CreateSystemRestore(systemRestore *longhorn.SystemRestore) (*longhorn.SystemRestore, error) {
+	ret, err := s.lhClient.LonghornV1beta2().SystemRestores(s.namespace).Create(context.TODO(), systemRestore, metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	if SkipListerCheck {
+		return ret, nil
+	}
+
+	obj, err := verifyCreation(ret.Name, "system restore", func(name string) (runtime.Object, error) {
+		return s.GetSystemRestoreRO(name)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ret, ok := obj.(*longhorn.SystemRestore)
+	if !ok {
+		return nil, fmt.Errorf("BUG: datastore: verifyCreation returned wrong type for SystemRestore")
+	}
+
+	return ret.DeepCopy(), nil
+}
+
+// DeleteSystemRestore won't result in immediately deletion since finalizer was set by default
+// The dependents will be deleted in the foreground
+func (s *DataStore) DeleteSystemRestore(name string) error {
+	propagation := metav1.DeletePropagationForeground
+	return s.lhClient.LonghornV1beta2().SystemRestores(s.namespace).Delete(
+		context.TODO(),
+		name,
+		metav1.DeleteOptions{PropagationPolicy: &propagation},
+	)
+}
+
+// GetOwnerReferencesForSystemRestore returns OwnerReference for the given
+// SystemRestore
+func GetOwnerReferencesForSystemRestore(systemRestore *longhorn.SystemRestore) []metav1.OwnerReference {
+	controller := true
+	blockOwnerDeletion := true
+	return []metav1.OwnerReference{
+		{
+			APIVersion:         longhorn.SchemeGroupVersion.String(),
+			Kind:               types.LonghornKindSystemRestore,
+			Name:               systemRestore.Name,
+			UID:                systemRestore.UID,
+			Controller:         &controller,
+			BlockOwnerDeletion: &blockOwnerDeletion,
+		},
+	}
+}
+
+// RemoveSystemRestoreLabel removed the system-restore label and updates the SystemRestore. Longhorn labels
+// SystemRestore with "longhorn.io/system-restore: InProgress" during restoring to ensure only one restore is rolling out.
+func (s *DataStore) RemoveSystemRestoreLabel(systemRestore *longhorn.SystemRestore) (*longhorn.SystemRestore, error) {
+	key := types.GetSystemRestoreLabelKey()
+	if _, exist := systemRestore.Labels[key]; !exist {
+		return systemRestore, nil
+	}
+
+	delete(systemRestore.Labels, key)
+	_, err := s.lhClient.LonghornV1beta2().SystemRestores(s.namespace).Update(context.TODO(), systemRestore, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to remove SystemRestore %v label %v", systemRestore.Name, key)
+	}
+
+	log := logrus.WithFields(logrus.Fields{
+		"systemRestore": systemRestore.Name,
+		"label":         key,
+	})
+	log.Info("Removed SystemRestore label")
+	return systemRestore, nil
+}
+
+// UpdateSystemRestore updates Longhorn SystemRestore and verifies update
+func (s *DataStore) UpdateSystemRestore(systemRestore *longhorn.SystemRestore) (*longhorn.SystemRestore, error) {
+	err := labelLonghornSystemRestoreInProgress(systemRestore)
+	if err != nil {
+		return nil, err
+	}
+
+	obj, err := s.lhClient.LonghornV1beta2().SystemRestores(s.namespace).Update(context.TODO(), systemRestore, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	verifyUpdate(systemRestore.Name, obj, func(name string) (runtime.Object, error) {
+		return s.GetSystemRestore(name)
+	})
+
+	return obj, nil
+}
+
+func labelLonghornSystemRestoreInProgress(obj runtime.Object) error {
+	metadata, err := meta.Accessor(obj)
+	if err != nil {
+		return err
+	}
+
+	labels := metadata.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[types.GetSystemRestoreLabelKey()] = string(longhorn.SystemRestoreStateInProgress)
+	metadata.SetLabels(labels)
+	return nil
+}
+
+// UpdateSystemRestoreStatus updates Longhorn SystemRestore resource status and verifies update
+func (s *DataStore) UpdateSystemRestoreStatus(systemRestore *longhorn.SystemRestore) (*longhorn.SystemRestore, error) {
+	obj, err := s.lhClient.LonghornV1beta2().SystemRestores(s.namespace).UpdateStatus(context.TODO(), systemRestore, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	verifyUpdate(systemRestore.Name, obj, func(name string) (runtime.Object, error) {
+		return s.GetSystemRestoreRO(name)
+	})
+
+	return obj, nil
+}
+
+// GetSystemRestore returns a copy of SystemRestore with the given obj name
+func (s *DataStore) GetSystemRestore(name string) (*longhorn.SystemRestore, error) {
+	resultRO, err := s.GetSystemRestoreRO(name)
+	if err != nil {
+		return nil, err
+	}
+	// Cannot use cached object from lister
+	return resultRO.DeepCopy(), nil
+}
+
+// GetSystemRestoreRO returns the SystemRestore with the given CR name
+func (s *DataStore) GetSystemRestoreRO(name string) (*longhorn.SystemRestore, error) {
+	return s.systemRestoreLister.SystemRestores(s.namespace).Get(name)
+}
+
+// GetSystemRestoreInProgress validate the given name and returns the only
+// SystemRestore in progress. Returns error if found less or more SystemRestore.
+// If given an empty name, return the SystemRestore without validating the name.
+func (s *DataStore) GetSystemRestoreInProgress(name string) (systemRestore *longhorn.SystemRestore, err error) {
+	systemRestores, err := s.ListSystemRestoresInProgress()
+	if err != nil {
+		return nil, err
+	}
+
+	systemRestoreCount := len(systemRestores)
+	if systemRestoreCount == 0 {
+		return nil, errors.Errorf("cannot find in-progress system restore")
+	} else if systemRestoreCount > 1 {
+		return nil, errors.Errorf("found %v system restore already in progress", systemRestoreCount-1)
+	}
+
+	for _, systemRestore = range systemRestores {
+		if name == "" {
+			break
+		}
+
+		if systemRestore.Name != name {
+			return nil, errors.Errorf("found the in-progress system restore with a mismatching name %v, expecting %v", systemRestore.Name, name)
+		}
+	}
+
+	return systemRestore, nil
+}
+
+// ListSystemRestoresInProgress returns an object contains all SystemRestores in progress
+func (s *DataStore) ListSystemRestoresInProgress() (map[string]*longhorn.SystemRestore, error) {
+	selector, err := s.getSystemRestoreInProgressSelector()
+	if err != nil {
+		return nil, err
+	}
+	return s.listSystemRestores(selector)
+}
+
+func (s *DataStore) getSystemRestoreInProgressSelector() (labels.Selector, error) {
+	return metav1.LabelSelectorAsSelector(&metav1.LabelSelector{
+		MatchLabels: types.GetSystemRestoreInProgressLabel(),
+	})
+}
+
+func (s *DataStore) listSystemRestores(selector labels.Selector) (map[string]*longhorn.SystemRestore, error) {
+	list, err := s.systemRestoreLister.SystemRestores(s.namespace).List(selector)
+	if err != nil {
+		return nil, err
+	}
+
+	itemMap := map[string]*longhorn.SystemRestore{}
+	for _, itemRO := range list {
+		// Cannot use cached object from lister
+		itemMap[itemRO.Name] = itemRO.DeepCopy()
+	}
+	return itemMap, nil
+}
+
+// ListSystemRestores returns an object contains all SystemRestores
+func (s *DataStore) ListSystemRestores() (map[string]*longhorn.SystemRestore, error) {
+	return s.listSystemRestores(labels.Everything())
+}
+
+// UpdateLHVolumeAttachment updates the given Longhorn VolumeAttachment in the VolumeAttachment CR and verifies update
+func (s *DataStore) UpdateLHVolumeAttachment(va *longhorn.VolumeAttachment) (*longhorn.VolumeAttachment, error) {
+	obj, err := s.lhClient.LonghornV1beta2().VolumeAttachments(s.namespace).Update(context.TODO(), va, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	verifyUpdate(va.Name, obj, func(name string) (runtime.Object, error) {
+		return s.GetLHVolumeAttachmentRO(name)
+	})
+	return obj, nil
+}
+
+// UpdateLHVolumeAttachmentStatus updates the given Longhorn VolumeAttachment status in the VolumeAttachment CR status and verifies update
+func (s *DataStore) UpdateLHVolumeAttachmentStatus(va *longhorn.VolumeAttachment) (*longhorn.VolumeAttachment, error) {
+	obj, err := s.lhClient.LonghornV1beta2().VolumeAttachments(s.namespace).UpdateStatus(context.TODO(), va, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	verifyUpdate(va.Name, obj, func(name string) (runtime.Object, error) {
+		return s.GetLHVolumeAttachmentRO(name)
+	})
+	return obj, nil
+}
+
+// ListLonghornVolumeAttachmentByVolumeRO returns a list of all Longhorn VolumeAttachments of a volume.
+// The list contains direct references to the internal cache objects and should not be mutated.
+// Consider using this function when you can guarantee read only access and don't want the overhead of deep copies
+func (s *DataStore) ListLonghornVolumeAttachmentByVolumeRO(name string) ([]*longhorn.VolumeAttachment, error) {
+	volumeSelector, err := getVolumeSelector(name)
+	if err != nil {
+		return nil, err
+	}
+	return s.lhVolumeAttachmentLister.VolumeAttachments(s.namespace).List(volumeSelector)
+}
+
+// ListLHVolumeAttachmentsRO returns a list of all VolumeAttachments for the given namespace
+func (s *DataStore) ListLHVolumeAttachmentsRO() ([]*longhorn.VolumeAttachment, error) {
+	return s.lhVolumeAttachmentLister.VolumeAttachments(s.namespace).List(labels.Everything())
+}
+
+// RemoveFinalizerForLHVolumeAttachment will result in deletion if DeletionTimestamp was set
+func (s *DataStore) RemoveFinalizerForLHVolumeAttachment(va *longhorn.VolumeAttachment) error {
+	if !util.FinalizerExists(longhornFinalizerKey, va) {
+		return nil
+	}
+	if err := util.RemoveFinalizer(longhornFinalizerKey, va); err != nil {
+		return err
+	}
+	_, err := s.lhClient.LonghornV1beta2().VolumeAttachments(s.namespace).Update(context.TODO(), va, metav1.UpdateOptions{})
+	if err != nil {
+		// workaround `StorageError: invalid object, Code: 4` due to empty object
+		if va.DeletionTimestamp != nil {
+			return nil
+		}
+		return errors.Wrapf(err, "unable to remove finalizer for VolumeAttachment %s", va.Name)
+	}
+	return nil
+}
+
+// DeleteLHVolumeAttachment won't result in immediately deletion since finalizer was set by default
+func (s *DataStore) DeleteLHVolumeAttachment(vaName string) error {
+	return s.lhClient.LonghornV1beta2().VolumeAttachments(s.namespace).Delete(context.TODO(), vaName, metav1.DeleteOptions{})
+}
+
+// IsSupportedVolumeSize returns turn if the v1 volume size is supported by the given fsType file system.
+func IsSupportedVolumeSize(dataEngine longhorn.DataEngineType, fsType string, volumeSize int64) bool {
+	// TODO: check the logical volume maximum size limit
+	if types.IsDataEngineV1(dataEngine) {
+		// unix.Statfs can not differentiate the ext2/ext3/ext4 file systems.
+		if (strings.HasPrefix(fsType, "ext") && volumeSize >= util.MaxExt4VolumeSize) || (fsType == "xfs" && volumeSize >= util.MaxXfsVolumeSize) {
+			return false
+		}
+	}
+	return true
+}
+
+// IsDataEngineEnabled returns true if the given dataEngine is enabled
+func (s *DataStore) IsDataEngineEnabled(dataEngine longhorn.DataEngineType) (bool, error) {
+	dataEngineSetting := types.SettingNameV1DataEngine
+	if dataEngine == longhorn.DataEngineTypeV2 {
+		dataEngineSetting = types.SettingNameV2DataEngine
+	}
+
+	enabled, err := s.GetSettingAsBool(dataEngineSetting)
+	if err != nil {
+		return true, errors.Wrapf(err, "failed to get %v setting", dataEngineSetting)
+	}
+
+	return enabled, nil
+}
+
+func (s *DataStore) GetDataEngines() map[longhorn.DataEngineType]struct{} {
+	dataEngines := map[longhorn.DataEngineType]struct{}{}
+
+	for _, setting := range []types.SettingName{types.SettingNameV1DataEngine, types.SettingNameV2DataEngine} {
+		dataEngineEnabled, err := s.GetSettingAsBool(setting)
+		if err != nil {
+			logrus.WithError(err).Warnf("Failed to get setting %v", setting)
+			continue
+		}
+		if dataEngineEnabled {
+			switch setting {
+			case types.SettingNameV1DataEngine:
+				dataEngines[longhorn.DataEngineTypeV1] = struct{}{}
+			case types.SettingNameV2DataEngine:
+				dataEngines[longhorn.DataEngineTypeV2] = struct{}{}
+			}
+		}
+	}
+
+	return dataEngines
+}
+
+// IsV2VolumeDisabledForNode returns true if the node disables v2 data engine
+func (s *DataStore) IsV2DataEngineDisabledForNode(nodeName string) (bool, error) {
+	kubeNode, err := s.GetKubernetesNodeRO(nodeName)
+	if err != nil {
+		return false, err
+	}
+	val, ok := kubeNode.Labels[types.NodeDisableV2DataEngineLabelKey]
+	if ok && val == types.NodeDisableV2DataEngineLabelKeyTrue {
+		return true, nil
+	}
+	return false, nil
+}
+
+func (s *DataStore) GetDiskBackingImageMap() (map[string][]*longhorn.BackingImage, error) {
+	diskBackingImageMap := map[string][]*longhorn.BackingImage{}
+	backingImages, err := s.ListBackingImages()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, bi := range backingImages {
+		for diskUUID := range bi.Status.DiskFileStatusMap {
+			diskBackingImageMap[diskUUID] = append(diskBackingImageMap[diskUUID], bi)
+		}
+	}
+
+	return diskBackingImageMap, nil
+}
+
+// CreateBackupBackingImage creates a Longhorn BackupBackingImage resource and verifies
+func (s *DataStore) CreateBackupBackingImage(backupBackingImage *longhorn.BackupBackingImage) (*longhorn.BackupBackingImage, error) {
+	ret, err := s.lhClient.LonghornV1beta2().BackupBackingImages(s.namespace).Create(context.TODO(), backupBackingImage, metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if SkipListerCheck {
+		return ret, nil
+	}
+
+	obj, err := verifyCreation(ret.Name, "backup backing image", func(name string) (runtime.Object, error) {
+		return s.GetBackupBackingImageRO(name)
+	})
+	if err != nil {
+		return nil, err
+	}
+	ret, ok := obj.(*longhorn.BackupBackingImage)
+	if !ok {
+		return nil, fmt.Errorf("BUG: datastore: verifyCreation returned wrong type for backup backing image")
+	}
+
+	return ret.DeepCopy(), nil
+}
+
+// UpdateBackupBackingImage updates Longhorn BackupBackingImage and verifies update
+func (s *DataStore) UpdateBackupBackingImage(backupBackingImage *longhorn.BackupBackingImage) (*longhorn.BackupBackingImage, error) {
+	obj, err := s.lhClient.LonghornV1beta2().BackupBackingImages(s.namespace).Update(context.TODO(), backupBackingImage, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	verifyUpdate(backupBackingImage.Name, obj, func(name string) (runtime.Object, error) {
+		return s.GetBackupBackingImageRO(name)
+	})
+	return obj, nil
+}
+
+// UpdateBackupBackingImageStatus updates Longhorn BackupBackingImage resource status and
+// verifies update
+func (s *DataStore) UpdateBackupBackingImageStatus(backupBackingImage *longhorn.BackupBackingImage) (*longhorn.BackupBackingImage, error) {
+	obj, err := s.lhClient.LonghornV1beta2().BackupBackingImages(s.namespace).UpdateStatus(context.TODO(), backupBackingImage, metav1.UpdateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	verifyUpdate(backupBackingImage.Name, obj, func(name string) (runtime.Object, error) {
+		return s.GetBackupBackingImageRO(name)
+	})
+	return obj, nil
+}
+
+// DeleteBackupBackingImage won't result in immediately deletion since finalizer was
+// set by default
+func (s *DataStore) DeleteBackupBackingImage(name string) error {
+	return s.lhClient.LonghornV1beta2().BackupBackingImages(s.namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
+}
+
+// RemoveFinalizerForBackupBackingImage will result in deletion if DeletionTimestamp was set
+func (s *DataStore) RemoveFinalizerForBackupBackingImage(obj *longhorn.BackupBackingImage) error {
+	if !util.FinalizerExists(longhornFinalizerKey, obj) {
+		// finalizer already removed
+		return nil
+	}
+	if err := util.RemoveFinalizer(longhornFinalizerKey, obj); err != nil {
+		return err
+	}
+	_, err := s.lhClient.LonghornV1beta2().BackupBackingImages(s.namespace).Update(context.TODO(), obj, metav1.UpdateOptions{})
+	if err != nil {
+		// workaround `StorageError: invalid object, Code: 4` due to empty object
+		if obj.DeletionTimestamp != nil {
+			return nil
+		}
+		return errors.Wrapf(err, "unable to remove finalizer for backing image %v", obj.Name)
+	}
+	return nil
+}
+
+func (s *DataStore) GetBackupBackingImageRO(name string) (*longhorn.BackupBackingImage, error) {
+	return s.backupBackingImageLister.BackupBackingImages(s.namespace).Get(name)
+}
+
+// GetBackupBackingImage returns a new BackupBackingImage object for the given name and
+// namespace
+func (s *DataStore) GetBackupBackingImage(name string) (*longhorn.BackupBackingImage, error) {
+	resultRO, err := s.GetBackupBackingImageRO(name)
+	if err != nil {
+		return nil, err
+	}
+	// Cannot use cached object from lister
+	return resultRO.DeepCopy(), nil
+}
+
+// ListBackupBackingImages returns object includes all BackupBackingImage in namespace
+func (s *DataStore) ListBackupBackingImages() (map[string]*longhorn.BackupBackingImage, error) {
+	itemMap := map[string]*longhorn.BackupBackingImage{}
+
+	list, err := s.backupBackingImageLister.BackupBackingImages(s.namespace).List(labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+
+	for _, itemRO := range list {
+		// Cannot use cached object from lister
+		itemMap[itemRO.Name] = itemRO.DeepCopy()
+	}
+	return itemMap, nil
+}
+
+func (s *DataStore) ListBackupBackingImagesRO() ([]*longhorn.BackupBackingImage, error) {
+	return s.backupBackingImageLister.BackupBackingImages(s.namespace).List(labels.Everything())
+}
+
+// GetRunningInstanceManagerByNodeRO returns the running instance manager for the given node and data engine
+func (s *DataStore) GetRunningInstanceManagerByNodeRO(node string, dataEngine longhorn.DataEngineType) (*longhorn.InstanceManager, error) {
+	// Trying to get the default instance manager first.
+	// If the default instance manager is not running, then try to get another running instance manager.
+	im, err := s.GetDefaultInstanceManagerByNodeRO(node, dataEngine)
+	if err == nil {
+		if im.Status.CurrentState == longhorn.InstanceManagerStateRunning {
+			return im, nil
+		}
+	}
+
+	logrus.WithError(err).Debugf("Failed to get the default instance manager for node %v and data engine %v, trying to get another running instance manager", node, dataEngine)
+
+	ims, err := s.ListInstanceManagersByNodeRO(node, longhorn.InstanceManagerTypeAllInOne, dataEngine)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to list instance managers for node %v", node)
+	}
+
+	for _, im := range ims {
+		if im.Status.CurrentState == longhorn.InstanceManagerStateRunning {
+			return im, nil
+		}
+	}
+
+	return nil, fmt.Errorf("failed to find a running instance manager for node %v", node)
+}
+
+func (s *DataStore) GetFreezeFilesystemForSnapshotSetting(e *longhorn.Engine) (bool, error) {
+	volume, err := s.GetVolumeRO(e.Spec.VolumeName)
+	if err != nil {
+		return false, err
+	}
+
+	if volume.Spec.FreezeFilesystemForSnapshot != longhorn.FreezeFilesystemForSnapshotDefault {
+		return volume.Spec.FreezeFilesystemForSnapshot == longhorn.FreezeFilesystemForSnapshotEnabled, nil
+	}
+
+	return s.GetSettingAsBool(types.SettingNameFreezeFilesystemForSnapshot)
+}
+
+func (s *DataStore) CanPutBackingImageOnDisk(backingImage *longhorn.BackingImage, diskUUID string) (bool, error) {
+	node, diskName, err := s.GetReadyDiskNodeRO(diskUUID)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to get the node of the disk %v", diskUUID)
+	}
+
+	allowEmptyNodeSelectorVolume, err := s.GetSettingAsBool(types.SettingNameAllowEmptyNodeSelectorVolume)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to get %v setting", types.SettingNameAllowEmptyNodeSelectorVolume)
+	}
+
+	allowEmptyDiskSelectorVolume, err := s.GetSettingAsBool(types.SettingNameAllowEmptyDiskSelectorVolume)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to get %v setting", types.SettingNameAllowEmptyDiskSelectorVolume)
+	}
+
+	if !types.IsSelectorsInTags(node.Spec.Tags, backingImage.Spec.NodeSelector, allowEmptyNodeSelectorVolume) {
+		return false, nil
+	}
+
+	diskSpec, exists := node.Spec.Disks[diskName]
+	if exists {
+		if !types.IsSelectorsInTags(diskSpec.Tags, backingImage.Spec.DiskSelector, allowEmptyDiskSelectorVolume) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (s *DataStore) GetOneBackingImageReadyNodeDisk(backingImage *longhorn.BackingImage) (*longhorn.Node, string, error) {
+	for diskUUID := range backingImage.Spec.DiskFileSpecMap {
+		bimMap, err := s.ListBackingImageManagersByDiskUUID(diskUUID)
+		if err != nil {
+			return nil, "", errors.Wrapf(err, "failed to get backing image manager by disk uuid %v", diskUUID)
+		}
+		for _, bim := range bimMap {
+			if bim.DeletionTimestamp == nil {
+				if info, exists := bim.Status.BackingImageFileMap[backingImage.Name]; exists && info.State == longhorn.BackingImageStateReady {
+					return s.GetReadyDiskNode(bim.Spec.DiskUUID)
+				}
+			}
+		}
+	}
+
+	return nil, "", fmt.Errorf("failed to find one ready backing image %v", backingImage.Name)
+}
+
+func (s *DataStore) IsPVMountOptionReadOnly(volume *longhorn.Volume) (bool, error) {
+	kubeStatus := volume.Status.KubernetesStatus
+	if kubeStatus.PVName == "" {
+		return false, nil
+	}
+
+	pv, err := s.GetPersistentVolumeRO(kubeStatus.PVName)
+	if err != nil {
+		return false, err
+	}
+	if pv != nil {
+		for _, opt := range pv.Spec.MountOptions {
+			if opt == "ro" {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (s *DataStore) IsStorageNetworkForRWXVolume() (bool, error) {
+	storageNetworkSetting, err := s.GetSettingWithAutoFillingRO(types.SettingNameStorageNetwork)
+	if err != nil {
+		return false, errors.Wrapf(err, "Failed to get setting %v", types.SettingNameStorageNetwork)
+	}
+
+	storageNetworkForRWXVolumeEnabled, err := s.GetSettingAsBool(types.SettingNameStorageNetworkForRWXVolumeEnabled)
+	if err != nil {
+		return false, errors.Wrapf(err, "Failed to get setting %v", types.SettingNameStorageNetworkForRWXVolumeEnabled)
+	}
+
+	return types.IsStorageNetworkForRWXVolume(storageNetworkSetting, storageNetworkForRWXVolumeEnabled), nil
 }

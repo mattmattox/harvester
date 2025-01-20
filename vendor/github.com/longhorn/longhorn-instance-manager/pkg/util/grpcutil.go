@@ -6,14 +6,15 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"strings"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
 
@@ -22,18 +23,24 @@ func unixDialer(ctx context.Context, addr string) (net.Conn, error) {
 	return dialer.DialContext(ctx, "unix", addr)
 }
 
-//Connect is a helper function to initiate a grpc client connection to server running at endpoint using tlsConfig
+// Connect is a helper function to initiate a grpc client connection to server running at endpoint using tlsConfig
 func Connect(endpoint string, tlsConfig *tls.Config, dialOptions ...grpc.DialOption) (*grpc.ClientConn, error) {
 	proto, address, err := parseEndpoint(endpoint)
 	if err != nil {
 		return nil, err
 	}
 
-	dialOptions = append(dialOptions, grpc.WithBackoffMaxDelay(time.Second))
+	dialOptions = append(dialOptions, grpc.WithConnectParams(grpc.ConnectParams{
+		Backoff: backoff.Config{
+			BaseDelay: time.Second,
+			MaxDelay:  time.Second,
+		},
+	}))
+
 	if tlsConfig != nil {
 		dialOptions = append(dialOptions, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	} else {
-		dialOptions = append(dialOptions, grpc.WithInsecure())
+		dialOptions = append(dialOptions, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
 	if proto == "unix" {
@@ -45,7 +52,7 @@ func Connect(endpoint string, tlsConfig *tls.Config, dialOptions ...grpc.DialOpt
 	// Code lifted from https://github.com/kubernetes-csi/csi-test/commit/6b8830bf5959a1c51c6e98fe514b22818b51eeeb
 	dialOptions = append(dialOptions, grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 30 * time.Second, PermitWithoutStream: true}))
 
-	return grpc.Dial(address, dialOptions...)
+	return grpc.NewClient(address, dialOptions...)
 }
 
 // NewServer is a helper function to start a grpc server at the given endpoint.
@@ -74,7 +81,7 @@ func NewServer(endpoint string, tlsConfig *tls.Config, opts ...grpc.ServerOption
 }
 
 // ServerTLS prepares the TLS configuration needed for a server with given
-// encoded certficate and private key.
+// encoded certificate and private key.
 func ServerTLS(caCert, cert, key []byte, peerName string) (*tls.Config, error) {
 	certPool := x509.NewCertPool()
 	if ok := certPool.AppendCertsFromPEM(caCert); !ok {
@@ -196,7 +203,7 @@ func loadCertificate(caFile, certFile, keyFile string) (certPool *x509.CertPool,
 	}
 
 	if caFile != "" {
-		caCert, err := ioutil.ReadFile(caFile)
+		caCert, err := os.ReadFile(caFile)
 		if err != nil {
 			return nil, nil, err
 		}

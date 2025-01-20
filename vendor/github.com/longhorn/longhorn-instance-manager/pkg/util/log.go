@@ -4,8 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"runtime"
 
 	"github.com/sirupsen/logrus"
 )
@@ -18,8 +21,6 @@ type LonghornFormatter struct {
 	*logrus.TextFormatter
 
 	LogsDir string
-
-	logFiles []*os.File
 }
 
 type LonghornWriter struct {
@@ -58,9 +59,16 @@ func SetUpLogger(logsDir string) error {
 		return err
 	}
 	logrus.Infof("Storing process logs at path: %v", logsDir)
+	logrus.SetReportCaller(true)
+
 	logrus.SetFormatter(LonghornFormatter{
 		TextFormatter: &logrus.TextFormatter{
 			DisableColors: false,
+			CallerPrettyfier: func(f *runtime.Frame) (function string, file string) {
+				fileName := fmt.Sprintf("%s:%d", path.Base(f.File), f.Line)
+				funcName := path.Base(f.Function)
+				return funcName, fileName
+			},
 		},
 		LogsDir: logsDir,
 	})

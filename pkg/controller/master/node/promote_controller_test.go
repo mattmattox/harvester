@@ -39,9 +39,30 @@ func (n *NodeBuilder) Zone(name string) *NodeBuilder {
 	return n
 }
 
+func (n *NodeBuilder) RoleMgmt() *NodeBuilder {
+	n.node.Labels[HarvesterMgmtNodeLabelKey] = "true"
+	return n
+}
+
+func (n *NodeBuilder) RoleWitness() *NodeBuilder {
+	n.node.Labels[HarvesterWitnessNodeLabelKey] = "true"
+	return n
+}
+
+func (n *NodeBuilder) RoleWorker() *NodeBuilder {
+	n.node.Labels[HarvesterWorkerNodeLabelKey] = "true"
+	return n
+}
+
 func (n *NodeBuilder) Harvester() *NodeBuilder {
 	n.node.Labels[HarvesterManagedNodeLabelKey] = "true"
 	return n
+}
+
+func (n *NodeBuilder) Witness() *corev1.Node {
+	n.node.Labels[KubeEtcdNodeLabelKey] = "true"
+	n.node.CreationTimestamp = metav1.NewTime(time.Now())
+	return n.node
 }
 
 func (n *NodeBuilder) Management() *corev1.Node {
@@ -92,6 +113,11 @@ var (
 	m2 = NewDefaultNodeBuilder().Name("m-2").Harvester().Management()
 	m3 = NewDefaultNodeBuilder().Name("m-3").Harvester().Management()
 
+	witnc1 = NewDefaultNodeBuilder().Name("witness-c-1").Harvester().Complete().RoleWitness().Witness()
+	witnr1 = NewDefaultNodeBuilder().Name("witness-r-1").Harvester().Running().Witness()
+	witnf1 = NewDefaultNodeBuilder().Name("witness-f-1").Harvester().Failed().Witness()
+	witnu1 = NewDefaultNodeBuilder().Name("witness-u-1").Harvester().Unknown().Witness()
+
 	mc1 = NewDefaultNodeBuilder().Name("m-complete-1").Harvester().Complete().Management()
 
 	wr1 = NewDefaultNodeBuilder().Name("w-running-1").Harvester().Running().Worker()
@@ -107,6 +133,11 @@ var (
 	w1 = NewDefaultNodeBuilder().Name("w-1").Harvester().Worker()
 	w2 = NewDefaultNodeBuilder().Name("w-2").Harvester().Worker()
 	w3 = NewDefaultNodeBuilder().Name("w-3").Harvester().Worker()
+
+	w1rm  = NewDefaultNodeBuilder().Name("w-1-r-mgmt").Harvester().RoleMgmt().Worker()
+	w1rwk = NewDefaultNodeBuilder().Name("w-1-r-worker").Harvester().RoleWorker().Worker()
+	w1rw  = NewDefaultNodeBuilder().Name("w-1-r-witness").Harvester().RoleWitness().Worker()
+	w2rw  = NewDefaultNodeBuilder().Name("w-2-r-witness").Harvester().RoleWitness().Worker()
 
 	// zone aware nodes
 	mu1z2 = NewDefaultNodeBuilder().Name("m-unmanaged-1-z2").Zone("zone2").Management()
@@ -128,10 +159,13 @@ var (
 
 	wc1z2 = NewDefaultNodeBuilder().Name("w-complete-1-z2").Harvester().Complete().Worker()
 
-	w1z1 = NewDefaultNodeBuilder().Name("w-1-z1").Zone("zone1").Harvester().Worker()
-	w2z2 = NewDefaultNodeBuilder().Name("w-2-z2").Zone("zone2").Harvester().Worker()
-	w3z3 = NewDefaultNodeBuilder().Name("w-3-z3").Zone("zone3").Harvester().Worker()
-	w4z3 = NewDefaultNodeBuilder().Name("w-4-z3").Zone("zone3").Harvester().Worker()
+	w1z1    = NewDefaultNodeBuilder().Name("w-1-z1").Zone("zone1").Harvester().Worker()
+	w2z2    = NewDefaultNodeBuilder().Name("w-2-z2").Zone("zone2").Harvester().Worker()
+	w3z3    = NewDefaultNodeBuilder().Name("w-3-z3").Zone("zone3").Harvester().Worker()
+	w4z3    = NewDefaultNodeBuilder().Name("w-4-z3").Zone("zone3").Harvester().Worker()
+	w5z2rm  = NewDefaultNodeBuilder().Name("w-5-z2-mgmt").Zone("zone2").Harvester().RoleMgmt().Worker()
+	w6z2rwk = NewDefaultNodeBuilder().Name("w-6-z2-worker").Zone("zone2").Harvester().RoleWorker().Worker()
+	w7z1    = NewDefaultNodeBuilder().Name("w-7-z1").Zone("zone1").Harvester().Worker()
 )
 
 func Test_selectPromoteNode(t *testing.T) {
@@ -389,6 +423,13 @@ func Test_selectPromoteNode(t *testing.T) {
 			want: nil,
 		},
 		{
+			name: "one management in zone1 and two worker in zone1",
+			args: args{
+				nodeList: []*corev1.Node{m1z1, w1z1, w7z1},
+			},
+			want: nil,
+		},
+		{
 			name: "one management in zone1 and one worker in zone2",
 			args: args{
 				nodeList: []*corev1.Node{m1z1, w2z2, w3},
@@ -618,6 +659,104 @@ func Test_selectPromoteNode(t *testing.T) {
 				nodeList: []*corev1.Node{m1z1, wc1z2, w3z3},
 			},
 			want: nil,
+		},
+		{
+			name: "two management one witness",
+			args: args{
+				nodeList: []*corev1.Node{m1, m2, witnc1},
+			},
+			want: nil,
+		},
+		{
+			name: "one management two witness",
+			args: args{
+				nodeList: []*corev1.Node{m1, w1rw, w2rw},
+			},
+			want: nil,
+		},
+		{
+			name: "one management one witness one worker",
+			args: args{
+				nodeList: []*corev1.Node{m1, w1rw, w2rw, w3},
+			},
+			want: w1rw,
+		},
+		{
+			name: "one management one witness promoted one witness one worker",
+			args: args{
+				nodeList: []*corev1.Node{m1, witnc1, w2rw, w3},
+			},
+			want: w3,
+		},
+		{
+			name: "one management one witness one promoted witness one worker order testing",
+			args: args{
+				nodeList: []*corev1.Node{m1, w2rw, witnc1, w3},
+			},
+			want: w3,
+		},
+		{
+			name: "one management one running witness one witness one worker",
+			args: args{
+				nodeList: []*corev1.Node{m1, witnr1, w2rw, w3},
+			},
+			want: nil,
+		},
+		{
+			name: "one management one failed witness one witness one worker",
+			args: args{
+				nodeList: []*corev1.Node{m1, witnf1, w2rw, w3},
+			},
+			want: nil,
+		},
+		{
+			name: "one management one unknown witness one witness one worker",
+			args: args{
+				nodeList: []*corev1.Node{m1, witnu1, w2rw, w3},
+			},
+			want: nil,
+		},
+		{
+			name: "two management one worker one worker with role management",
+			args: args{
+				nodeList: []*corev1.Node{m1, m2, w1, w1rm},
+			},
+			want: w1rm,
+		},
+		{
+			name: "two management one worker one worker and one worker with role witness",
+			args: args{
+				nodeList: []*corev1.Node{m1, m2, w1, w1rw},
+			},
+			want: w1rw,
+		},
+		{
+			name: "two management one worker with role worker",
+			args: args{
+				nodeList: []*corev1.Node{m1, m2, w1rwk},
+			},
+			want: nil,
+		},
+		{
+			name: "one management, one management in zone1, one worker in zone2, one worker with role management in zone2, one worker with in zone3",
+			args: args{
+				nodeList: []*corev1.Node{m1, m1z1, w2z2, w5z2rm, w3z3},
+			},
+			want: w5z2rm,
+		},
+		{
+			name: "one management in zone1, one worker with role worker in zone2, one worker in zone3",
+			args: args{
+				nodeList: []*corev1.Node{m1z1, w6z2rwk, w3z3},
+			},
+			want: nil,
+		},
+		{
+			name: "one management in zone1, one worker with role worker in zone2, one worker in zone2, one worker in zone3",
+			args: args{
+				nodeList: []*corev1.Node{m1z1, w6z2rwk, w2z2, w3z3},
+			},
+			want: w2z2,
 		},
 	}
 	for _, tt := range tests {

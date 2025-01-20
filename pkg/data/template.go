@@ -5,7 +5,7 @@ import (
 	"text/template"
 
 	"github.com/pkg/errors"
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -242,7 +242,7 @@ spec:
       runStrategy: RerunOnFailure
       template:
         spec:
-          evictionStrategy: LiveMigrate
+          evictionStrategy: LiveMigrateIfPossible
           domain:
             features:
               acpi:
@@ -317,7 +317,7 @@ spec:
       runStrategy: RerunOnFailure
       template:
         spec:
-          evictionStrategy: LiveMigrate
+          evictionStrategy: LiveMigrateIfPossible
           domain:
             features:
               acpi:
@@ -385,7 +385,7 @@ spec:
       runStrategy: RerunOnFailure
       template:
         spec:
-          evictionStrategy: LiveMigrate
+          evictionStrategy: LiveMigrateIfPossible
           domain:
             features:
               acpi:
@@ -463,7 +463,7 @@ spec:
       runStrategy: RerunOnFailure
       template:
         spec:
-          evictionStrategy: LiveMigrate
+          evictionStrategy: LiveMigrateIfPossible
           domain:
             features:
               acpi:
@@ -506,7 +506,7 @@ spec:
               claimName: pvc-rootdisk
             name: rootdisk
           - containerDisk:
-              image: registry.suse.com/suse/vmdp/vmdp:2.5.3
+              image: registry.suse.com/suse/vmdp/vmdp:2.5.4.3
               imagePullPolicy: IfNotPresent
             name: virtio-container-disk
 `

@@ -26,6 +26,8 @@ type BackingImageManagerExpansion interface{}
 
 type BackupExpansion interface{}
 
+type BackupBackingImageExpansion interface{}
+
 type BackupTargetExpansion interface{}
 
 type BackupVolumeExpansion interface{}
@@ -50,4 +52,12 @@ type ShareManagerExpansion interface{}
 
 type SnapshotExpansion interface{}
 
+type SupportBundleExpansion interface{}
+
+type SystemBackupExpansion interface{}
+
+type SystemRestoreExpansion interface{}
+
 type VolumeExpansion interface{}
+
+type VolumeAttachmentExpansion interface{}

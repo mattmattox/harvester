@@ -2,9 +2,10 @@ package upgrade
 
 import (
 	"fmt"
+	"strings"
 
 	upgradev1 "github.com/rancher/system-upgrade-controller/pkg/apis/upgrade.cattle.io/v1"
-	"github.com/rancher/wrangler/pkg/name"
+	"github.com/rancher/wrangler/v3/pkg/name"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -12,17 +13,44 @@ import (
 
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	"github.com/harvester/harvester/pkg/controller/master/node"
+	"github.com/harvester/harvester/pkg/controller/master/upgrade/repoinfo"
 )
 
 const (
 	nodeComponent     = "node"
 	manifestComponent = "manifest"
+	cleanupComponent  = "cleanup"
 
 	labelArch               = "kubernetes.io/arch"
 	labelCriticalAddonsOnly = "CriticalAddonsOnly"
 
 	// keep jobs for 7 days
 	defaultTTLSecondsAfterFinished = 604800
+	// Give up to an hour for slower hardware to preload images.
+	defaultPrepareDeadlineSeconds = 3600
+	imageCleanupScript            = `
+#!/usr/bin/env sh
+set -e
+
+HOST_DIR="${HOST_DIR:-/host}"
+
+export CONTAINER_RUNTIME_ENDPOINT=unix:///$HOST_DIR/run/k3s/containerd/containerd.sock
+export CONTAINERD_ADDRESS=$HOST_DIR/run/k3s/containerd/containerd.sock
+
+CRICTL="$HOST_DIR/$(readlink $HOST_DIR/var/lib/rancher/rke2/bin)/crictl"
+if [ -z "$CRICTL" ];then
+	echo "Fail to get host crictl binary."
+	exit 0
+fi
+
+ret=0
+"$CRICTL" rmi $IMAGES || ret=$?
+
+if [ "$ret" -ne 0 ]; then
+	echo "Fail to remove images"
+	exit 0
+fi
+`
 )
 
 func setNodeUpgradeStatus(upgrade *harvesterv1.Upgrade, nodeName string, state, reason, message string) {
@@ -54,6 +82,13 @@ func setNodeUpgradeStatus(upgrade *harvesterv1.Upgrade, nodeName string, state, 
 		}
 		setNodesUpgradedCondition(upgrade, corev1.ConditionTrue, "", "")
 	}
+}
+
+func setLogReadyCondition(upgrade *harvesterv1.Upgrade, status corev1.ConditionStatus, reason, message string) {
+	harvesterv1.LogReady.SetStatus(upgrade, string(status))
+	harvesterv1.LogReady.Reason(upgrade, reason)
+	harvesterv1.LogReady.Message(upgrade, message)
+	markComplete(upgrade)
 }
 
 func setImageReadyCondition(upgrade *harvesterv1.Upgrade, status corev1.ConditionStatus, reason, message string) {
@@ -119,22 +154,40 @@ func markComplete(upgrade *harvesterv1.Upgrade) {
 	}
 }
 
-func preparePlan(upgrade *harvesterv1.Upgrade) *upgradev1.Plan {
-	planVersion := upgrade.Name
+func prepareUpgradeLog(upgrade *harvesterv1.Upgrade) *harvesterv1.UpgradeLog {
+	return &harvesterv1.UpgradeLog{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name.SafeConcatName(upgrade.Name, "upgradelog"),
+			Namespace: upgradeNamespace,
+			Labels: map[string]string{
+				harvesterUpgradeLabel: upgrade.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				upgradeReference(upgrade),
+			},
+		},
+		Spec: harvesterv1.UpgradeLogSpec{
+			UpgradeName: upgrade.Name,
+		},
+	}
+}
 
-	// Use current running version because new images are not preloaded yet.
+func prepareCleanupPlan(upgrade *harvesterv1.Upgrade, imageList []string) *upgradev1.Plan {
+	concurrency := len(upgrade.Status.NodeStatuses)
+	planVersion := upgrade.Name
 	imageVersion := upgrade.Status.PreviousVersion
+
 	return &upgradev1.Plan{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-prepare", upgrade.Name),
+			Name:      fmt.Sprintf("%s-cleanup", upgrade.Name),
 			Namespace: sucNamespace,
 			Labels: map[string]string{
 				harvesterUpgradeLabel:          upgrade.Name,
-				harvesterUpgradeComponentLabel: nodeComponent,
+				harvesterUpgradeComponentLabel: cleanupComponent,
 			},
 		},
 		Spec: upgradev1.PlanSpec{
-			Concurrency: int64(1),
+			Concurrency: int64(concurrency),
 			Version:     planVersion,
 			NodeSelector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
@@ -154,6 +207,90 @@ func preparePlan(upgrade *harvesterv1.Upgrade) *upgradev1.Plan {
 				},
 				{
 					Key:      node.KubeControlPlaneNodeLabelKey,
+					Operator: corev1.TolerationOpExists,
+					Effect:   corev1.TaintEffectNoExecute,
+				},
+				{
+					Key:      node.KubeEtcdNodeLabelKey,
+					Operator: corev1.TolerationOpExists,
+					Effect:   corev1.TaintEffectNoExecute,
+				},
+				{
+					Key:      labelArch,
+					Operator: corev1.TolerationOpEqual,
+					Effect:   corev1.TaintEffectNoSchedule,
+					Value:    "amd64",
+				},
+				{
+					Key:      labelArch,
+					Operator: corev1.TolerationOpEqual,
+					Effect:   corev1.TaintEffectNoSchedule,
+					Value:    "arm64",
+				},
+				{
+					Key:      labelArch,
+					Operator: corev1.TolerationOpEqual,
+					Effect:   corev1.TaintEffectNoSchedule,
+					Value:    "arm",
+				},
+			},
+			Upgrade: &upgradev1.ContainerSpec{
+				Image: fmt.Sprintf("%s:%s", upgradeImageRepository, imageVersion),
+				Command: []string{
+					"sh", "-c", imageCleanupScript,
+				},
+				Env: []corev1.EnvVar{
+					{
+						Name:  "IMAGES",
+						Value: strings.Join(imageList, " "),
+					},
+				},
+			},
+		},
+	}
+}
+
+func preparePlan(upgrade *harvesterv1.Upgrade, concurrency int) *upgradev1.Plan {
+	planVersion := upgrade.Name
+
+	// Use current running version because new images are not preloaded yet.
+	imageVersion := upgrade.Status.PreviousVersion
+	return &upgradev1.Plan{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-prepare", upgrade.Name),
+			Namespace: sucNamespace,
+			Labels: map[string]string{
+				harvesterUpgradeLabel:          upgrade.Name,
+				harvesterUpgradeComponentLabel: nodeComponent,
+			},
+		},
+		Spec: upgradev1.PlanSpec{
+			Concurrency:           int64(concurrency),
+			JobActiveDeadlineSecs: defaultPrepareDeadlineSeconds,
+			Version:               planVersion,
+			NodeSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					harvesterManagedLabel: "true",
+				},
+			},
+			ServiceAccountName: upgradeServiceAccount,
+			Tolerations: []corev1.Toleration{
+				{
+					Key:      labelCriticalAddonsOnly,
+					Operator: corev1.TolerationOpExists,
+				},
+				{
+					Key:      "kubevirt.io/drain",
+					Operator: corev1.TolerationOpExists,
+					Effect:   corev1.TaintEffectNoSchedule,
+				},
+				{
+					Key:      node.KubeControlPlaneNodeLabelKey,
+					Operator: corev1.TolerationOpExists,
+					Effect:   corev1.TaintEffectNoExecute,
+				},
+				{
+					Key:      node.KubeEtcdNodeLabelKey,
 					Operator: corev1.TolerationOpExists,
 					Effect:   corev1.TaintEffectNoExecute,
 				},
@@ -191,7 +328,7 @@ func preparePlan(upgrade *harvesterv1.Upgrade) *upgradev1.Plan {
 	}
 }
 
-func applyNodeJob(upgrade *harvesterv1.Upgrade, repoInfo *UpgradeRepoInfo, nodeName string, jobType string) *batchv1.Job {
+func applyNodeJob(upgrade *harvesterv1.Upgrade, repoInfo *repoinfo.RepoInfo, nodeName string, jobType string) *batchv1.Job {
 	// Use the image tag in the upgrade repo because it's already preloaded and might contain updated codes.
 	imageVersion := repoInfo.Release.Harvester
 	hostPathDirectory := corev1.HostPathDirectory
@@ -296,7 +433,7 @@ func applyNodeJob(upgrade *harvesterv1.Upgrade, repoInfo *UpgradeRepoInfo, nodeN
 	}
 }
 
-func applyManifestsJob(upgrade *harvesterv1.Upgrade, repoInfo *UpgradeRepoInfo) *batchv1.Job {
+func applyManifestsJob(upgrade *harvesterv1.Upgrade, repoInfo *repoinfo.RepoInfo) *batchv1.Job {
 	// Use the image tag in the upgrade repo because it's already preloaded and might contain updated codes.
 	imageVersion := repoInfo.Release.Harvester
 	return &batchv1.Job{
@@ -356,6 +493,11 @@ func getDefaultTolerations() []corev1.Toleration {
 			Effect:   corev1.TaintEffectNoExecute,
 		},
 		{
+			Key:      node.KubeEtcdNodeLabelKey,
+			Operator: corev1.TolerationOpExists,
+			Effect:   corev1.TaintEffectNoExecute,
+		},
+		{
 			Key:      "kubevirt.io/drain",
 			Operator: corev1.TolerationOpExists,
 			Effect:   corev1.TaintEffectNoSchedule,
@@ -388,40 +530,6 @@ func getDefaultTolerations() []corev1.Toleration {
 			Value:    "arm",
 		},
 	}
-}
-
-const (
-	testJobName      = "test-job"
-	testPlanName     = "test-plan"
-	testNodeName     = "test-node"
-	testUpgradeName  = "test-upgrade"
-	testVersion      = "test-version"
-	testUpgradeImage = "test-upgrade-image"
-	testPlanHash     = "test-hash"
-)
-
-func newTestNodeJobBuilder() *jobBuilder {
-	return newJobBuilder(testJobName).
-		WithLabel(upgradePlanLabel, testPlanName).
-		WithLabel(upgradeNodeLabel, testNodeName)
-}
-
-func newTestPlanBuilder() *planBuilder {
-	return newPlanBuilder(testPlanName).
-		Version(testVersion).
-		WithLabel(harvesterUpgradeLabel, testUpgradeName).
-		Hash(testPlanHash)
-}
-
-func newTestChartJobBuilder() *jobBuilder {
-	return newJobBuilder(testJobName).
-		WithLabel(harvesterUpgradeComponentLabel, manifestComponent)
-}
-
-func newTestUpgradeBuilder() *upgradeBuilder {
-	return newUpgradeBuilder(testUpgradeName).
-		WithLabel(harvesterLatestUpgradeLabel, "true").
-		Version(testVersion)
 }
 
 type jobBuilder struct {
@@ -507,6 +615,11 @@ func (p *upgradeBuilder) WithAnnotation(key, value string) *upgradeBuilder {
 	return p
 }
 
+func (p *upgradeBuilder) WithLogEnabled(value bool) *upgradeBuilder {
+	p.upgrade.Spec.LogEnabled = value
+	return p
+}
+
 func (p *upgradeBuilder) WithImage(image string) *upgradeBuilder {
 	p.upgrade.Spec.Image = fmt.Sprintf("%s/%s", upgradeNamespace, image)
 	return p
@@ -517,12 +630,17 @@ func (p *upgradeBuilder) Version(version string) *upgradeBuilder {
 	return p
 }
 
+func (p *upgradeBuilder) LogReadyCondition(status corev1.ConditionStatus, reason, message string) *upgradeBuilder {
+	setLogReadyCondition(p.upgrade, status, reason, message)
+	return p
+}
+
 func (p *upgradeBuilder) ImageReadyCondition(status corev1.ConditionStatus, reason, message string) *upgradeBuilder {
 	setImageReadyCondition(p.upgrade, status, reason, message)
 	return p
 }
 
-func (p *upgradeBuilder) RepoProvisionedCondition(status corev1.ConditionStatus, reason, message string) *upgradeBuilder {
+func (p *upgradeBuilder) RepoProvisionedCondition(status corev1.ConditionStatus, _, _ string) *upgradeBuilder {
 	setRepoProvisionedCondition(p.upgrade, status, "", "")
 	return p
 }
@@ -534,6 +652,11 @@ func (p *upgradeBuilder) NodeUpgradeStatus(nodeName string, state, reason, messa
 
 func (p *upgradeBuilder) ImageIDStatus(imageName string) *upgradeBuilder {
 	p.upgrade.Status.ImageID = imageName
+	return p
+}
+
+func (p *upgradeBuilder) UpgradeLogStatus(upgradeLogName string) *upgradeBuilder {
+	p.upgrade.Status.UpgradeLog = upgradeLogName
 	return p
 }
 
@@ -603,6 +726,11 @@ func (p *planBuilder) WithLabel(key, value string) *planBuilder {
 	return p
 }
 
+func (p *planBuilder) Concurrency(concurrency int) *planBuilder {
+	p.plan.Spec.Concurrency = int64(concurrency)
+	return p
+}
+
 func (p *planBuilder) Version(version string) *planBuilder {
 	p.plan.Spec.Version = version
 	return p
@@ -660,4 +788,24 @@ func upgradeReference(upgrade *harvesterv1.Upgrade) metav1.OwnerReference {
 		UID:        upgrade.UID,
 		APIVersion: upgrade.APIVersion,
 	}
+}
+
+// removeItemFromSlice removes one element at index i from the slice. By
+// removing the element, it simply copies the last element in the slice to the
+// slot at index i and returns the same slice but excluding the last element.
+// That is to say, the order of elements in the slice might change, depending
+// on what element is going to be removed.
+func removeItemFromSlice(slice []string, i int) []string {
+	slice[i] = slice[len(slice)-1]
+	return slice[:len(slice)-1]
+}
+
+func difference(setA, setB map[string]bool) []string {
+	var diff []string
+	for key := range setA {
+		if !setB[key] {
+			diff = append(diff, key)
+		}
+	}
+	return diff
 }

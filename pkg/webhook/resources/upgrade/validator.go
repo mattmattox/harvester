@@ -1,53 +1,97 @@
 package upgrade
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strconv"
 	"strings"
 
-	longhornv1beta1 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta1"
-	v1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	lhv1beta2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	fleetv1alpha1 "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
+	mgmtv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
+	v1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
+	"github.com/sirupsen/logrus"
 	admissionregv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
-	clusterv1alpha4 "sigs.k8s.io/cluster-api/api/v1alpha4"
+	kubeletconfigv1 "k8s.io/kubelet/config/v1beta1"
+	kubeletstatsv1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 
 	"github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	"github.com/harvester/harvester/pkg/controller/master/upgrade"
-	ctlclusterv1 "github.com/harvester/harvester/pkg/generated/controllers/cluster.x-k8s.io/v1alpha4"
+	ctlclusterv1 "github.com/harvester/harvester/pkg/generated/controllers/cluster.x-k8s.io/v1beta1"
 	ctlharvesterv1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
-	ctllonghornv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta1"
+	ctlkubevirtv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
+	ctllhv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta2"
 	"github.com/harvester/harvester/pkg/util"
+	"github.com/harvester/harvester/pkg/util/virtualmachineinstance"
 	werror "github.com/harvester/harvester/pkg/webhook/error"
+	"github.com/harvester/harvester/pkg/webhook/indexeres"
+	versionWebhook "github.com/harvester/harvester/pkg/webhook/resources/version"
 	"github.com/harvester/harvester/pkg/webhook/types"
 )
 
 const (
-	upgradeStateLabel     = "harvesterhci.io/upgradeState"
-	skipWebhookAnnotation = "harvesterhci.io/skipWebhook"
+	upgradeStateLabel                         = "harvesterhci.io/upgradeState"
+	skipWebhookAnnotation                     = "harvesterhci.io/skipWebhook"
+	skipSingleReplicaDetachedVol              = "harvesterhci.io/skipSingleReplicaDetachedVol"
+	rkeInternalIPAnnotation                   = "rke2.io/internal-ip"
+	managedChartNamespace                     = "fleet-local"
+	defaultNewImageSize                uint64 = 13 * 1024 * 1024 * 1024 // 13GB, this value aggregates all tarball image sizes. It may change in the future.
+	defaultImageGCHighThresholdPercent        = 85.0                    // default value in kubelet config
+	freeSystemPartitionMsg                    = "df -h '/usr/local/'"
 )
 
 func NewValidator(
 	upgrades ctlharvesterv1.UpgradeCache,
 	nodes v1.NodeCache,
-	lhVolumes ctllonghornv1.VolumeCache,
+	lhVolumes ctllhv1.VolumeCache,
 	clusters ctlclusterv1.ClusterCache,
+	machines ctlclusterv1.MachineCache,
+	managedChartCache mgmtv3.ManagedChartCache,
+	versionCache ctlharvesterv1.VersionCache,
+	vmBackupCache ctlharvesterv1.VirtualMachineBackupCache,
+	svmbackupCache ctlharvesterv1.ScheduleVMBackupCache,
+	vmiCache ctlkubevirtv1.VirtualMachineInstanceCache,
+	httpClient *http.Client,
+	bearToken string,
 ) types.Validator {
 	return &upgradeValidator{
-		upgrades:  upgrades,
-		nodes:     nodes,
-		lhVolumes: lhVolumes,
-		clusters:  clusters,
+		upgrades:          upgrades,
+		nodes:             nodes,
+		lhVolumes:         lhVolumes,
+		clusters:          clusters,
+		machines:          machines,
+		managedChartCache: managedChartCache,
+		versionCache:      versionCache,
+		vmBackupCache:     vmBackupCache,
+		svmbackupCache:    svmbackupCache,
+		vmiCache:          vmiCache,
+		httpClient:        httpClient,
+		bearToken:         bearToken,
 	}
 }
 
 type upgradeValidator struct {
 	types.DefaultValidator
 
-	upgrades  ctlharvesterv1.UpgradeCache
-	nodes     v1.NodeCache
-	lhVolumes ctllonghornv1.VolumeCache
-	clusters  ctlclusterv1.ClusterCache
+	upgrades          ctlharvesterv1.UpgradeCache
+	nodes             v1.NodeCache
+	lhVolumes         ctllhv1.VolumeCache
+	clusters          ctlclusterv1.ClusterCache
+	machines          ctlclusterv1.MachineCache
+	managedChartCache mgmtv3.ManagedChartCache
+	versionCache      ctlharvesterv1.VersionCache
+	vmBackupCache     ctlharvesterv1.VirtualMachineBackupCache
+	svmbackupCache    ctlharvesterv1.ScheduleVMBackupCache
+	vmiCache          ctlkubevirtv1.VirtualMachineInstanceCache
+	httpClient        *http.Client
+	bearToken         string
 }
 
 func (v *upgradeValidator) Resource() types.Resource {
@@ -64,21 +108,30 @@ func (v *upgradeValidator) Resource() types.Resource {
 	}
 }
 
-func (v *upgradeValidator) Create(request *types.Request, newObj runtime.Object) error {
+func (v *upgradeValidator) Create(_ *types.Request, newObj runtime.Object) error {
 	newUpgrade := newObj.(*v1beta1.Upgrade)
 
 	if newUpgrade.Spec.Version == "" && newUpgrade.Spec.Image == "" {
 		return werror.NewBadRequest("version or image field are not specified.")
 	}
 
+	var version *v1beta1.Version
+	var err error
+	if newUpgrade.Spec.Version != "" && newUpgrade.Spec.Image == "" {
+		version, err = v.versionCache.Get(newUpgrade.Namespace, newUpgrade.Spec.Version)
+		if err != nil {
+			return werror.NewBadRequest(fmt.Sprintf("version %s is not found", newUpgrade.Spec.Version))
+		}
+	}
+
 	req, err := labels.NewRequirement(upgradeStateLabel, selection.NotIn, []string{upgrade.StateSucceeded, upgrade.StateFailed})
 	if err != nil {
-		return err
+		return werror.NewBadRequest(fmt.Sprintf("%s label is already set as %s or %s", upgradeStateLabel, upgrade.StateSucceeded, upgrade.StateFailed))
 	}
 
 	upgrades, err := v.upgrades.List(newUpgrade.Namespace, labels.NewSelector().Add(*req))
 	if err != nil {
-		return err
+		return werror.NewInternalError(fmt.Sprintf("can't list upgrades, err: %+v", err))
 	}
 	if len(upgrades) > 0 {
 		msg := fmt.Sprintf("cannot proceed until previous upgrade %q completes", upgrades[0].Name)
@@ -91,6 +144,10 @@ func (v *upgradeValidator) Create(request *types.Request, newObj runtime.Object)
 		}
 	}
 
+	return v.checkResources(version, newUpgrade)
+}
+
+func (v *upgradeValidator) checkResources(version *v1beta1.Version, upgrade *v1beta1.Upgrade) error {
 	hasDegradedVolume, err := v.hasDegradedVolume()
 	if err != nil {
 		return werror.NewInternalError(err.Error())
@@ -100,7 +157,40 @@ func (v *upgradeValidator) Create(request *types.Request, newObj runtime.Object)
 		return werror.NewBadRequest("there are degraded volumes, please check all volumes are healthy")
 	}
 
-	return nil
+	cluster, err := v.clusters.Get(util.FleetLocalNamespaceName, util.LocalClusterName)
+	if err != nil {
+		return werror.NewInternalError(fmt.Sprintf("can't find %s/%s cluster, err: %+v", util.FleetLocalNamespaceName, util.LocalClusterName, err))
+	}
+
+	if cluster.Status.Phase != string(clusterv1.ClusterPhaseProvisioned) {
+		return werror.NewBadRequest(fmt.Sprintf("cluster %s/%s status is %s, please wait for it to be provisioned", util.FleetLocalNamespaceName, util.LocalClusterName, cluster.Status.Phase))
+	}
+
+	if err := v.checkVMBackups(); err != nil {
+		return err
+	}
+
+	if err := v.checkScheduleVMBackups(); err != nil {
+		return err
+	}
+
+	if err := v.checkManagedCharts(); err != nil {
+		return err
+	}
+
+	if err := v.checkNodes(version); err != nil {
+		return err
+	}
+
+	if err := v.checkMachines(); err != nil {
+		return err
+	}
+
+	if err := v.checkSingleReplicaVolumes(upgrade); err != nil {
+		return err
+	}
+
+	return v.checkNonLiveMigratableVMs()
 }
 
 func (v *upgradeValidator) hasDegradedVolume() (bool, error) {
@@ -119,12 +209,256 @@ func (v *upgradeValidator) hasDegradedVolume() (bool, error) {
 	}
 
 	for _, volume := range volumes {
-		if volume.Status.Robustness == longhornv1beta1.VolumeRobustnessDegraded {
+		if volume.Status.Robustness == lhv1beta2.VolumeRobustnessDegraded {
 			return true, nil
 		}
 	}
 
 	return false, nil
+}
+
+func (v *upgradeValidator) checkManagedCharts() error {
+	managedCharts, err := v.managedChartCache.List(managedChartNamespace, labels.Everything())
+	if err != nil {
+		return werror.NewInternalError(fmt.Sprintf("can't list managed charts, err: %+v", err))
+	}
+
+	for _, managedChart := range managedCharts {
+		for _, condition := range managedChart.Status.Conditions {
+			if condition.Type == fleetv1alpha1.BundleConditionReady {
+				if condition.Status != corev1.ConditionTrue {
+					return werror.NewBadRequest(fmt.Sprintf("managed chart %s is not ready, please wait for it to be ready", managedChart.Name))
+				}
+				break
+			}
+		}
+	}
+
+	return nil
+}
+
+// Since volume snapshot/backup will hold one additional LH VA tickets, it can block VM live migration.
+// We should check if there is any vmbackup under processing before upgrade
+func (v *upgradeValidator) checkVMBackups() error {
+	vmBackups, err := v.vmBackupCache.GetByIndex(indexeres.VMBackupByIsProgressing, strconv.FormatBool(true))
+	if err != nil {
+		return err
+	}
+
+	if len(vmBackups) == 0 {
+		return nil
+	}
+
+	return werror.NewBadRequest(fmt.Sprintf("please wait until all vmbackups are stopped, for example %s/%s is under processing",
+		vmBackups[0].Namespace, vmBackups[0].Name))
+}
+
+// Since volume snapshot/backup will hold one additional LH VA tickets, it can block VM live migration,
+// and an active schedule could start a vmbackup at any time.
+// we should check if there is any running schedule before upgrade
+func (v *upgradeValidator) checkScheduleVMBackups() error {
+	svmbackups, err := v.svmbackupCache.GetByIndex(indexeres.ScheduleVMBackupBySuspended, strconv.FormatBool(false))
+	if err != nil {
+		return err
+	}
+
+	if len(svmbackups) == 0 {
+		return nil
+	}
+
+	return werror.NewBadRequest(fmt.Sprintf("please suspend all backup/snapshot schedule, for example %s/%s is running",
+		svmbackups[0].Namespace, svmbackups[0].Name))
+}
+
+func (v *upgradeValidator) checkNodes(version *v1beta1.Version) error {
+	nodes, err := v.nodes.List(labels.Everything())
+	if err != nil {
+		return werror.NewInternalError(fmt.Sprintf("can't list nodes, err: %+v", err))
+	}
+
+	skipGarbageCollection := false
+	if version != nil && version.Annotations != nil {
+		if value, ok := version.Annotations[versionWebhook.SkipGarbageCollectionThreadholdCheckAnnotation]; ok {
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return werror.NewBadRequest(fmt.Sprintf("invalid value %s for %s annotation in version %s/%s", value, versionWebhook.SkipGarbageCollectionThreadholdCheckAnnotation, version.Namespace, version.Name))
+			}
+			skipGarbageCollection = v
+		}
+	}
+
+	for _, node := range nodes {
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == corev1.NodeReady {
+				if condition.Status != corev1.ConditionTrue {
+					return werror.NewBadRequest(fmt.Sprintf("node %s is not ready, please wait for it to be ready", node.Name))
+				}
+				break
+			}
+		}
+
+		if node.Spec.Unschedulable {
+			return werror.NewBadRequest(fmt.Sprintf("node %s is unschedulable, please wait for it to be schedulable", node.Name))
+		}
+
+		if !skipGarbageCollection {
+			if err := v.checkDiskSpace(node); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (v *upgradeValidator) checkDiskSpace(node *corev1.Node) error {
+	internalIP, ok := node.Annotations[rkeInternalIPAnnotation]
+	if !ok {
+		return werror.NewInternalError(fmt.Sprintf("node %s doesn't have %s annotation", node.Name, rkeInternalIPAnnotation))
+	}
+
+	kubeletPort := node.Status.DaemonEndpoints.KubeletEndpoint.Port
+	kubeletURL := fmt.Sprintf("https://%s:%d", internalIP, kubeletPort)
+	summary, err := v.getKubeletStatsSummary(node.Name, kubeletURL)
+	if err != nil {
+		return err
+	}
+
+	if summary.Node.Fs == nil || summary.Node.Fs.AvailableBytes == nil || summary.Node.Fs.CapacityBytes == nil || summary.Node.Fs.UsedBytes == nil {
+		return werror.NewInternalError(fmt.Sprintf("can't get node %s filesystem stats from %s, err: %+v", node.Name, kubeletURL, err))
+	}
+
+	kubeletConfiguration, err := v.getKubeletConfigz(node.Name, kubeletURL)
+	if err != nil {
+		return err
+	}
+
+	imageGCHighThresholdPercent := defaultImageGCHighThresholdPercent
+	if kubeletConfiguration.ImageGCHighThresholdPercent != nil {
+		imageGCHighThresholdPercent = float64(*kubeletConfiguration.ImageGCHighThresholdPercent)
+	}
+	usedPercent := (float64(*summary.Node.Fs.UsedBytes+defaultNewImageSize) / float64(*summary.Node.Fs.CapacityBytes)) * 100.0
+	logrus.Debugf("node %s uses %.3f%% storage space, kubelet image garbage collection threshold is %.3f%%", node.Name, usedPercent, imageGCHighThresholdPercent)
+
+	if usedPercent > imageGCHighThresholdPercent {
+		// Using strconv.FormatFloat to show imageGCHighThresholdPercent to trim zeros, because the default value is 0.85.
+		return werror.NewBadRequest(fmt.Sprintf("Node %q will reach %.2f%% storage space after loading new images. It's higher than kubelet image garbage collection threshold %s%%.",
+			node.Name, usedPercent, strconv.FormatFloat(imageGCHighThresholdPercent, 'f', -1, 64)))
+	}
+
+	return nil
+}
+
+func (v *upgradeValidator) checkMachines() error {
+	machines, err := v.machines.List(util.FleetLocalNamespaceName, labels.Everything())
+	if err != nil {
+		return werror.NewInternalError(fmt.Sprintf("can't list machines, err: %+v", err))
+	}
+
+	for _, machine := range machines {
+		if machine.Status.GetTypedPhase() != clusterv1.MachinePhaseRunning {
+			return werror.NewInternalError(fmt.Sprintf("machine %s/%s is not running", machine.Namespace, machine.Name))
+		}
+	}
+
+	return nil
+}
+
+func skipSingleReplicaDetachedVolCheck(upgrade *v1beta1.Upgrade) bool {
+	var annotations = upgrade.GetAnnotations()
+	if annotations == nil || annotations[skipSingleReplicaDetachedVol] == "" {
+		return false
+	}
+	return true
+}
+
+func checkActiveSingleReplicaVols(singleReplicaVols []*lhv1beta2.Volume) error {
+	volumeNames := make([]string, 0, len(singleReplicaVols))
+	for _, volume := range singleReplicaVols {
+		switch volume.Status.State {
+		case lhv1beta2.VolumeStateCreating, lhv1beta2.VolumeStateAttached, lhv1beta2.VolumeStateAttaching:
+			pvcNamespace := volume.Status.KubernetesStatus.Namespace
+			pvcName := volume.Status.KubernetesStatus.PVCName
+			volumeNames = append(volumeNames, pvcNamespace+"/"+pvcName)
+		}
+	}
+
+	if len(volumeNames) > 0 {
+		return werror.NewInvalidError(
+			fmt.Sprintf("Following PVCs with active single-replica volume, please consider shutdown the corresponding workload before upgrade: %s", strings.Join(volumeNames, ", ")), "",
+		)
+	}
+	return nil
+}
+
+func checkAllSingleReplicaVols(singleReplicaVols []*lhv1beta2.Volume) error {
+	volumeNames := make([]string, 0, len(singleReplicaVols))
+	for _, volume := range singleReplicaVols {
+		// If the pvc is bound only until it's used, the related volume can be never created,
+		// in this case, we will not iterate such pvc,
+		// so it's still safe to directly access `volume.Status.KubernetesStatus` fields
+		pvcNamespace := volume.Status.KubernetesStatus.Namespace
+		pvcName := volume.Status.KubernetesStatus.PVCName
+		volumeNames = append(volumeNames, pvcNamespace+"/"+pvcName)
+	}
+
+	if len(volumeNames) > 0 {
+		return werror.NewInvalidError(
+			fmt.Sprintf("Following PVCs with single-replica volume, even the volume is detached, upgrade may have potential data integrity concerns: %s", strings.Join(volumeNames, ", ")), "",
+		)
+	}
+	return nil
+}
+
+func (v *upgradeValidator) checkSingleReplicaVolumes(upgrade *v1beta1.Upgrade) error {
+	// Upgrade should be rejected if any single-replica volume exists
+	nodes, err := v.nodes.List(labels.Everything())
+	if err != nil {
+		return err
+	}
+
+	// Skip for single-node cluster
+	if len(nodes) == 1 {
+		return nil
+	}
+
+	// Find all single-replica volumes
+	singleReplicaVolumes, err := v.lhVolumes.GetByIndex(indexeres.VolumeByReplicaCountIndex, "1")
+	if err != nil {
+		return err
+	}
+
+	checkFunc := checkAllSingleReplicaVols
+	if skipSingleReplicaDetachedVolCheck(upgrade) {
+		checkFunc = checkActiveSingleReplicaVols
+	}
+
+	return checkFunc(singleReplicaVolumes)
+}
+
+func (v *upgradeValidator) checkNonLiveMigratableVMs() error {
+	allVMIs, err := v.vmiCache.List(corev1.NamespaceAll, labels.Everything())
+	if err != nil {
+		return err
+	}
+
+	allNodes, err := v.nodes.List(labels.Everything())
+	if err != nil {
+		return err
+	}
+
+	nonLiveMigratableVMNames, err := virtualmachineinstance.GetAllNonLiveMigratableVMINames(allVMIs, allNodes)
+	if err != nil {
+		return err
+	}
+
+	if len(nonLiveMigratableVMNames) > 0 {
+		return werror.NewInvalidError(
+			fmt.Sprintf("There are non-live migratable VMs that need to be shut off before initiating the upgrade: %s", strings.Join(nonLiveMigratableVMNames, ", ")), "",
+		)
+	}
+
+	return nil
 }
 
 func (v *upgradeValidator) Delete(_ *types.Request, oldObj runtime.Object) error {
@@ -140,9 +474,73 @@ func (v *upgradeValidator) Delete(_ *types.Request, oldObj runtime.Object) error
 		return werror.NewInternalError(fmt.Sprintf("can't find %s/%s cluster, err: %+v", util.FleetLocalNamespaceName, util.LocalClusterName, err))
 	}
 
-	if cluster.Status.Phase == string(clusterv1alpha4.ClusterPhaseProvisioning) {
+	if cluster.Status.Phase == string(clusterv1.ClusterPhaseProvisioning) {
 		return werror.NewBadRequest(fmt.Sprintf("cluster %s/%s status is provisioning, please wait for it to be provisioned", util.FleetLocalNamespaceName, util.LocalClusterName))
 	}
 
+	// If fleet-local/local cluster.provisioning.cattle.io is upgrading, deny removing upgrade CR request.
+	// If upgrade is removed, the cluster may have different RKE2 version nodes. It will make next upgrade fail.
+	if v1beta1.NodesUpgraded.IsUnknown(oldUpgrade) {
+		return werror.NewBadRequest("node upgrade is in progressing, please wait for it to be provisioned")
+	}
+
 	return nil
+}
+
+func (v *upgradeValidator) getKubeletConfigz(nodeName, kubeletURL string) (*kubeletconfigv1.KubeletConfiguration, error) {
+	url := fmt.Sprintf("%s/configz", kubeletURL)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, werror.NewInternalError(fmt.Sprintf("node %s, can't make http.NewRequest to get %s, err: %+v", nodeName, url, err))
+	}
+	req.Header.Set("Authorization", "Bearer "+v.bearToken)
+
+	resp, err := v.httpClient.Do(req)
+	if err != nil {
+		return nil, werror.NewInternalError(fmt.Sprintf("node %s, can't make http request to get %s, err: %+v", nodeName, url, err))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, werror.NewInternalError(fmt.Sprintf("node %s, http response from %s is %d", nodeName, url, resp.StatusCode))
+	}
+
+	kubeletConfiguration := &kubeletconfigv1.KubeletConfiguration{}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, werror.NewInternalError(fmt.Sprintf("node %s, can't read response from %s, err: %+v", nodeName, url, err))
+	}
+	if err = json.Unmarshal(body, kubeletConfiguration); err != nil {
+		return nil, werror.NewInternalError(fmt.Sprintf("node %s, can't parse json response %s, err: %+v", nodeName, string(body), err))
+	}
+	return kubeletConfiguration, nil
+}
+
+func (v *upgradeValidator) getKubeletStatsSummary(nodeName, kubeletURL string) (*kubeletstatsv1.Summary, error) {
+	url := fmt.Sprintf("%s/stats/summary", kubeletURL)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, werror.NewInternalError(fmt.Sprintf("node %s, can't make http.NewRequest to get %s, err: %+v", nodeName, url, err))
+	}
+	req.Header.Set("Authorization", "Bearer "+v.bearToken)
+
+	resp, err := v.httpClient.Do(req)
+	if err != nil {
+		return nil, werror.NewInternalError(fmt.Sprintf("node %s, can't make http request to get %s, err: %+v", nodeName, url, err))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, werror.NewInternalError(fmt.Sprintf("node %s, http response from %s is %d", nodeName, url, resp.StatusCode))
+	}
+
+	summary := &kubeletstatsv1.Summary{}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, werror.NewInternalError(fmt.Sprintf("node %s, can't read response from %s, err: %+v", nodeName, url, err))
+	}
+	if err = json.Unmarshal(body, summary); err != nil {
+		return nil, werror.NewInternalError(fmt.Sprintf("node %s, can't parse json response %s, err: %+v", nodeName, string(body), err))
+	}
+	return summary, nil
 }

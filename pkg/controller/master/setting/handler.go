@@ -3,23 +3,28 @@ package setting
 import (
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
+	ctlnodev1 "github.com/harvester/node-manager/pkg/generated/controllers/node.harvesterhci.io/v1beta1"
 	ctlhelmv1 "github.com/k3s-io/helm-controller/pkg/generated/controllers/helm.cattle.io/v1"
 	catalogv1api "github.com/rancher/rancher/pkg/apis/catalog.cattle.io/v1"
 	catalogv1 "github.com/rancher/rancher/pkg/generated/controllers/catalog.cattle.io/v1"
-	mgmtv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
+	ctlmgmtv3 "github.com/rancher/rancher/pkg/generated/controllers/management.cattle.io/v3"
 	provisioningv1 "github.com/rancher/rancher/pkg/generated/controllers/provisioning.cattle.io/v1"
-	"github.com/rancher/wrangler/pkg/apply"
-	v1 "github.com/rancher/wrangler/pkg/generated/controllers/apps/v1"
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
-	"github.com/rancher/wrangler/pkg/slice"
+	ctlrkev1 "github.com/rancher/rancher/pkg/generated/controllers/rke.cattle.io/v1"
+	"github.com/rancher/wrangler/v3/pkg/apply"
+	v1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/apps/v1"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
+	"github.com/rancher/wrangler/v3/pkg/slice"
 	"k8s.io/apimachinery/pkg/api/errors"
 
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	"github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
-	ctllonghornv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta1"
+	kubevirtv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
+	ctllhv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta2"
 	networkingv1 "github.com/harvester/harvester/pkg/generated/controllers/networking.k8s.io/v1"
 	"github.com/harvester/harvester/pkg/settings"
 	"github.com/harvester/harvester/pkg/util"
@@ -32,6 +37,18 @@ var (
 	// bootstrapSettings are the setting that syncs on bootstrap
 	bootstrapSettings = []string{
 		settings.SSLCertificatesSettingName,
+		settings.KubeconfigDefaultTokenTTLMinutesSettingName,
+		// The Longhorn storage over-provisioning percentage is set to 100, whereas Harvester uses 200.
+		// This needs to be synchronized when Harvester starts.
+		settings.OvercommitConfigSettingName,
+		// always run this when Harvester POD starts
+		settings.AdditionalGuestMemoryOverheadRatioName,
+	}
+	skipHashCheckSettings = []string{
+		settings.AutoRotateRKE2CertsSettingName,
+		settings.LogLevelSettingName,
+		settings.KubeconfigDefaultTokenTTLMinutesSettingName,
+		settings.AdditionalGuestMemoryOverheadRatioName,
 	}
 )
 
@@ -43,21 +60,32 @@ type Handler struct {
 	clusters             provisioningv1.ClusterClient
 	settings             v1beta1.SettingClient
 	settingCache         v1beta1.SettingCache
+	settingController    v1beta1.SettingController
 	secrets              ctlcorev1.SecretClient
 	secretCache          ctlcorev1.SecretCache
 	deployments          v1.DeploymentClient
 	deploymentCache      v1.DeploymentCache
 	ingresses            networkingv1.IngressClient
 	ingressCache         networkingv1.IngressCache
-	longhornSettings     ctllonghornv1.SettingClient
-	longhornSettingCache ctllonghornv1.SettingCache
+	longhornSettings     ctllhv1.SettingClient
+	longhornSettingCache ctllhv1.SettingCache
 	configmaps           ctlcorev1.ConfigMapClient
 	configmapCache       ctlcorev1.ConfigMapCache
+	serviceCache         ctlcorev1.ServiceCache
 	apps                 catalogv1.AppClient
-	managedCharts        mgmtv3.ManagedChartClient
-	managedChartCache    mgmtv3.ManagedChartCache
+	managedCharts        ctlmgmtv3.ManagedChartClient
+	managedChartCache    ctlmgmtv3.ManagedChartCache
 	helmChartConfigs     ctlhelmv1.HelmChartConfigClient
 	helmChartConfigCache ctlhelmv1.HelmChartConfigCache
+	nodeClient           ctlcorev1.NodeController
+	nodeCache            ctlcorev1.NodeCache
+	nodeConfigs          ctlnodev1.NodeConfigClient
+	nodeConfigsCache     ctlnodev1.NodeConfigCache
+	rkeControlPlaneCache ctlrkev1.RKEControlPlaneCache
+	rancherSettings      ctlmgmtv3.SettingClient
+	rancherSettingsCache ctlmgmtv3.SettingCache
+	kubeVirtConfig       kubevirtv1.KubeVirtClient
+	kubeVirtConfigCache  kubevirtv1.KubeVirtCache
 }
 
 func (h *Handler) settingOnChanged(_ string, setting *harvesterv1.Setting) (*harvesterv1.Setting, error) {
@@ -71,10 +99,16 @@ func (h *Handler) settingOnChanged(_ string, setting *harvesterv1.Setting) (*har
 		!slice.ContainsString(bootstrapSettings, setting.Name) {
 		return nil, nil
 	}
+
+	toMeasure := io.MultiReader(
+		strings.NewReader(setting.Value),
+		strings.NewReader(setting.Annotations[util.AnnotationUpgradePatched]),
+	)
+
 	hash := sha256.New224()
-	hash.Write([]byte(setting.Value))
+	io.Copy(hash, toMeasure)
 	currentHash := fmt.Sprintf("%x", hash.Sum(nil))
-	if currentHash == setting.Annotations[util.AnnotationHash] {
+	if !slice.ContainsString(skipHashCheckSettings, setting.Name) && currentHash == setting.Annotations[util.AnnotationHash] {
 		return nil, nil
 	}
 
@@ -82,11 +116,13 @@ func (h *Handler) settingOnChanged(_ string, setting *harvesterv1.Setting) (*har
 	if toUpdate.Annotations == nil {
 		toUpdate.Annotations = make(map[string]string)
 	}
-	toUpdate.Annotations[util.AnnotationHash] = currentHash
 
 	var err error
 	if syncer, ok := syncers[setting.Name]; ok {
 		err = syncer(setting)
+		if err == nil {
+			toUpdate.Annotations[util.AnnotationHash] = currentHash
+		}
 		if updateErr := h.setConfiguredCondition(toUpdate, err); updateErr != nil {
 			return setting, updateErr
 		}

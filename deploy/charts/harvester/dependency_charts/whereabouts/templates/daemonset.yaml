@@ -43,6 +43,11 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
+          - name: NODENAME
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: spec.nodeName
           - name: WHEREABOUTS_NAMESPACE
             valueFrom:
               fieldRef:
@@ -54,6 +59,8 @@ spec:
             mountPath: /host/opt/cni/bin
           - name: cni-net-dir
             mountPath: /host/etc/cni/net.d
+          - name: cron-scheduler-configmap
+            mountPath: /cron-schedule
       volumes:
         - name: cnibin
           hostPath:
@@ -61,6 +68,13 @@ spec:
         - name: cni-net-dir
           hostPath:
             path: /etc/cni/net.d
+        - name: cron-scheduler-configmap
+          configMap:
+            name: "whereabouts-config"
+            defaultMode: 0744
+            items:
+            - key: "cron-expression"
+              path: "config"
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

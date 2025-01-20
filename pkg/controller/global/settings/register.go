@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/rancher/steve/pkg/server"
 	"k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,7 +17,7 @@ import (
 	"github.com/harvester/harvester/pkg/settings"
 )
 
-func Register(ctx context.Context, scaled *config.Scaled, server *server.Server, options config.Options) error {
+func Register(ctx context.Context, scaled *config.Scaled, _ *server.Server, _ config.Options) error {
 	sp := &settingsProvider{
 		context:        ctx,
 		settings:       scaled.HarvesterFactory.Harvesterhci().V1beta1().Setting(),
@@ -23,11 +25,7 @@ func Register(ctx context.Context, scaled *config.Scaled, server *server.Server,
 		fallback:       map[string]string{},
 	}
 
-	if err := settings.SetProvider(sp); err != nil {
-		return err
-	}
-
-	return nil
+	return settings.SetProvider(sp)
 }
 
 type settingsProvider struct {
@@ -92,6 +90,16 @@ func (s *settingsProvider) SetAll(settingsMap map[string]settings.Setting) error
 	for name, setting := range settingsMap {
 		key := settings.GetEnvKey(name)
 		value := os.Getenv(key)
+		defaultvaluekey := settings.GetEnvDefaultValueKey(name)
+		defaultvalue := os.Getenv(defaultvaluekey)
+
+		// override settings from ENV first
+		if defaultvalue != "" && defaultvalue != setting.Default {
+			logrus.WithFields(logrus.Fields{
+				"name": name,
+			}).Debugf("setting default %s is replaced with %s", setting.Default, defaultvalue)
+			setting.Default = defaultvalue
+		}
 
 		obj, err := s.settings.Get(setting.Name, v1.GetOptions{})
 		if errors.IsNotFound(err) {
@@ -109,6 +117,7 @@ func (s *settingsProvider) SetAll(settingsMap map[string]settings.Setting) error
 			} else {
 				fallback[newSetting.Name] = newSetting.Value
 			}
+
 			_, err := s.settings.Create(newSetting)
 			if err != nil {
 				return err

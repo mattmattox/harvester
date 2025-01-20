@@ -8,15 +8,16 @@ import (
 	"github.com/sirupsen/logrus"
 
 	appsv1 "k8s.io/api/apps/v1"
-	apiv1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 
 	"github.com/longhorn/longhorn-manager/datastore"
 	"github.com/longhorn/longhorn-manager/types"
+	"github.com/longhorn/longhorn-manager/util"
 
 	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 )
 
-func (m *VolumeManager) PVCreate(name, pvName, fsType, secretNamespace, secretName string) (v *longhorn.Volume, err error) {
+func (m *VolumeManager) PVCreate(name, pvName, fsType, secretNamespace, secretName, storageClassName string) (v *longhorn.Volume, err error) {
 	defer func() {
 		err = errors.Wrapf(err, "unable to create PV for volume %v", name)
 	}()
@@ -34,13 +35,28 @@ func (m *VolumeManager) PVCreate(name, pvName, fsType, secretNamespace, secretNa
 		pvName = v.Name
 	}
 
-	storageClassName, err := m.ds.GetSettingValueExisted(types.SettingNameDefaultLonghornStaticStorageClass)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get longhorn static storage class name for PV %v creation: %v", pvName, err)
+	if storageClassName == "" {
+		if backupVolumeName := v.Labels[types.LonghornLabelBackupVolume]; backupVolumeName != "" {
+			backupVolume, _ := m.ds.GetBackupVolumeRO(backupVolumeName)
+			if backupVolume != nil {
+				storageClassName = backupVolume.Status.StorageClassName
+			}
+		}
+	}
+
+	if storageClassName == "" {
+		storageClassName, err = m.ds.GetSettingValueExisted(types.SettingNameDefaultLonghornStaticStorageClass)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get longhorn default static storage class name for PV %v creation: %v", pvName, err)
+		}
 	}
 
 	if fsType == "" {
 		fsType = "ext4"
+	}
+	if fsType == "xfs" && v.Spec.Size < util.MinimalVolumeSizeXFS {
+		return nil, fmt.Errorf("XFS filesystems with size %d, smaller than %d, are not supported", v.Spec.Size,
+			util.MinimalVolumeSizeXFS)
 	}
 
 	pv := datastore.NewPVManifestForVolume(v, pvName, storageClassName, fsType)
@@ -53,7 +69,7 @@ func (m *VolumeManager) PVCreate(name, pvName, fsType, secretNamespace, secretNa
 			secretNamespace = "longhorn-system"
 		}
 
-		secretRef := &apiv1.SecretReference{
+		secretRef := &corev1.SecretReference{
 			Name:      secretName,
 			Namespace: secretNamespace,
 		}
@@ -61,12 +77,12 @@ func (m *VolumeManager) PVCreate(name, pvName, fsType, secretNamespace, secretNa
 		pv.Spec.CSI.NodePublishSecretRef = secretRef
 	}
 
-	pv, err = m.ds.CreatePersistentVolume(pv)
+	_, err = m.ds.CreatePersistentVolume(pv)
 	if err != nil {
 		return nil, err
 	}
 
-	logrus.Debugf("Created PV for volume %v: %+v", v.Name, v.Spec)
+	logrus.Infof("Created PV for volume %v: %+v", v.Name, v.Spec)
 	return v, nil
 }
 
@@ -96,7 +112,7 @@ func (m *VolumeManager) PVCCreate(name, namespace, pvcName string) (v *longhorn.
 		}
 		ks = v.Status.KubernetesStatus
 		if v.Status.KubernetesStatus.PVName != "" &&
-			(ks.PVStatus == string(apiv1.VolumeAvailable) || ks.PVStatus == string(apiv1.VolumeReleased)) {
+			(ks.PVStatus == string(corev1.VolumeAvailable) || ks.PVStatus == string(corev1.VolumeReleased)) {
 			pvFound = true
 			break
 		}
@@ -120,12 +136,12 @@ func (m *VolumeManager) PVCCreate(name, namespace, pvcName string) (v *longhorn.
 	}
 
 	pvc := datastore.NewPVCManifestForVolume(v, ks.PVName, namespace, pvcName, pv.Spec.StorageClassName)
-	pvc, err = m.ds.CreatePersistentVolumeClaim(namespace, pvc)
+	_, err = m.ds.CreatePersistentVolumeClaim(namespace, pvc)
 	if err != nil {
 		return nil, err
 	}
 
-	logrus.Debugf("Created PVC for volume %v: %+v", v.Name, v.Spec)
+	logrus.Infof("Created PVC for volume %v: %+v", v.Name, v.Spec)
 	return v, nil
 }
 

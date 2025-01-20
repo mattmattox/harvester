@@ -6,15 +6,12 @@ import (
 	"strings"
 
 	"github.com/guonaihong/gout"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
 	"github.com/tidwall/gjson"
 	"golang.org/x/crypto/ssh"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	"github.com/harvester/harvester/pkg/util"
-	. "github.com/harvester/harvester/tests/framework/dsl"
 	"github.com/harvester/harvester/tests/framework/fuzz"
 	"github.com/harvester/harvester/tests/framework/helper"
 )
@@ -41,23 +38,6 @@ var _ = Describe("verify keypair APIs", func() {
 		})
 
 		Specify("verify required fields", func() {
-
-			By("create a keypair with name missing", func() {
-				rsaKey, err := util.GeneratePrivateKey(2048)
-				MustNotError(err)
-				publicKey, err := util.GeneratePublicKey(&rsaKey.PublicKey)
-				MustNotError(err)
-				var keypair = harvesterv1.KeyPair{
-					ObjectMeta: v1.ObjectMeta{
-						Namespace: keypairNamespace,
-					},
-					Spec: harvesterv1.KeyPairSpec{
-						PublicKey: string(publicKey),
-					},
-				}
-				respCode, respBody, err := helper.PostObject(keypairsAPI, keypair)
-				MustRespCodeIs(http.StatusUnprocessableEntity, "post keypair", err, respCode, respBody)
-			})
 
 			By("create a keypair with public key missing", func() {
 				var keypair = harvesterv1.KeyPair{

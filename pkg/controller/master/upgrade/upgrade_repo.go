@@ -1,12 +1,14 @@
 package upgrade
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -17,10 +19,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/pointer"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	"github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
+	"github.com/harvester/harvester/pkg/controller/master/upgrade/repoinfo"
 	"github.com/harvester/harvester/pkg/util"
 )
 
@@ -33,35 +39,22 @@ stages:
     - echo > /sysroot/harvester-serve-iso
 `
 	repoServiceNamePrefix = "upgrade-repo-"
+	currentVersion        = "current"
 )
 
-type HarvesterRelease struct {
-	Harvester            string `yaml:"harvester,omitempty"`
-	HarvesterChart       string `yaml:"harvesterChart,omitempty"`
-	OS                   string `yaml:"os,omitempty"`
-	Kubernetes           string `yaml:"kubernetes,omitempty"`
-	Rancher              string `yaml:"rancher,omitempty"`
-	MonitoringChart      string `yaml:"monitoringChart,omitempty"`
-	MinUpgradableVersion string `yaml:"minUpgradableVersion,omitempty"`
-}
-
-type UpgradeRepoInfo struct {
-	Release HarvesterRelease
-}
-
-func (info *UpgradeRepoInfo) Marshall() (string, error) {
-	out, err := yaml.Marshal(info)
-	if err != nil {
-		return "", err
+var (
+	// Images in the list will be retained during the image pruning process at
+	// the end of an upgrade.
+	imageRetainList = []string{
+		"rancher/harvester-upgrade",
+		"longhornio/longhorn-engine",
+		"longhornio/longhorn-instance-manager",
+		"rancher/mirrored-banzaicloud-fluentd",
+		"rancher/mirrored-fluent-fluent-bit",
 	}
-	return string(out), nil
-}
+)
 
-func (info *UpgradeRepoInfo) Load(data string) error {
-	return yaml.Unmarshal([]byte(data), info)
-}
-
-type UpgradeRepo struct {
+type Repo struct {
 	ctx     context.Context
 	upgrade *harvesterv1.Upgrade
 	h       *upgradeHandler
@@ -69,8 +62,8 @@ type UpgradeRepo struct {
 	httpClient *http.Client
 }
 
-func NewUpgradeRepo(ctx context.Context, upgrade *harvesterv1.Upgrade, upgradeHandler *upgradeHandler) *UpgradeRepo {
-	return &UpgradeRepo{
+func NewUpgradeRepo(ctx context.Context, upgrade *harvesterv1.Upgrade, upgradeHandler *upgradeHandler) *Repo {
+	return &Repo{
 		ctx:     ctx,
 		upgrade: upgrade,
 		h:       upgradeHandler,
@@ -80,7 +73,7 @@ func NewUpgradeRepo(ctx context.Context, upgrade *harvesterv1.Upgrade, upgradeHa
 	}
 }
 
-func (r *UpgradeRepo) Bootstrap() error {
+func (r *Repo) Bootstrap() error {
 	image := r.upgrade.Status.ImageID
 	if image == "" {
 		return errors.New("Upgrade repo image is not provided")
@@ -103,11 +96,11 @@ func getISODisplayNameImageName(upgradeName string, version string) string {
 	return fmt.Sprintf("%s-%s", upgradeName, version)
 }
 
-func (r *UpgradeRepo) CreateImageFromISO(isoURL string, checksum string) (*harvesterv1.VirtualMachineImage, error) {
+func (r *Repo) CreateImageFromISO(isoURL string, checksum string) (*harvesterv1.VirtualMachineImage, error) {
 	imageSpec := &harvesterv1.VirtualMachineImage{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace:    harvesterSystemNamespace,
-			GenerateName: "harvester-iso-",
+			Namespace: harvesterSystemNamespace,
+			Name:      r.upgrade.Name,
 			Labels: map[string]string{
 				harvesterUpgradeLabel: r.upgrade.Name,
 			},
@@ -120,13 +113,14 @@ func (r *UpgradeRepo) CreateImageFromISO(isoURL string, checksum string) (*harve
 			SourceType:  v1beta1.VirtualMachineImageSourceTypeDownload,
 			URL:         isoURL,
 			Checksum:    checksum,
+			Retry:       3,
 		},
 	}
 
 	return r.h.vmImageClient.Create(imageSpec)
 }
 
-func (r *UpgradeRepo) GetImage(imageName string) (*harvesterv1.VirtualMachineImage, error) {
+func (r *Repo) GetImage(imageName string) (*harvesterv1.VirtualMachineImage, error) {
 	tokens := strings.Split(imageName, "/")
 	if len(tokens) != 2 {
 		return nil, fmt.Errorf("Invalid image format %s", imageName)
@@ -139,15 +133,15 @@ func (r *UpgradeRepo) GetImage(imageName string) (*harvesterv1.VirtualMachineIma
 	return image, nil
 }
 
-func (r *UpgradeRepo) getVMName() string {
+func (r *Repo) getVMName() string {
 	return fmt.Sprintf("%s%s", repoVMNamePrefix, r.upgrade.Name)
 }
 
-func (r *UpgradeRepo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevirtv1.VirtualMachine, error) {
+func (r *Repo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevirtv1.VirtualMachine, error) {
 	vmName := r.getVMName()
 	vmRun := true
 	var bootOrder uint = 1
-	evictionStrategy := kubevirtv1.EvictionStrategyLiveMigrate
+	evictionStrategy := kubevirtv1.EvictionStrategyLiveMigrateIfPossible
 
 	disk0Claim := fmt.Sprintf("%s-disk-0", vmName)
 	volumeMode := corev1.PersistentVolumeBlock
@@ -156,12 +150,12 @@ func (r *UpgradeRepo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevir
 		ObjectMeta: metav1.ObjectMeta{
 			Name: disk0Claim,
 			Annotations: map[string]string{
-				"harvesterhci.io/imageId": fmt.Sprintf("%s/%s", image.Namespace, image.Name),
+				util.AnnotationImageID: fmt.Sprintf("%s/%s", image.Namespace, image.Name),
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
-			Resources: corev1.ResourceRequirements{
+			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					"storage": resource.MustParse("10Gi"),
 				},
@@ -180,14 +174,14 @@ func (r *UpgradeRepo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevir
 			Name:      vmName,
 			Namespace: upgradeNamespace,
 			Labels: map[string]string{
-				"harvesterhci.io/creator":      "harvester",
+				util.LabelVMCreator:            "harvester",
 				harvesterUpgradeLabel:          r.upgrade.Name,
 				harvesterUpgradeComponentLabel: upgradeComponentRepo,
 			},
 			Annotations: map[string]string{
-				"harvesterhci.io/volumeClaimTemplates": string(pvc),
-				"network.harvesterhci.io/ips":          "[]",
-				util.RemovedPVCsAnnotationKey:          disk0Claim,
+				util.AnnotationVolumeClaimTemplates: string(pvc),
+				"network.harvesterhci.io/ips":       "[]",
+				util.RemovedPVCsAnnotationKey:       disk0Claim,
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				upgradeReference(r.upgrade),
@@ -198,8 +192,8 @@ func (r *UpgradeRepo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevir
 			Template: &kubevirtv1.VirtualMachineInstanceTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"harvesterhci.io/creator":      "harvester",
-						"harvesterhci.io/vmName":       vmName,
+						util.LabelVMCreator:            "harvester",
+						util.LabelVMName:               vmName,
 						harvesterUpgradeLabel:          r.upgrade.Name,
 						harvesterUpgradeComponentLabel: upgradeComponentRepo,
 					},
@@ -211,13 +205,20 @@ func (r *UpgradeRepo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevir
 							Sockets: 1,
 							Threads: 1,
 						},
+						Firmware: &kubevirtv1.Firmware{
+							Bootloader: &kubevirtv1.Bootloader{
+								EFI: &kubevirtv1.EFI{
+									SecureBoot: pointer.Bool(false),
+								},
+							},
+						},
 						Devices: kubevirtv1.Devices{
 							Disks: []kubevirtv1.Disk{
 								{
 									BootOrder: &bootOrder,
 									DiskDevice: kubevirtv1.DiskDevice{
 										CDRom: &kubevirtv1.CDRomTarget{
-											Bus: "sata",
+											Bus: "scsi",
 										},
 									},
 									Name: "disk-0",
@@ -225,7 +226,7 @@ func (r *UpgradeRepo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevir
 								{
 									DiskDevice: kubevirtv1.DiskDevice{
 										CDRom: &kubevirtv1.CDRomTarget{
-											Bus: "sata",
+											Bus: "scsi",
 										},
 									},
 									Name: "cloudinitdisk",
@@ -247,9 +248,6 @@ func (r *UpgradeRepo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevir
 									Name:  "default",
 								},
 							},
-						},
-						Machine: &kubevirtv1.Machine{
-							Type: "q35",
 						},
 						Resources: kubevirtv1.ResourceRequirements{
 							Limits: corev1.ResourceList{
@@ -310,7 +308,30 @@ func (r *UpgradeRepo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevir
 	return r.h.vmClient.Create(&vm)
 }
 
-func (r *UpgradeRepo) deleteVM() error {
+func (r *Repo) startVM() error {
+	vmName := r.getVMName()
+	vm, err := r.h.vmCache.Get(upgradeNamespace, vmName)
+	if err != nil {
+		return err
+	}
+
+	if vm.Status.PrintableStatus == kubevirtv1.VirtualMachineStatusRunning {
+		return nil
+	}
+
+	toUpdate := vm.DeepCopy()
+
+	toUpdate.Spec.Running = func(b bool) *bool { return &b }(true)
+	if !reflect.DeepEqual(toUpdate, vm) {
+		if _, err = r.h.vmClient.Update(toUpdate); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *Repo) deleteVM() error {
 	vmName := r.getVMName()
 
 	vm, err := r.h.vmCache.Get(upgradeNamespace, vmName)
@@ -335,7 +356,7 @@ func (r *UpgradeRepo) deleteVM() error {
 // (1) If a PVC based on the image exists, it adds the PVC as the OwnerReference to the repo image.
 // Once the repo VM is deleted and VM's PVC is deleted, the repo image will be garbage collected.
 // (2) If there is no PVCs based on the repo image. We delete the image directly.
-func (r *UpgradeRepo) deleteImage(pvcName string) error {
+func (r *Repo) deleteImage(pvcName string) error {
 	imageID := r.upgrade.Status.ImageID
 	if imageID == "" {
 		logrus.Error("Upgrade repo image is not provided")
@@ -379,11 +400,11 @@ func (r *UpgradeRepo) deleteImage(pvcName string) error {
 	return err
 }
 
-func (r *UpgradeRepo) getRepoServiceName() string {
+func (r *Repo) getRepoServiceName() string {
 	return fmt.Sprintf("%s%s", repoServiceNamePrefix, r.upgrade.Name)
 }
 
-func (r *UpgradeRepo) createService() (*corev1.Service, error) {
+func (r *Repo) createService() (*corev1.Service, error) {
 	service := corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: upgradeNamespace,
@@ -392,7 +413,7 @@ func (r *UpgradeRepo) createService() (*corev1.Service, error) {
 				upgradeReference(r.upgrade),
 			},
 			Labels: map[string]string{
-				"harvesterhci.io/creator":      "harvester",
+				util.LabelVMCreator:            "harvester",
 				harvesterUpgradeLabel:          r.upgrade.Name,
 				harvesterUpgradeComponentLabel: upgradeComponentRepo,
 			},
@@ -415,7 +436,7 @@ func (r *UpgradeRepo) createService() (*corev1.Service, error) {
 	return r.h.serviceClient.Create(&service)
 }
 
-func (r *UpgradeRepo) getInfo() (*UpgradeRepoInfo, error) {
+func (r *Repo) getInfo() (*repoinfo.RepoInfo, error) {
 	releaseURL := fmt.Sprintf("http://%s.%s/harvester-iso/harvester-release.yaml", r.getRepoServiceName(), upgradeNamespace)
 
 	req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, releaseURL, nil)
@@ -430,7 +451,7 @@ func (r *UpgradeRepo) getInfo() (*UpgradeRepoInfo, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Unexpect status: %s", resp.Status)
+		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
 	}
 
 	body, err := ioutil.ReadAll(resp.Body)
@@ -438,10 +459,82 @@ func (r *UpgradeRepo) getInfo() (*UpgradeRepoInfo, error) {
 		return nil, err
 	}
 
-	info := UpgradeRepoInfo{}
+	info := repoinfo.RepoInfo{}
 	err = yaml.Unmarshal(body, &info.Release)
 	if err != nil {
 		return nil, err
 	}
 	return &info, nil
+}
+
+func (r *Repo) getImageList(version string, imageList map[string]bool) error {
+	imageListURL := fmt.Sprintf("http://%s.%s/harvester-iso/bundle/harvester/images-lists-archive/%s/image_list_all.txt",
+		r.getRepoServiceName(),
+		upgradeNamespace,
+		version,
+	)
+
+	req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, imageListURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		imageName := scanner.Text()
+		imageList[imageName] = true
+	}
+
+	return scanner.Err()
+}
+
+func applyImageRetainList(imageList []string) []string {
+	for _, retainedImage := range imageRetainList {
+		for i, image := range imageList {
+			if strings.Contains(image, retainedImage) {
+				imageList = removeItemFromSlice(imageList, i)
+				break
+			}
+		}
+	}
+	return imageList
+}
+
+func (r *Repo) getImagesDiffList() ([]string, error) {
+	previousImageList := make(map[string]bool)
+	currentImageList := make(map[string]bool)
+
+	backoff := wait.Backoff{
+		Steps:    30,
+		Duration: 10 * time.Second,
+		Factor:   1.0,
+		Jitter:   0.1,
+	}
+
+	if err := retry.OnError(backoff, util.IsRetriableNetworkError, func() error {
+		logrus.Infof("Trying to get %s image list", r.upgrade.Status.PreviousVersion)
+		err := r.getImageList(r.upgrade.Status.PreviousVersion, previousImageList)
+		if err != nil {
+			return err
+		}
+		logrus.Infof("Trying to get %s image list", currentVersion)
+		return r.getImageList(currentVersion, currentImageList)
+	}); err != nil {
+		return nil, err
+	}
+
+	diffList := applyImageRetainList(difference(previousImageList, currentImageList))
+	logrus.Infof("Diff: %v", diffList)
+
+	return diffList, nil
 }

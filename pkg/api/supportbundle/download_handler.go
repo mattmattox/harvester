@@ -12,7 +12,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -42,13 +42,13 @@ func NewDownloadHandler(scaled *config.Scaled, namespace string) *DownloadHandle
 		supportBundleCache: scaled.HarvesterFactory.Harvesterhci().V1beta1().SupportBundle().Cache(),
 		podCache:           scaled.CoreFactory.Core().V1().Pod().Cache(),
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 24 * time.Hour,
 		},
 	}
 }
 
 func (h *DownloadHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
-	bundleName := mux.Vars(r)["bundleName"]
+	bundleName := util.EncodeVars(mux.Vars(r))["bundleName"]
 
 	retainSb := false
 	if retain, err := strconv.ParseBool(r.URL.Query().Get("retain")); err == nil {

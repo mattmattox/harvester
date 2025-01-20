@@ -10,15 +10,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/watch"
 	corefake "k8s.io/client-go/kubernetes/fake"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	"github.com/harvester/harvester/pkg/controller/master/migration"
 	"github.com/harvester/harvester/pkg/generated/clientset/versioned/fake"
-	kubevirttype "github.com/harvester/harvester/pkg/generated/clientset/versioned/typed/kubevirt.io/v1"
-	kubevirtctrl "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
 	"github.com/harvester/harvester/pkg/util"
 	"github.com/harvester/harvester/pkg/util/fakeclients"
 )
@@ -161,18 +157,38 @@ func TestMigrateAction(t *testing.T) {
 		},
 	}
 
+	fakeNodeList := []*corev1.Node{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "fake-node1",
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "fake-node2",
+			},
+		},
+	}
+
 	for _, tc := range testCases {
 		var clientset = fake.NewSimpleClientset()
+		var coreclientset = corefake.NewSimpleClientset()
 		if tc.given.vmInstance != nil {
 			err := clientset.Tracker().Add(tc.given.vmInstance)
 			assert.Nil(t, err, "Mock resource should add into fake controller tracker")
 		}
 
+		for _, node := range fakeNodeList {
+			err := coreclientset.Tracker().Add(node)
+			assert.Nil(t, err, "Mock resource should add into fake controller tracker")
+		}
+
 		var handler = &vmActionHandler{
-			vmis:      fakeVirtualMachineInstanceClient(clientset.KubevirtV1().VirtualMachineInstances),
-			vmiCache:  fakeVirtualMachineInstanceCache(clientset.KubevirtV1().VirtualMachineInstances),
-			vmims:     fakeVirtualMachineInstanceMigrationClient(clientset.KubevirtV1().VirtualMachineInstanceMigrations),
-			vmimCache: fakeVirtualMachineInstanceMigrationCache(clientset.KubevirtV1().VirtualMachineInstanceMigrations),
+			nodeCache: fakeclients.NodeCache(coreclientset.CoreV1().Nodes),
+			vmis:      fakeclients.VirtualMachineInstanceClient(clientset.KubevirtV1().VirtualMachineInstances),
+			vmiCache:  fakeclients.VirtualMachineInstanceCache(clientset.KubevirtV1().VirtualMachineInstances),
+			vmims:     fakeclients.VirtualMachineInstanceMigrationClient(clientset.KubevirtV1().VirtualMachineInstanceMigrations),
+			vmimCache: fakeclients.VirtualMachineInstanceMigrationCache(clientset.KubevirtV1().VirtualMachineInstanceMigrations),
 		}
 
 		var actual output
@@ -333,10 +349,10 @@ func TestAbortMigrateAction(t *testing.T) {
 		}
 
 		var handler = &vmActionHandler{
-			vmis:      fakeVirtualMachineInstanceClient(clientset.KubevirtV1().VirtualMachineInstances),
-			vmiCache:  fakeVirtualMachineInstanceCache(clientset.KubevirtV1().VirtualMachineInstances),
-			vmims:     fakeVirtualMachineInstanceMigrationClient(clientset.KubevirtV1().VirtualMachineInstanceMigrations),
-			vmimCache: fakeVirtualMachineInstanceMigrationCache(clientset.KubevirtV1().VirtualMachineInstanceMigrations),
+			vmis:      fakeclients.VirtualMachineInstanceClient(clientset.KubevirtV1().VirtualMachineInstances),
+			vmiCache:  fakeclients.VirtualMachineInstanceCache(clientset.KubevirtV1().VirtualMachineInstances),
+			vmims:     fakeclients.VirtualMachineInstanceMigrationClient(clientset.KubevirtV1().VirtualMachineInstanceMigrations),
+			vmimCache: fakeclients.VirtualMachineInstanceMigrationCache(clientset.KubevirtV1().VirtualMachineInstanceMigrations),
 		}
 
 		var actual output
@@ -412,10 +428,10 @@ func TestAddVolume(t *testing.T) {
 
 func TestRemoveVolume(t *testing.T) {
 	type input struct {
-		namespace  string
-		name       string
-		input      RemoveVolumeInput
-		vmInstance *kubevirtv1.VirtualMachineInstance
+		namespace string
+		name      string
+		input     RemoveVolumeInput
+		vm        *kubevirtv1.VirtualMachine
 	}
 	type output struct {
 		err error
@@ -435,7 +451,7 @@ func TestRemoveVolume(t *testing.T) {
 				},
 			},
 			expected: output{
-				err: errors.New("virtualmachineinstances.kubevirt.io \"test\" not found"),
+				err: errors.New("virtualmachines.kubevirt.io \"test\" not found"),
 			},
 		},
 		{
@@ -446,15 +462,18 @@ func TestRemoveVolume(t *testing.T) {
 				input: RemoveVolumeInput{
 					DiskName: "not-exist",
 				},
-				vmInstance: &kubevirtv1.VirtualMachineInstance{
+				vm: &kubevirtv1.VirtualMachine{
 					ObjectMeta: metav1.ObjectMeta{
 						Namespace: "default",
 						Name:      "test",
 					},
-					Spec: kubevirtv1.VirtualMachineInstanceSpec{
-						Volumes: nil,
+					Spec: kubevirtv1.VirtualMachineSpec{
+						Template: &kubevirtv1.VirtualMachineInstanceTemplateSpec{
+							Spec: kubevirtv1.VirtualMachineInstanceSpec{
+								Volumes: nil,
+							},
+						},
 					},
-					Status: kubevirtv1.VirtualMachineInstanceStatus{Phase: kubevirtv1.Running, MigrationState: nil},
 				},
 			},
 			expected: output{
@@ -466,13 +485,13 @@ func TestRemoveVolume(t *testing.T) {
 	for _, tc := range testCases {
 		var clientset = fake.NewSimpleClientset()
 		var coreclientset = corefake.NewSimpleClientset()
-		if tc.given.vmInstance != nil {
-			err := clientset.Tracker().Add(tc.given.vmInstance)
+		if tc.given.vm != nil {
+			err := clientset.Tracker().Add(tc.given.vm)
 			assert.Nil(t, err, "Mock resource should add into fake controller tracker")
 		}
 
 		var handler = &vmActionHandler{
-			vmiCache: fakeVirtualMachineInstanceCache(clientset.KubevirtV1().VirtualMachineInstances),
+			vmCache:  fakeclients.VirtualMachineCache(clientset.KubevirtV1().VirtualMachines),
 			pvcCache: fakeclients.PersistentVolumeClaimCache(coreclientset.CoreV1().PersistentVolumeClaims),
 		}
 
@@ -488,116 +507,212 @@ func TestRemoveVolume(t *testing.T) {
 	}
 }
 
-type fakeVirtualMachineInstanceCache func(string) kubevirttype.VirtualMachineInstanceInterface
-
-func (c fakeVirtualMachineInstanceCache) Get(namespace, name string) (*kubevirtv1.VirtualMachineInstance, error) {
-	return c(namespace).Get(context.TODO(), name, metav1.GetOptions{})
-}
-
-func (c fakeVirtualMachineInstanceCache) List(namespace string, selector labels.Selector) ([]*kubevirtv1.VirtualMachineInstance, error) {
-	panic("implement me")
-}
-
-func (c fakeVirtualMachineInstanceCache) AddIndexer(indexName string, indexer kubevirtctrl.VirtualMachineInstanceIndexer) {
-	panic("implement me")
-}
-
-func (c fakeVirtualMachineInstanceCache) GetByIndex(indexName, key string) ([]*kubevirtv1.VirtualMachineInstance, error) {
-	panic("implement me")
-}
-
-type fakeVirtualMachineInstanceClient func(string) kubevirttype.VirtualMachineInstanceInterface
-
-func (c fakeVirtualMachineInstanceClient) Create(virtualMachine *kubevirtv1.VirtualMachineInstance) (*kubevirtv1.VirtualMachineInstance, error) {
-	return c(virtualMachine.Namespace).Create(context.TODO(), virtualMachine, metav1.CreateOptions{})
-}
-
-func (c fakeVirtualMachineInstanceClient) Update(virtualMachine *kubevirtv1.VirtualMachineInstance) (*kubevirtv1.VirtualMachineInstance, error) {
-	return c(virtualMachine.Namespace).Update(context.TODO(), virtualMachine, metav1.UpdateOptions{})
-}
-
-func (c fakeVirtualMachineInstanceClient) UpdateStatus(virtualMachine *kubevirtv1.VirtualMachineInstance) (*kubevirtv1.VirtualMachineInstance, error) {
-	return c(virtualMachine.Namespace).UpdateStatus(context.TODO(), virtualMachine, metav1.UpdateOptions{})
-}
-
-func (c fakeVirtualMachineInstanceClient) Delete(namespace, name string, opts *metav1.DeleteOptions) error {
-	return c(namespace).Delete(context.TODO(), name, *opts)
-}
-
-func (c fakeVirtualMachineInstanceClient) Get(namespace, name string, opts metav1.GetOptions) (*kubevirtv1.VirtualMachineInstance, error) {
-	return c(namespace).Get(context.TODO(), name, opts)
-}
-
-func (c fakeVirtualMachineInstanceClient) List(namespace string, opts metav1.ListOptions) (*kubevirtv1.VirtualMachineInstanceList, error) {
-	return c(namespace).List(context.TODO(), opts)
-}
-
-func (c fakeVirtualMachineInstanceClient) Watch(namespace string, opts metav1.ListOptions) (watch.Interface, error) {
-	return c(namespace).Watch(context.TODO(), opts)
-}
-
-func (c fakeVirtualMachineInstanceClient) Patch(namespace, name string, pt types.PatchType, data []byte, subresources ...string) (result *kubevirtv1.VirtualMachineInstance, err error) {
-	return c(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{}, subresources...)
-}
-
-type fakeVirtualMachineInstanceMigrationCache func(string) kubevirttype.VirtualMachineInstanceMigrationInterface
-
-func (c fakeVirtualMachineInstanceMigrationCache) Get(namespace, name string) (*kubevirtv1.VirtualMachineInstanceMigration, error) {
-	return c(namespace).Get(context.TODO(), name, metav1.GetOptions{})
-}
-
-func (c fakeVirtualMachineInstanceMigrationCache) List(namespace string, selector labels.Selector) ([]*kubevirtv1.VirtualMachineInstanceMigration, error) {
-	list, err := c(namespace).List(context.TODO(), metav1.ListOptions{
-		LabelSelector: selector.String(),
-	})
-	if err != nil {
-		return nil, err
+func Test_vmActionHandler_findMigratableNodesByVMI(t *testing.T) {
+	type args struct {
+		vmi *kubevirtv1.VirtualMachineInstance
 	}
-	result := make([]*kubevirtv1.VirtualMachineInstanceMigration, 0, len(list.Items))
-	for _, vmim := range list.Items {
-		result = append(result, &vmim)
+	tests := []struct {
+		name string
+		args args
+		want []string
+		err  error
+	}{
+		{
+			name: "Get migratable nodes by network affinity",
+			args: args{
+				vmi: &kubevirtv1.VirtualMachineInstance{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test",
+						Namespace: "default",
+					},
+					Spec: kubevirtv1.VirtualMachineInstanceSpec{
+						Affinity: &corev1.Affinity{
+							NodeAffinity: &corev1.NodeAffinity{
+								RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+									NodeSelectorTerms: []corev1.NodeSelectorTerm{
+										{
+											MatchExpressions: []corev1.NodeSelectorRequirement{
+												{
+													Key:      "network",
+													Operator: corev1.NodeSelectorOpIn,
+													Values:   []string{"a"},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: []string{
+				"node1", "node2",
+			},
+		},
+		{
+			name: "Get migratable nodes by network affinity and zone",
+			args: args{
+				vmi: &kubevirtv1.VirtualMachineInstance{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test",
+						Namespace: "default",
+					},
+					Spec: kubevirtv1.VirtualMachineInstanceSpec{
+						Affinity: &corev1.Affinity{
+							NodeAffinity: &corev1.NodeAffinity{
+								RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+									NodeSelectorTerms: []corev1.NodeSelectorTerm{
+										{
+											MatchExpressions: []corev1.NodeSelectorRequirement{
+												{
+													Key:      "network",
+													Operator: corev1.NodeSelectorOpIn,
+													Values:   []string{"a"},
+												},
+												{
+													Key:      "zone",
+													Operator: corev1.NodeSelectorOpIn,
+													Values:   []string{"zone2"},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: []string{
+				"node2",
+			},
+		},
+		{
+			name: "User defined custom affinity",
+			args: args{
+				vmi: &kubevirtv1.VirtualMachineInstance{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test",
+						Namespace: "default",
+					},
+					Spec: kubevirtv1.VirtualMachineInstanceSpec{
+						Affinity: &corev1.Affinity{
+							NodeAffinity: &corev1.NodeAffinity{
+								RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+									NodeSelectorTerms: []corev1.NodeSelectorTerm{
+										{
+											MatchExpressions: []corev1.NodeSelectorRequirement{
+												{
+													Key:      "user.custom/label",
+													Operator: corev1.NodeSelectorOpIn,
+													Values:   []string{"a"},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: []string{
+				"node1", "node3",
+			},
+		},
 	}
-	return result, err
-}
 
-func (c fakeVirtualMachineInstanceMigrationCache) AddIndexer(indexName string, indexer kubevirtctrl.VirtualMachineInstanceMigrationIndexer) {
-	panic("implement me")
-}
+	fakeNodeList := []*corev1.Node{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "node1",
+				Labels: map[string]string{
+					"user.custom/label": "a",
+					"network":           "a",
+					"zone":              "zone1",
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "node2",
+				Labels: map[string]string{
+					"network": "a",
+					"zone":    "zone2",
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "node3",
+				Labels: map[string]string{
+					"user.custom/label": "a",
+					"network":           "b",
+					"zone":              "zone3",
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "unschedulable-node",
+				Labels: map[string]string{
+					"network": "a",
+					"zone":    "zone2",
+				},
+			},
+			Spec: corev1.NodeSpec{
+				Unschedulable: true,
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "unschedulable-node2",
+				Labels: map[string]string{
+					"user.custom/label": "a",
+					"network":           "a",
+					"zone":              "zone2",
+				},
+			},
+			Spec: corev1.NodeSpec{
+				Taints: []corev1.Taint{
+					{Key: corev1.TaintNodeUnschedulable},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "unreachable-node",
+				Labels: map[string]string{
+					"user.custom/label": "a",
+					"network":           "a",
+					"zone":              "zone2",
+				},
+			},
+			Spec: corev1.NodeSpec{
+				Taints: []corev1.Taint{
+					{Key: corev1.TaintNodeUnreachable},
+				},
+			},
+		},
+	}
+	var coreclientset = corefake.NewSimpleClientset()
+	for _, node := range fakeNodeList {
+		err := coreclientset.Tracker().Add(node)
+		assert.Nil(t, err, "Mock resource should add into fake controller tracker")
+	}
+	var nodeCache = fakeclients.NodeCache(coreclientset.CoreV1().Nodes)
 
-func (c fakeVirtualMachineInstanceMigrationCache) GetByIndex(indexName, key string) ([]*kubevirtv1.VirtualMachineInstanceMigration, error) {
-	panic("implement me")
-}
-
-type fakeVirtualMachineInstanceMigrationClient func(string) kubevirttype.VirtualMachineInstanceMigrationInterface
-
-func (c fakeVirtualMachineInstanceMigrationClient) Create(virtualMachine *kubevirtv1.VirtualMachineInstanceMigration) (*kubevirtv1.VirtualMachineInstanceMigration, error) {
-	return c(virtualMachine.Namespace).Create(context.TODO(), virtualMachine, metav1.CreateOptions{})
-}
-
-func (c fakeVirtualMachineInstanceMigrationClient) Update(virtualMachine *kubevirtv1.VirtualMachineInstanceMigration) (*kubevirtv1.VirtualMachineInstanceMigration, error) {
-	return c(virtualMachine.Namespace).Update(context.TODO(), virtualMachine, metav1.UpdateOptions{})
-}
-
-func (c fakeVirtualMachineInstanceMigrationClient) UpdateStatus(virtualMachine *kubevirtv1.VirtualMachineInstanceMigration) (*kubevirtv1.VirtualMachineInstanceMigration, error) {
-	return c(virtualMachine.Namespace).UpdateStatus(context.TODO(), virtualMachine, metav1.UpdateOptions{})
-}
-
-func (c fakeVirtualMachineInstanceMigrationClient) Delete(namespace, name string, opts *metav1.DeleteOptions) error {
-	return c(namespace).Delete(context.TODO(), name, *opts)
-}
-
-func (c fakeVirtualMachineInstanceMigrationClient) Get(namespace, name string, opts metav1.GetOptions) (*kubevirtv1.VirtualMachineInstanceMigration, error) {
-	return c(namespace).Get(context.TODO(), name, opts)
-}
-
-func (c fakeVirtualMachineInstanceMigrationClient) List(namespace string, opts metav1.ListOptions) (*kubevirtv1.VirtualMachineInstanceMigrationList, error) {
-	return c(namespace).List(context.TODO(), opts)
-}
-
-func (c fakeVirtualMachineInstanceMigrationClient) Watch(namespace string, opts metav1.ListOptions) (watch.Interface, error) {
-	return c(namespace).Watch(context.TODO(), opts)
-}
-
-func (c fakeVirtualMachineInstanceMigrationClient) Patch(namespace, name string, pt types.PatchType, data []byte, subresources ...string) (result *kubevirtv1.VirtualMachineInstanceMigration, err error) {
-	return c(namespace).Patch(context.TODO(), name, pt, data, metav1.PatchOptions{}, subresources...)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &vmActionHandler{
+				nodeCache: nodeCache,
+			}
+			got, err := h.findMigratableNodesByVMI(tt.args.vmi)
+			if tt.err != nil && err != nil {
+				assert.Equal(t, tt.err.Error(), err.Error(), "case %q", tt.name)
+			}
+			assert.Equalf(t, tt.want, got, "findMigratableNodesByVMI(%v)", tt.args.vmi)
+		})
+	}
 }

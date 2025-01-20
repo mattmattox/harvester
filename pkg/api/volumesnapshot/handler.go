@@ -7,22 +7,25 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
-	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
+	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
 	"github.com/rancher/apiserver/pkg/apierror"
-	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
-	ctlstoragev1 "github.com/rancher/wrangler/pkg/generated/controllers/storage/v1"
-	"github.com/rancher/wrangler/pkg/schemas/validation"
+	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
+	ctlstoragev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/storage/v1"
+	"github.com/rancher/wrangler/v3/pkg/schemas/validation"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	ctlsnapshotv1 "github.com/harvester/harvester/pkg/generated/controllers/snapshot.storage.k8s.io/v1beta1"
+	ctllonghornv1 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta2"
+	ctlsnapshotv1 "github.com/harvester/harvester/pkg/generated/controllers/snapshot.storage.k8s.io/v1"
 	"github.com/harvester/harvester/pkg/util"
 )
 
 type ActionHandler struct {
 	pvcs              ctlcorev1.PersistentVolumeClaimClient
 	pvcCache          ctlcorev1.PersistentVolumeClaimCache
+	volumes           ctllonghornv1.VolumeClient
+	volumeCache       ctllonghornv1.VolumeCache
 	snapshotCache     ctlsnapshotv1.VolumeSnapshotCache
 	storageClassCache ctlstoragev1.StorageClassCache
 }
@@ -40,8 +43,8 @@ func (h ActionHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	rw.WriteHeader(http.StatusNoContent)
 }
 
-func (h *ActionHandler) do(rw http.ResponseWriter, r *http.Request) error {
-	vars := mux.Vars(r)
+func (h *ActionHandler) do(_ http.ResponseWriter, r *http.Request) error {
+	vars := util.EncodeVars(mux.Vars(r))
 	action := vars["action"]
 	snapshotName := vars["name"]
 	snapshotNamespace := vars["namespace"]
@@ -61,7 +64,7 @@ func (h *ActionHandler) do(rw http.ResponseWriter, r *http.Request) error {
 	}
 }
 
-func (h *ActionHandler) restore(ctx context.Context, snapshotNamespace, snapshotName, newPVCName, storageClassName string) error {
+func (h *ActionHandler) restore(_ context.Context, snapshotNamespace, snapshotName, newPVCName, storageClassName string) error {
 	volumeSnapshot, err := h.snapshotCache.Get(snapshotNamespace, snapshotName)
 	if err != nil {
 		return err
@@ -69,7 +72,7 @@ func (h *ActionHandler) restore(ctx context.Context, snapshotNamespace, snapshot
 
 	sourceStorageClassName := volumeSnapshot.Annotations[util.AnnotationStorageClassName]
 	sourceStorageProvisioner := volumeSnapshot.Annotations[util.AnnotationStorageProvisioner]
-	sourceImageId := volumeSnapshot.Annotations[util.AnnotationImageID]
+	sourceImageID := volumeSnapshot.Annotations[util.AnnotationImageID]
 	// default to using source storageClass
 	if storageClassName == "" {
 		storageClassName = sourceStorageClassName
@@ -81,7 +84,7 @@ func (h *ActionHandler) restore(ctx context.Context, snapshotNamespace, snapshot
 	if sourceStorageProvisioner != "" && sc.Provisioner != sourceStorageProvisioner {
 		return apierror.NewAPIError(validation.InvalidBodyContent, "Can not use different provisioner for restoring volume snapshot")
 	}
-	if sourceImageId != "" && storageClassName != sourceStorageClassName {
+	if sourceImageID != "" && storageClassName != sourceStorageClassName {
 		return apierror.NewAPIError(validation.InvalidBodyContent, "Can not use different storageClass for restoring image volume snapshot")
 	}
 
@@ -90,7 +93,7 @@ func (h *ActionHandler) restore(ctx context.Context, snapshotNamespace, snapshot
 	accessModes := []corev1.PersistentVolumeAccessMode{
 		corev1.ReadWriteMany,
 	}
-	resources := corev1.ResourceRequirements{
+	resources := corev1.VolumeResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceStorage: *volumeSnapshot.Status.RestoreSize,
 		},
@@ -115,14 +118,13 @@ func (h *ActionHandler) restore(ctx context.Context, snapshotNamespace, snapshot
 		},
 	}
 
-	if sourceImageId != "" {
-		newPVC.Annotations[util.AnnotationImageID] = sourceImageId
+	if sourceImageID != "" {
+		newPVC.Annotations[util.AnnotationImageID] = sourceImageID
 	}
 
 	if _, err = h.pvcs.Create(newPVC); err != nil {
-		logrus.Errorf("failed to restore volume snapshot %s/%s to new pvc %s", snapshotNamespace, snapshotName, newPVCName)
+		logrus.Errorf("failed to restore volume snapshot %s/%s", snapshotNamespace, snapshotName)
 		return err
 	}
-
 	return nil
 }

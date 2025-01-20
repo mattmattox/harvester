@@ -3,7 +3,11 @@ package upgrade
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/rest"
+
 	"github.com/harvester/harvester/pkg/config"
+	"github.com/harvester/harvester/pkg/generated/clientset/versioned/scheme"
 )
 
 const (
@@ -23,6 +27,7 @@ func Register(ctx context.Context, management *config.Management, options config
 	}
 
 	upgrades := management.HarvesterFactory.Harvesterhci().V1beta1().Upgrade()
+	upgradeLogs := management.HarvesterFactory.Harvesterhci().V1beta1().UpgradeLog()
 	versions := management.HarvesterFactory.Harvesterhci().V1beta1().Version()
 	settings := management.HarvesterFactory.Harvesterhci().V1beta1().Setting()
 	plans := management.UpgradeFactory.Upgrade().V1().Plan()
@@ -32,30 +37,49 @@ func Register(ctx context.Context, management *config.Management, options config
 	vmImages := management.HarvesterFactory.Harvesterhci().V1beta1().VirtualMachineImage()
 	vms := management.VirtFactory.Kubevirt().V1().VirtualMachine()
 	services := management.CoreFactory.Core().V1().Service()
+	namespaces := management.CoreFactory.Core().V1().Namespace()
 	clusters := management.ProvisioningFactory.Provisioning().V1().Cluster()
-	machines := management.ClusterFactory.Cluster().V1alpha4().Machine()
+	machines := management.ClusterFactory.Cluster().V1beta1().Machine()
 	secrets := management.CoreFactory.Core().V1().Secret()
 	pvcs := management.CoreFactory.Core().V1().PersistentVolumeClaim()
+	lhSettings := management.LonghornFactory.Longhorn().V1beta2().Setting()
+	kubeVirt := management.VirtFactory.Kubevirt().V1().KubeVirt()
+
+	virtSubsrcConfig := rest.CopyConfig(management.RestConfig)
+	virtSubsrcConfig.GroupVersion = &schema.GroupVersion{Group: "subresources.kubevirt.io", Version: "v1"}
+	virtSubsrcConfig.APIPath = "/apis"
+	virtSubsrcConfig.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
+	virtSubresourceClient, err := rest.RESTClientFor(virtSubsrcConfig)
+	if err != nil {
+		return err
+	}
 
 	controller := &upgradeHandler{
-		ctx:           ctx,
-		jobClient:     jobs,
-		jobCache:      jobs.Cache(),
-		nodeCache:     nodes.Cache(),
-		namespace:     options.Namespace,
-		upgradeClient: upgrades,
-		upgradeCache:  upgrades.Cache(),
-		versionCache:  versions.Cache(),
-		planClient:    plans,
-		planCache:     plans.Cache(),
-		vmImageClient: vmImages,
-		vmImageCache:  vmImages.Cache(),
-		vmClient:      vms,
-		vmCache:       vms.Cache(),
-		serviceClient: services,
-		pvcClient:     pvcs,
-		clusterClient: clusters,
-		clusterCache:  clusters.Cache(),
+		ctx:               ctx,
+		jobClient:         jobs,
+		jobCache:          jobs.Cache(),
+		nodeCache:         nodes.Cache(),
+		namespace:         options.Namespace,
+		upgradeClient:     upgrades,
+		upgradeCache:      upgrades.Cache(),
+		upgradeController: upgrades,
+		upgradeLogClient:  upgradeLogs,
+		upgradeLogCache:   upgradeLogs.Cache(),
+		versionCache:      versions.Cache(),
+		planClient:        plans,
+		planCache:         plans.Cache(),
+		vmImageClient:     vmImages,
+		vmImageCache:      vmImages.Cache(),
+		vmClient:          vms,
+		vmCache:           vms.Cache(),
+		serviceClient:     services,
+		pvcClient:         pvcs,
+		clusterClient:     clusters,
+		clusterCache:      clusters.Cache(),
+		lhSettingClient:   lhSettings,
+		lhSettingCache:    lhSettings.Cache(),
+		kubeVirtCache:     kubeVirt.Cache(),
+		vmRestClient:      virtSubresourceClient,
 	}
 	upgrades.OnChange(ctx, upgradeControllerName, controller.OnChanged)
 	upgrades.OnRemove(ctx, upgradeControllerName, controller.OnRemove)
@@ -116,7 +140,7 @@ func Register(ctx context.Context, management *config.Management, options config
 	}
 	nodes.OnChange(ctx, nodeControllerName, nodeHandler.OnChanged)
 
-	versionSyncer := newVersionSyncer(ctx, options.Namespace, versions, versions.Cache())
+	versionSyncer := newVersionSyncer(ctx, options.Namespace, versions, nodes, namespaces)
 
 	settingHandler := settingHandler{
 		versionSyncer: versionSyncer,

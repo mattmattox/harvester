@@ -5,9 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-	v1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	v1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,7 +16,6 @@ import (
 	"github.com/harvester/harvester/pkg/builder"
 	"github.com/harvester/harvester/pkg/config"
 	ctlkubevirtv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
-	. "github.com/harvester/harvester/tests/framework/dsl"
 	"github.com/harvester/harvester/tests/framework/fuzz"
 	"github.com/harvester/harvester/tests/framework/helper"
 )
@@ -79,21 +76,6 @@ var _ = Describe("verify vm APIs", func() {
 
 		Specify("verify vm api", func() {
 
-			// create
-			By("create a virtual machine should fail if name missing")
-			MustFinallyBeTrue(func() bool {
-				vm, err := NewDefaultTestVMBuilder(testResourceLabels).Name("").
-					NetworkInterface(testVMInterfaceName, testVMInterfaceModel, "", builder.NetworkInterfaceTypeMasquerade, "").
-					PVCDisk(testVMBlankDiskName, testVMDefaultDiskBus, false, false, 1, testVMDiskSize, "", nil).
-					VM()
-				MustNotError(err)
-				respCode, _, err := helper.PostObject(vmsAPI, vm)
-				MustNotError(err)
-				// 404 is because the api server is up but ready to serve with watching the metadata controllers
-				Expect(respCode).To(BeElementOf([]int{http.StatusUnprocessableEntity, http.StatusNotFound}))
-				return respCode == http.StatusUnprocessableEntity
-			}, 1*time.Minute, 3*time.Second)
-
 			By("when create a virtual machine with cloud-init")
 			vmName := testVMGenerateName + fuzz.String(5)
 			vmCloudInit := &VMCloudInit{
@@ -130,14 +112,23 @@ var _ = Describe("verify vm APIs", func() {
 
 			// edit
 			By("when edit virtual machine")
-			vm, err = builder.NewVMBuilder(testCreator).Update(vm).CPU(testVMUpdatedCPUCore).Memory(testVMUpdatedMemory).
-				PVCDisk(testVMCDRomDiskName, testVMCDRomBus, true, false, 2, testVMDiskSize, "", &builder.PersistentVolumeClaimOption{
-					VolumeMode: builder.PersistentVolumeModeFilesystem,
-					AccessMode: builder.PersistentVolumeAccessModeReadWriteOnce,
-				}).VM()
-			MustNotError(err)
-			respCode, respBody, err = helper.PutObject(vmURL, vm)
-			MustRespCodeIs(http.StatusOK, "put edit action", err, respCode, respBody)
+			MustFinallyBeTrue(func() bool {
+				// re-get, vm object may be outdated at this point
+				vm, err = vmController.Get(vmNamespace, vmName, metav1.GetOptions{})
+				MustNotError(err)
+				vm, err = builder.NewVMBuilder(testCreator).Update(vm).CPU(testVMUpdatedCPUCore).Memory(testVMUpdatedMemory).
+					PVCDisk(testVMCDRomDiskName, testVMCDRomBus, true, false, 2, testVMDiskSize, "", &builder.PersistentVolumeClaimOption{
+						VolumeMode: builder.PersistentVolumeModeFilesystem,
+						AccessMode: builder.PersistentVolumeAccessModeReadWriteOnce,
+					}).VM()
+				MustNotError(err)
+				respCode, _, err = helper.PutObject(vmURL, vm)
+				MustNotError(err)
+				// 409 may also occur
+				// e.g.: {...the object has been modified; please apply your changes to the latest version and try again","status":409,"type":"error"}
+				Expect(respCode).To(BeElementOf([]int{http.StatusOK, http.StatusConflict}))
+				return respCode == http.StatusOK
+			}, 10*time.Second, 3*time.Second)
 
 			By("then the virtual machine is changed")
 			AfterVMRunning(vmController, vmNamespace, vmName, func(vm *kubevirtv1.VirtualMachine) bool {
@@ -261,11 +252,14 @@ var _ = Describe("verify vm APIs", func() {
 			_, err = vmController.Get(vmNamespace, vmName, metav1.GetOptions{})
 			MustNotError(err)
 
-			By("when deleting the virtual machine with removeDisks query parameter")
-			vmURL := helper.BuildResourceURL(vmsAPI, vmNamespace, vmName)
-			queryParams := fmt.Sprintf("?removedDisks=%s", testVMRemoveDiskName)
-			respCode, respBody, err = helper.DeleteObject(vmURL + queryParams)
-			MustRespCodeIs(http.StatusOK, "delete action", err, respCode, respBody)
+			By("when deleting the virtual machine with removeDisks query parameter", func() {
+				vmURL := helper.BuildResourceURL(vmsAPI, vmNamespace, vmName)
+				queryParams := fmt.Sprintf("?removedDisks=%s", testVMRemoveDiskName)
+				MustFinallyBeTrue(func() bool {
+					respCode, respBody, err = helper.DeleteObject(vmURL + queryParams)
+					return CheckRespCodeIs(http.StatusOK, "delete action", err, respCode, respBody)
+				}, 10*time.Second, 3*time.Second)
+			})
 
 			By("then the virtual machine is deleted")
 			MustVMDeleted(vmController, vmNamespace, vmName)

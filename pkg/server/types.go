@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"strings"
@@ -18,8 +19,8 @@ import (
 	"github.com/rancher/steve/pkg/aggregation"
 	steveauth "github.com/rancher/steve/pkg/auth"
 	steveserver "github.com/rancher/steve/pkg/server"
-	"github.com/rancher/wrangler/pkg/generic"
-	"github.com/rancher/wrangler/pkg/ratelimit"
+	"github.com/rancher/wrangler/v3/pkg/generic"
+	"github.com/rancher/wrangler/v3/pkg/ratelimit"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,6 +57,17 @@ type HarvesterServer struct {
 
 	Handler http.Handler
 }
+
+var (
+	whiteListedCiphers = []uint16{
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+	}
+)
 
 const (
 	RancherKubeConfigSecretName = "rancher-kubeconfig"
@@ -155,6 +167,10 @@ func (s *HarvesterServer) ListenAndServe(listenerCfg *dynamiclistener.Config, op
 		Secrets: s.controllers.Core.Secret(),
 		TLSListenerConfig: dynamiclistener.Config{
 			CloseConnOnCertChange: true,
+			TLSConfig: &tls.Config{
+				MinVersion:   tls.VersionTLS12,
+				CipherSuites: whiteListedCiphers,
+			},
 		},
 	}
 
@@ -191,7 +207,7 @@ func (s *HarvesterServer) generateSteveServer(options config.Options) error {
 
 	var scaled *config.Scaled
 
-	s.Context, scaled, err = config.SetupScaled(s.Context, s.RESTConfig, factoryOpts, options.Namespace)
+	s.Context, scaled, err = config.SetupScaled(s.Context, s.RESTConfig, factoryOpts)
 	if err != nil {
 		return err
 	}

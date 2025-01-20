@@ -5,19 +5,37 @@ import (
 	"reflect"
 	"strings"
 
-	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
-	lhv1beta1 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta1"
-	longhorntypes "github.com/longhorn/longhorn-manager/types"
-	"github.com/sirupsen/logrus"
+	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
+	lhv1beta2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
-	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	"github.com/harvester/harvester/pkg/util"
 )
+
+const backupProgressComplete = 100
+
+func (h *Handler) updateBackupProgress(volumeBackup *harvesterv1.VolumeBackup) error {
+	if volumeBackup.ReadyToUse != nil && *volumeBackup.ReadyToUse {
+		volumeBackup.Progress = backupProgressComplete
+		return nil
+	}
+
+	if volumeBackup.LonghornBackupName == nil {
+		return nil
+	}
+
+	lhBackup, err := h.lhbackupCache.Get(util.LonghornSystemNamespaceName, *volumeBackup.LonghornBackupName)
+	if err != nil {
+		return err
+	}
+
+	volumeBackup.Progress = lhBackup.Status.Progress
+	return nil
+}
 
 func (h *Handler) updateConditions(vmBackup *harvesterv1.VirtualMachineBackup) error {
 	var vmBackupCpy = vmBackup.DeepCopy()
@@ -28,15 +46,32 @@ func (h *Handler) updateConditions(vmBackup *harvesterv1.VirtualMachineBackup) e
 
 	ready := true
 	errorMessage := ""
-	for _, vb := range vmBackup.Status.VolumeBackups {
+	var volumeSizeSum int64
+	var progressWeightSum int64
+
+	for i := range vmBackupCpy.Status.VolumeBackups {
+		vb := &vmBackupCpy.Status.VolumeBackups[i]
 		if vb.ReadyToUse == nil || !*vb.ReadyToUse {
 			ready = false
+		}
+
+		if vmBackupCpy.Spec.Type == harvesterv1.Backup {
+			if err := h.updateBackupProgress(vb); err != nil {
+				return err
+			}
+
+			volumeSizeSum += vb.VolumeSize
+			progressWeightSum += int64(vb.Progress) * vb.VolumeSize
 		}
 
 		if vb.Error != nil {
 			errorMessage = fmt.Sprintf("VolumeSnapshot %s in error state", *vb.Name)
 			break
 		}
+	}
+
+	if volumeSizeSum != 0 {
+		vmBackupCpy.Status.Progress = int(progressWeightSum / volumeSizeSum)
 	}
 
 	if ready && (vmBackupCpy.Status.ReadyToUse == nil || !*vmBackupCpy.Status.ReadyToUse) {
@@ -66,7 +101,7 @@ func (h *Handler) updateConditions(vmBackup *harvesterv1.VirtualMachineBackup) e
 	return nil
 }
 
-func (h *Handler) updateVolumeSnapshotChanged(key string, snapshot *snapshotv1.VolumeSnapshot) (*snapshotv1.VolumeSnapshot, error) {
+func (h *Handler) updateVolumeSnapshotChanged(_ string, snapshot *snapshotv1.VolumeSnapshot) (*snapshotv1.VolumeSnapshot, error) {
 	if snapshot == nil || snapshot.DeletionTimestamp != nil {
 		return nil, nil
 	}
@@ -105,52 +140,11 @@ func (h *Handler) resolveVolSnapshotRef(namespace string, controllerRef *metav1.
 	return backup
 }
 
-// mountLonghornVolumes helps to mount the volumes to host if it is detached
-func (h *Handler) mountLonghornVolumes(vm *kubevirtv1.VirtualMachine) error {
-	for _, vol := range vm.Spec.Template.Spec.Volumes {
-		if vol.PersistentVolumeClaim == nil {
-			continue
-		}
-		name := vol.PersistentVolumeClaim.ClaimName
-
-		pvc, err := h.pvcCache.Get(vm.Namespace, name)
-		if err != nil {
-			return fmt.Errorf("failed to get pvc %s/%s, error: %s", name, vm.Namespace, err.Error())
-		}
-
-		sc, err := h.storageClassCache.Get(*pvc.Spec.StorageClassName)
-		if err != nil {
-			return err
-		}
-		if sc.Provisioner != longhorntypes.LonghornDriverName {
-			continue
-		}
-
-		volume, err := h.volumeCache.Get(util.LonghornSystemNamespaceName, pvc.Spec.VolumeName)
-		if err != nil {
-			return fmt.Errorf("failed to get volume %s/%s, error: %s", name, vm.Namespace, err.Error())
-		}
-
-		volCpy := volume.DeepCopy()
-		if volume.Status.State == lhv1beta1.VolumeStateDetached || volume.Status.State == lhv1beta1.VolumeStateDetaching {
-			volCpy.Spec.NodeID = volume.Status.OwnerID
-		}
-
-		if !reflect.DeepEqual(volCpy, volume) {
-			logrus.Infof("mount detached volume %s to the node %s", volCpy.Name, volCpy.Spec.NodeID)
-			if _, err = h.volumes.Update(volCpy); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 func getVolumeSnapshotContentName(volumeBackup harvesterv1.VolumeBackup) string {
 	return fmt.Sprintf("%s-vsc", *volumeBackup.Name)
 }
 
-func (h *Handler) OnLHBackupChanged(key string, lhBackup *lhv1beta1.Backup) (*lhv1beta1.Backup, error) {
+func (h *Handler) OnLHBackupChanged(_ string, lhBackup *lhv1beta2.Backup) (*lhv1beta2.Backup, error) {
 	if lhBackup == nil || lhBackup.DeletionTimestamp != nil || lhBackup.Status.SnapshotName == "" {
 		return nil, nil
 	}
@@ -187,7 +181,12 @@ func (h *Handler) OnLHBackupChanged(key string, lhBackup *lhv1beta1.Backup) (*lh
 			if _, err := h.vmBackups.Update(vmBackupCpy); err != nil {
 				return nil, err
 			}
+
+			return nil, nil
 		}
+
+		//enqueue to trigger progress update in updateConditions()
+		h.vmBackupController.Enqueue(vmBackup.Namespace, vmBackup.Name)
 	}
 	return nil, nil
 }

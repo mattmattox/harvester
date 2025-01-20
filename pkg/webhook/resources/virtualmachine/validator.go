@@ -4,30 +4,50 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 
-	v1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	v1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	admissionregv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/runtime"
+	runtime "k8s.io/apimachinery/pkg/runtime"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
+	ctlharvestercorev1 "github.com/harvester/harvester/pkg/generated/controllers/core/v1"
 	ctlharvesterv1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
+	ctlcniv1 "github.com/harvester/harvester/pkg/generated/controllers/k8s.cni.cncf.io/v1"
+	ctlkubevirtv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
 	"github.com/harvester/harvester/pkg/ref"
 	"github.com/harvester/harvester/pkg/util"
+	indexeresutil "github.com/harvester/harvester/pkg/util/indexeres"
+	"github.com/harvester/harvester/pkg/util/resourcequota"
+	vmUtil "github.com/harvester/harvester/pkg/util/virtualmachine"
 	werror "github.com/harvester/harvester/pkg/webhook/error"
+	indexerwebhook "github.com/harvester/harvester/pkg/webhook/indexeres"
 	"github.com/harvester/harvester/pkg/webhook/types"
 	webhookutil "github.com/harvester/harvester/pkg/webhook/util"
 )
 
 func NewValidator(
+	nsCache v1.NamespaceCache,
+	podCache v1.PodCache,
 	pvcCache v1.PersistentVolumeClaimCache,
+	rqCache ctlharvestercorev1.ResourceQuotaCache,
 	vmBackupCache ctlharvesterv1.VirtualMachineBackupCache,
+	vmimCache ctlkubevirtv1.VirtualMachineInstanceMigrationCache,
+	vmCache ctlkubevirtv1.VirtualMachineCache,
+	vmiCache ctlkubevirtv1.VirtualMachineInstanceCache,
+	nadCache ctlcniv1.NetworkAttachmentDefinitionCache,
 ) types.Validator {
 	return &vmValidator{
 		pvcCache:      pvcCache,
 		vmBackupCache: vmBackupCache,
+		vmCache:       vmCache,
+		vmiCache:      vmiCache,
+		nadCache:      nadCache,
+
+		rqCalculator: resourcequota.NewCalculator(nsCache, podCache, rqCache, vmimCache),
 	}
 }
 
@@ -35,6 +55,11 @@ type vmValidator struct {
 	types.DefaultValidator
 	pvcCache      v1.PersistentVolumeClaimCache
 	vmBackupCache ctlharvesterv1.VirtualMachineBackupCache
+	vmCache       ctlkubevirtv1.VirtualMachineCache
+	vmiCache      ctlkubevirtv1.VirtualMachineInstanceCache
+	nadCache      ctlcniv1.NetworkAttachmentDefinitionCache
+
+	rqCalculator *resourcequota.Calculator
 }
 
 func (v *vmValidator) Resource() types.Resource {
@@ -51,7 +76,140 @@ func (v *vmValidator) Resource() types.Resource {
 	}
 }
 
-func (v *vmValidator) Create(request *types.Request, newObj runtime.Object) error {
+func (v *vmValidator) getClusterNetworkForNad(nwName string) (clusterNetwork string, err error) {
+	words := strings.Split(nwName, "/")
+	var namespace, name string
+	switch len(words) {
+	case 1:
+		namespace, name = "default", words[0]
+	case 2:
+		namespace, name = words[0], words[1]
+	default:
+		return clusterNetwork, fmt.Errorf("invalid network name %s", nwName)
+	}
+
+	nad, err := v.nadCache.Get(namespace, name)
+	if err != nil {
+		return clusterNetwork, err
+	}
+	clusterNetwork, ok := nad.Labels[keyClusterNetwork]
+	if !ok {
+		return clusterNetwork, err
+	}
+
+	return clusterNetwork, nil
+}
+
+func (v *vmValidator) getVMInterfaceInfo(vms []*kubevirtv1.VirtualMachine) (MacAddrPerCluster map[string]map[string]string, err error) {
+	MacAddrPerCluster = make(map[string]map[string]string) //map[clusterName]map[macaddr]intfName
+
+	for _, vm := range vms {
+		vmName := vm.Namespace + "/" + vm.Name
+
+		if vm.Spec.Template == nil {
+			return MacAddrPerCluster, fmt.Errorf("vm %s template is nil", vm.Name)
+		}
+
+		vmCluster := make(map[string]string) // map[netIntfName]clusterNetwork
+		vmNetworks := vm.Spec.Template.Spec.Networks
+		for _, vmNetwork := range vmNetworks {
+			if vmNetwork.Multus == nil || vmNetwork.Multus.NetworkName == "" {
+				continue
+			}
+			cn, err := v.getClusterNetworkForNad(vmNetwork.Multus.NetworkName)
+			if err != nil {
+				return MacAddrPerCluster, err
+			}
+			vmCluster[vmNetwork.Name] = cn
+		}
+
+		vmInterfaces := vm.Spec.Template.Spec.Domain.Devices.Interfaces
+
+		var macAddrs map[string]string
+		for _, vmInterface := range vmInterfaces {
+			if vmInterface.MacAddress == "" {
+				continue
+			}
+
+			clusNet := vmCluster[vmInterface.Name]
+			if _, exists := MacAddrPerCluster[clusNet]; !exists {
+				macAddrs = make(map[string]string)
+			} else {
+				macAddrs = MacAddrPerCluster[clusNet]
+			}
+			macAddrs[vmInterface.MacAddress] = vmInterface.Name + "+" + vmName
+			MacAddrPerCluster[clusNet] = macAddrs
+		}
+	}
+
+	return MacAddrPerCluster, nil
+}
+
+func (v *vmValidator) checkForDuplicateMacAddrs(vm *kubevirtv1.VirtualMachine) (err error) {
+	var newVMs []*kubevirtv1.VirtualMachine
+	var oldVMsInfo map[string]map[string]string
+	var oldVMsList []*kubevirtv1.VirtualMachine
+
+	//get map[clustername]map[mac]string info for new vm
+	newVMs = append(newVMs, vm)
+	newVMsInfo, err := v.getVMInterfaceInfo(newVMs)
+	if err != nil {
+		return err
+	}
+
+	//newVMsInfo will be empty when new vms are created without any mac address config
+	//skip processing further as there is no mac address configuration from user
+	if len(newVMsInfo) == 0 {
+		return nil
+	}
+
+	if vm.Spec.Template == nil {
+		return fmt.Errorf("vm %s template is nil", vm.Name)
+	}
+
+	vmInterfaces := vm.Spec.Template.Spec.Domain.Devices.Interfaces
+
+	for _, vmInterface := range vmInterfaces {
+		oldVMs, err := v.vmCache.GetByIndex(indexerwebhook.VMByMacAddress, vmInterface.MacAddress)
+		if err != nil {
+			return err
+		}
+
+		oldVMsList = append(oldVMsList, oldVMs...)
+	}
+
+	//No matching mac addresses,skip duplicate mac address check
+	if len(oldVMsList) == 0 {
+		return nil
+	}
+
+	oldVMsInfo, err = v.getVMInterfaceInfo(oldVMsList)
+	if err != nil {
+		return err
+	}
+
+	for cn, macs := range newVMsInfo {
+		if othermacs, exists := oldVMsInfo[cn]; exists {
+			if comparemacs(macs, othermacs) { //duplicate present
+				return fmt.Errorf("duplicate mac address present for vm %s for cluster network %s", vm.Name, cn)
+			}
+		}
+	}
+
+	return nil
+}
+
+func comparemacs(macList1 map[string]string, macList2 map[string]string) bool {
+	for mac1, newvmIntfName := range macList1 {
+		if oldVMIntfName, exists := macList2[mac1]; exists && oldVMIntfName != newvmIntfName { //skip same vms during vm migration,restore cases
+			return true
+		}
+	}
+
+	return false
+}
+
+func (v *vmValidator) Create(_ *types.Request, newObj runtime.Object) error {
 	vm := newObj.(*kubevirtv1.VirtualMachine)
 	if vm == nil {
 		return nil
@@ -60,10 +218,19 @@ func (v *vmValidator) Create(request *types.Request, newObj runtime.Object) erro
 	if err := v.checkVMSpec(vm); err != nil {
 		return err
 	}
+
+	if err := v.checkStorageResourceQuota(vm, nil); err != nil {
+		return err
+	}
+
+	if err := v.checkForDuplicateMacAddrs(vm); err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func (v *vmValidator) Update(request *types.Request, oldObj runtime.Object, newObj runtime.Object) error {
+func (v *vmValidator) Update(_ *types.Request, oldObj runtime.Object, newObj runtime.Object) error {
 	newVM := newObj.(*kubevirtv1.VirtualMachine)
 	if newVM == nil {
 		return nil
@@ -78,12 +245,30 @@ func (v *vmValidator) Update(request *types.Request, oldObj runtime.Object, newO
 		return nil
 	}
 
+	if err := v.checkStorageResourceQuota(newVM, oldVM); err != nil {
+		return err
+	}
+
 	// Prevent users to stop/restart VM when there is VMBackup in progress.
 	if v.checkVMStoppingStatus(oldVM, newVM) {
 		if err := v.checkVMBackup(newVM); err != nil {
 			return err
 		}
 	}
+
+	// Check resize volumes
+	if err := v.checkResizeVolumes(oldVM, newVM); err != nil {
+		return err
+	}
+
+	if oldVM.Spec.Template != nil && newVM.Spec.Template != nil && reflect.DeepEqual(oldVM.Spec.Template.Spec.Domain.Devices.Interfaces, newVM.Spec.Template.Spec.Domain.Devices.Interfaces) {
+		return nil
+	}
+
+	if err := v.checkForDuplicateMacAddrs(newVM); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -95,10 +280,13 @@ func (v *vmValidator) checkVMSpec(vm *kubevirtv1.VirtualMachine) error {
 	if err := v.checkOccupiedPVCs(vm); err != nil {
 		return err
 	}
+	if err := v.checkTerminationGracePeriodSeconds(vm); err != nil {
+		return err
+	}
 	if err := v.checkReservedMemoryAnnotation(vm); err != nil {
 		return err
 	}
-	return nil
+	return v.rqCalculator.CheckIfVMCanStartByResourceQuota(vm)
 }
 
 func (v *vmValidator) checkVMStoppingStatus(oldVM *kubevirtv1.VirtualMachine, newVM *kubevirtv1.VirtualMachine) bool {
@@ -138,26 +326,68 @@ func (v *vmValidator) checkVolumeClaimTemplatesAnnotation(vm *kubevirtv1.Virtual
 	return nil
 }
 
+func (v *vmValidator) checkResizeVolumes(oldVM, newVM *kubevirtv1.VirtualMachine) error {
+	if oldVM.Annotations[util.AnnotationVolumeClaimTemplates] == "" || newVM.Annotations[util.AnnotationVolumeClaimTemplates] == "" {
+		return nil
+	}
+
+	var oldPvcs, newPvcs []*corev1.PersistentVolumeClaim
+	if err := json.Unmarshal([]byte(oldVM.Annotations[util.AnnotationVolumeClaimTemplates]), &oldPvcs); err != nil {
+		return werror.NewInvalidError(fmt.Sprintf("failed to unmarshal %s", oldVM.Annotations[util.AnnotationVolumeClaimTemplates]), fmt.Sprintf("metadata.annotations.%s", util.AnnotationVolumeClaimTemplates))
+	}
+	if err := json.Unmarshal([]byte(newVM.Annotations[util.AnnotationVolumeClaimTemplates]), &newPvcs); err != nil {
+		return werror.NewInvalidError(fmt.Sprintf("failed to unmarshal %s", newVM.Annotations[util.AnnotationVolumeClaimTemplates]), fmt.Sprintf("metadata.annotations.%s", util.AnnotationVolumeClaimTemplates))
+	}
+
+	oldPvcMap, newPvcMap := map[string]*corev1.PersistentVolumeClaim{}, map[string]*corev1.PersistentVolumeClaim{}
+	for _, pvc := range oldPvcs {
+		oldPvcMap[pvc.Name] = pvc
+	}
+	for _, pvc := range newPvcs {
+		newPvcMap[pvc.Name] = pvc
+	}
+
+	isResizeVolume := false
+	for name, oldPvc := range oldPvcMap {
+		newPvc, ok := newPvcMap[name]
+		if !ok || newPvc == nil {
+			continue
+		}
+
+		// ref: https://pkg.go.dev/k8s.io/apimachinery/pkg/api/resource#Quantity.Cmp
+		// -1 means newPvc < oldPvc
+		// 1 means newPVC > oldPVC
+		if newPvc.Spec.Resources.Requests.Storage().Cmp(*oldPvc.Spec.Resources.Requests.Storage()) == -1 {
+			return werror.NewInvalidError(fmt.Sprintf("%s PVC requests storage can't be less than previous value", newPvc.Name), fmt.Sprintf("metadata.annotations.%s", util.AnnotationVolumeClaimTemplates))
+		} else if newPvc.Spec.Resources.Requests.Storage().Cmp(*oldPvc.Spec.Resources.Requests.Storage()) == 1 {
+			isResizeVolume = true
+		}
+	}
+
+	if isResizeVolume {
+		stopped, err := vmUtil.IsVMStopped(newVM, v.vmiCache)
+		if err != nil {
+			return werror.NewInternalError(fmt.Sprintf("failed to get vm is stopped or not, err: %s", err.Error()))
+		}
+
+		if !stopped {
+			return werror.NewInvalidError("please stop the VM before resizing volumes", fmt.Sprintf("metadata.annotations.%s", util.AnnotationVolumeClaimTemplates))
+		}
+	}
+
+	return nil
+}
+
 func (v *vmValidator) checkOccupiedPVCs(vm *kubevirtv1.VirtualMachine) error {
-	vmID := ref.Construct(vm.Namespace, vm.Name)
 	for _, volume := range vm.Spec.Template.Spec.Volumes {
 		if volume.PersistentVolumeClaim != nil {
-			pvc, err := v.pvcCache.Get(vm.Namespace, volume.PersistentVolumeClaim.ClaimName)
+			vms, err := v.vmCache.GetByIndex(indexeresutil.VMByPVCIndex, ref.Construct(vm.Namespace, volume.PersistentVolumeClaim.ClaimName))
 			if err != nil {
-				if apierrors.IsNotFound(err) {
-					continue
-				}
-				return err
+				return werror.NewInternalError(fmt.Sprintf("failed to get VMs by index: %s, PVC: %s/%s, err: %s", indexeresutil.VMByPVCIndex, vm.Namespace, volume.PersistentVolumeClaim.ClaimName, err))
 			}
-			owners, err := ref.GetSchemaOwnersFromAnnotation(pvc)
-			if err != nil {
-				return err
-			}
-			ids := owners.List(kubevirtv1.VirtualMachineGroupVersionKind.GroupKind())
-
-			for _, id := range ids {
-				if id != vmID {
-					message := fmt.Sprintf("the volume %s is already used by VM %s", volume.PersistentVolumeClaim.ClaimName, id)
+			for _, otherVM := range vms {
+				if otherVM.Namespace != vm.Namespace || otherVM.Name != vm.Name {
+					message := fmt.Sprintf("the volume %s is already used by VM %s/%s", volume.PersistentVolumeClaim.ClaimName, otherVM.Namespace, otherVM.Name)
 					return werror.NewInvalidError(message, "spec.templates.spec.volumes")
 				}
 			}
@@ -173,6 +403,24 @@ func (v *vmValidator) checkVMBackup(vm *kubevirtv1.VirtualMachine) error {
 	} else if exist {
 		return werror.NewBadRequest(fmt.Sprintf("there is vmbackup in progress for vm %s/%s, please wait for the vmbackup or remove it before stop/restart the vm", vm.Namespace, vm.Name))
 	}
+	return nil
+}
+
+func (v *vmValidator) checkTerminationGracePeriodSeconds(vm *kubevirtv1.VirtualMachine) error {
+	terminationGracePeriodSeconds := vm.Spec.Template.Spec.TerminationGracePeriodSeconds
+
+	//During vm's "TerminationGracePeriodSeconds" field is not specified,
+	//vm mutator will set this field as "default-vm-termination-grace-period-seconds" from settings.
+	//However, we still check it for robustness.
+	if terminationGracePeriodSeconds == nil {
+		return nil
+	}
+
+	if *terminationGracePeriodSeconds < 0 {
+		return werror.NewInvalidError("Termination grace period can't be negative",
+			"spec.Template.Spec.TerminationGracePeriodSeconds")
+	}
+
 	return nil
 }
 
@@ -199,4 +447,8 @@ func (v *vmValidator) checkReservedMemoryAnnotation(vm *kubevirtv1.VirtualMachin
 		return werror.NewInvalidError("reservedMemory cannot be less than 0", field)
 	}
 	return nil
+}
+
+func (v *vmValidator) checkStorageResourceQuota(vm *kubevirtv1.VirtualMachine, oldVM *kubevirtv1.VirtualMachine) error {
+	return v.rqCalculator.CheckStorageResourceQuota(vm, oldVM)
 }

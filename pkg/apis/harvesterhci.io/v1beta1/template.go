@@ -1,13 +1,14 @@
 package v1beta1
 
 import (
-	"github.com/rancher/wrangler/pkg/condition"
+	"github.com/rancher/wrangler/v3/pkg/condition"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 )
 
 var (
-	VersionAssigned condition.Cond = "assigned" // version number was assigned to templateVersion object's status.Version
+	VersionAssigned      condition.Cond = "assigned" // version number was assigned to templateVersion object's status.Version
+	TemplateVersionReady condition.Cond = "ready"    // all images in the template are ready
 )
 
 // +genclient
